@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "rateguard"
+name = "rateguard-core"
 version = "0.1.0"

@@ -4,26 +4,26 @@ pub type Nanos = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quota {
-    rate_per_seq: u32,
+    rate_per_sec: u32,
     burst: u32,
 }
 impl Quota {
     pub fn new(rate_per_sec: u32, burst: u32) -> Self {
-        assert!(rate_per_sec > 0 "rate_per_sec must be > 0");
-        assert!(burst > 0 "burst must be > 0");
+        assert!(rate_per_sec > 0, "rate_per_sec must be > 0");
+        assert!(burst > 0, "burst must be > 0");
         Self {
-            rate_per_seq,
+            rate_per_sec,
             burst,
         }
     }
 
     fn t_nanos(&self) -> Nanos {
         let one_sec = 1_000_000_000u64;
-        one_sec.div_ceil(self.rate_per_seq as u64)
+        one_sec.div_ceil(self.rate_per_sec as u64)
     }
 
     fn tau_nanos(&self) -> Nanos {
-        self.t_nanos * self.burst as u64 - 1;
+        self.t_nanos() * (self.burst as u64 - 1)
     }
 }
 
@@ -77,5 +77,62 @@ impl Gcra {
         let tau = self.quota.tau_nanos();
         let earliest = tat.saturating_sub(tau);
         (now < earliest).then(|| Duration::from_nanos(earliest - now))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quota(rate: u32, burst: u32) -> Quota {
+        Quota::new(rate, burst)
+    }
+
+    #[test]
+    fn burst_of_n_then_deny() {
+        let mut g = Gcra::new(quota(1000, 3));
+        let t0: Nanos = 0;
+
+        assert_eq!(g.check(t0), Decision::Allow);
+        assert_eq!(g.check(t0), Decision::Allow);
+        assert_eq!(g.check(t0), Decision::Allow);
+        assert!(matches!(g.check(t0), Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn deny_then_allow_after_retry_at() {
+        let mut g = Gcra::new(quota(1000, 1));
+        let t0: Nanos = 0;
+
+        assert_eq!(g.check(t0), Decision::Allow);
+        let Decision::Deny { retry_at } = g.check(t0) else {
+            panic!("second immidiate request must be denied");
+        };
+        assert_eq!(g.check(retry_at), Decision::Allow);
+    }
+
+    #[test]
+    fn idle_key_does_not_accumulate_unlimited_credit() {
+        let mut g = Gcra::new(quota(1000, 3));
+        let t0: Nanos = 0;
+        let later = t0 + 10_000_000_000;
+
+        assert_eq!(g.check(later), Decision::Allow);
+        assert_eq!(g.check(later), Decision::Allow);
+        assert_eq!(g.check(later), Decision::Allow);
+        assert!(matches!(g.check(later), Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn set_quota_preserves_debt_proportionally() {
+        let mut g = Gcra::new(quota(1000, 10));
+        let t0: Nanos = 0;
+        for _ in 0..10 {
+            assert_eq!(g.check(t0), Decision::Allow);
+        }
+        assert!(matches!(g.check(t0), Decision::Deny { .. }));
+
+        g.set_quota(quota(100, 10), t0);
+        assert!(matches!(g.check(t0), Decision::Deny { .. }));
     }
 }

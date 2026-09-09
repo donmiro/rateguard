@@ -46,3 +46,78 @@ impl Demand {
         self.current_rate
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ONE_SEC: Nanos = 1_000_000_000;
+
+    #[test]
+    fn first_tick_sets_baseline_without_changing_rate() {
+        let mut d = Demand::new(ONE_SEC);
+        d.record_attempt();
+        d.record_attempt();
+        d.tick(0);
+        assert_eq!(d.rate(), 0.0);
+    }
+
+    #[test]
+    fn zero_elapsed_tick_does_not_panic_or_drop_attempts() {
+        let mut d = Demand::new(ONE_SEC);
+        d.tick(0);
+        d.record_attempt();
+        d.tick(0);
+        d.tick(ONE_SEC);
+        assert!(d.rate() > 0.0);
+    }
+
+    #[test]
+    fn rate_converges_towards_steady_load_gradually() {
+        let mut d = Demand::new(ONE_SEC);
+        d.tick(0);
+
+        let mut now = 0;
+        for _ in 0..1000 {
+            d.record_attempt();
+        }
+        now += ONE_SEC;
+        d.tick(now);
+        let after_one_tick = d.rate();
+        assert!(
+            after_one_tick > 0.0 && after_one_tick < 1000.0,
+            "shouldn't jump right away"
+        );
+
+        for _ in 0..4 {
+            for _ in 0..1000 {
+                d.record_attempt();
+            }
+            now += ONE_SEC;
+            d.tick(now);
+        }
+        assert!(
+            (d.rate() - 1000.0).abs() < 20.0,
+            "after 5 ticks it should be close to 1000, got {}",
+            d.rate()
+        );
+    }
+
+    #[test]
+    fn idle_key_decays_towards_zero() {
+        let mut d = Demand::new(ONE_SEC);
+        d.tick(0);
+        for _ in 0..1000 {
+            d.record_attempt();
+        }
+        d.tick(ONE_SEC);
+        assert!(d.rate() > 0.0);
+
+        d.tick(ONE_SEC + 10 * ONE_SEC);
+        assert!(
+            d.rate() < 1.0,
+            "after 5 seconds of silence, the rating should almost disappear, we received {}",
+            d.rate()
+        );
+    }
+}

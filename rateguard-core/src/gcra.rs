@@ -89,6 +89,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn negative_rps_or_burst_schould_panic() {
+        Quota::new(0 as u32, 0 as u32);
+    }
+
+    #[test]
     fn burst_of_n_then_deny() {
         let mut g = Gcra::new(quota(1000, 3));
         let t0: Nanos = 0;

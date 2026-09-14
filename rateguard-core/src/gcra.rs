@@ -72,6 +72,13 @@ impl Gcra {
         }
     }
 
+    /// Whether the key still carries unspent debt. A limiter without debt behaves
+    /// exactly like a freshly created one, so such an entry can be evicted from a
+    /// per-key map without changing any future decision.
+    pub fn has_debt(&self, now: Nanos) -> bool {
+        self.tat.is_some_and(|tat| tat > now)
+    }
+
     pub fn retry_after(&self, now: Nanos) -> Option<Duration> {
         let tat = self.tat?;
         let tau = self.quota.tau_nanos();
@@ -127,6 +134,28 @@ mod tests {
         assert_eq!(g.check(later), Decision::Allow);
         assert_eq!(g.check(later), Decision::Allow);
         assert!(matches!(g.check(later), Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn fresh_and_drained_limiters_carry_no_debt() {
+        let mut g = Gcra::new(quota(1000, 3));
+        assert!(!g.has_debt(0), "a fresh limiter carries no debt");
+
+        g.check(0);
+        assert!(g.has_debt(0));
+        assert!(!g.has_debt(1_000_000), "one slot drains in exactly t");
+    }
+
+    #[test]
+    fn has_debt_is_stricter_than_retry_after() {
+        let mut g = Gcra::new(quota(1000, 3));
+        g.check(0);
+
+        assert!(g.retry_after(0).is_none(), "requests still pass, one slot of three is spent");
+        assert!(
+            g.has_debt(0),
+            "but the entry is not empty: evicting it would hand back the whole burst"
+        );
     }
 
     #[test]

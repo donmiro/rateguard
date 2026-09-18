@@ -98,7 +98,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn negative_rps_or_burst_schould_panic() {
-        Quota::new(0 as u32, 0 as u32);
+        Quota::new(0_u32, 0_u32);
     }
 
     #[test]
@@ -151,7 +151,10 @@ mod tests {
         let mut g = Gcra::new(quota(1000, 3));
         g.check(0);
 
-        assert!(g.retry_after(0).is_none(), "requests still pass, one slot of three is spent");
+        assert!(
+            g.retry_after(0).is_none(),
+            "requests still pass, one slot of three is spent"
+        );
         assert!(
             g.has_debt(0),
             "but the entry is not empty: evicting it would hand back the whole burst"

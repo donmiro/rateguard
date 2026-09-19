@@ -72,9 +72,6 @@ impl Gcra {
         }
     }
 
-    /// Whether the key still carries unspent debt. A limiter without debt behaves
-    /// exactly like a freshly created one, so such an entry can be evicted from a
-    /// per-key map without changing any future decision.
     pub fn has_debt(&self, now: Nanos) -> bool {
         self.tat.is_some_and(|tat| tat > now)
     }

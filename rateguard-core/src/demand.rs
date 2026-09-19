@@ -17,10 +17,6 @@ impl Demand {
         }
     }
 
-    /// Like `new`, but with the baseline already set, so the very next `tick`
-    /// measures a real rate. `new` spends its first tick establishing that
-    /// baseline and reports zero — fine for a limiter created before traffic
-    /// starts, fatal for state created per key while traffic is already flowing.
     pub fn starting_at(time_constant: Nanos, now: Nanos) -> Self {
         Self {
             last_tick: Some(now),

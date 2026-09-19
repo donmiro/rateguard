@@ -66,7 +66,7 @@ impl Gcra {
             self.quota = quota;
             let new_t = self.quota.t_nanos();
             let new_debt_nanos = (debt_slots * new_t as f64).round() as u64;
-            self.tat = Some(now + new_debt_nanos);
+            self.tat = Some(now.saturating_add(new_debt_nanos));
         } else {
             self.quota = quota;
         }

@@ -226,21 +226,20 @@ impl<L: Link> Sim<L> {
                         "node {source} addressed an unknown peer {}",
                         peer.get()
                     );
-                    let Some(at) = link.deliver_at(source, target, now, bytes.len()) else {
-                        continue;
-                    };
-                    assert!(at >= now, "the link delivered into the past: {at} < {now}");
+                    for at in link.fate(source, target, now, bytes.len()).arrivals() {
+                        assert!(at >= now, "the link delivered into the past: {at} < {now}");
 
-                    queue.push(Scheduled {
-                        at,
-                        seq: *next_seq,
-                        target,
-                        kind: Kind::Deliver {
-                            from: peer_of(source),
-                            bytes: bytes.clone(),
-                        },
-                    });
-                    *next_seq += 1;
+                        queue.push(Scheduled {
+                            at,
+                            seq: *next_seq,
+                            target,
+                            kind: Kind::Deliver {
+                                from: peer_of(source),
+                                bytes: bytes.clone(),
+                            },
+                        });
+                        *next_seq += 1;
+                    }
                 }
             }
         }

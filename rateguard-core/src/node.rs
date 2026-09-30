@@ -29,6 +29,10 @@ impl Node {
         self.cluster_size
     }
 
+    pub fn limiter(&self) -> &Limiter {
+        &self.limiter
+    }
+
     pub fn check(&mut self, key: u64, now: Nanos) -> Decision {
         self.advance(now);
         self.limiter.check(key, now, self.cluster_size)

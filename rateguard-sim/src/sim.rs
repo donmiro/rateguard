@@ -6,6 +6,7 @@ use rateguard_core::gcra::{Decision, Nanos};
 use rateguard_core::limiter::Config;
 use rateguard_core::node::Node;
 
+use crate::invariant::{self, Happened, Invariant, View};
 use crate::link::{Link, NodeIndex};
 
 pub const PROTOCOL_PERIOD: Nanos = 200_000_000;
@@ -63,6 +64,9 @@ pub struct Sim<L: Link> {
     now: Nanos,
     next_seq: u64,
     admissions: Vec<Admission>,
+    config: Config,
+    invariants: Vec<Box<dyn Invariant>>,
+    events: u64,
 }
 
 impl<L: Link> Sim<L> {
@@ -79,6 +83,9 @@ impl<L: Link> Sim<L> {
             now: 0,
             next_seq: 0,
             admissions: Vec::new(),
+            config,
+            invariants: invariant::standard(),
+            events: 0,
         };
 
         for index in 0..node_count {
@@ -104,6 +111,10 @@ impl<L: Link> Sim<L> {
 
     pub fn admissions(&self) -> &[Admission] {
         &self.admissions
+    }
+
+    pub fn add_invariant(&mut self, invariant: impl Invariant + 'static) {
+        self.invariants.push(Box::new(invariant));
     }
 
     pub fn schedule_request(&mut self, at: Nanos, node: NodeIndex, key: u64) {
@@ -178,28 +189,66 @@ impl<L: Link> Sim<L> {
 
     fn step(&mut self, event: Scheduled) {
         let now = self.now;
+        let target = event.target;
 
-        match event.kind {
+        let happened = match event.kind {
             Kind::Request { key } => {
-                let decision = self.nodes[event.target].check(key, now);
-                self.admissions.push(Admission {
+                let decision = self.nodes[target].check(key, now);
+                let admission = Admission {
                     at: now,
-                    node: event.target,
+                    node: target,
                     key,
                     decision,
-                });
+                };
+                self.admissions.push(admission.clone());
+                Happened::Admission(admission)
             }
             Kind::Tick => {
-                self.dispatch(event.target, Event::Tick);
-                self.schedule(now + PROTOCOL_PERIOD, event.target, Kind::Tick);
+                self.dispatch(target, Event::Tick);
+                self.schedule(now + PROTOCOL_PERIOD, target, Kind::Tick);
+                Happened::Tick
             }
             Kind::Deliver { from, bytes } => {
                 self.dispatch(
-                    event.target,
+                    target,
                     Event::MessageReceived {
                         from,
                         bytes: &bytes,
                     },
+                );
+                Happened::Delivery
+            }
+        };
+
+        self.check_invariants(target, &happened);
+        self.events += 1;
+    }
+
+    fn check_invariants(&mut self, target: NodeIndex, happened: &Happened) {
+        let Self {
+            nodes,
+            invariants,
+            config,
+            now,
+            events,
+            ..
+        } = self;
+        let view = View {
+            event: *events,
+            now: *now,
+            target,
+            happened,
+            nodes: nodes.as_slice(),
+            config,
+        };
+
+        for invariant in invariants.iter_mut() {
+            if let Err(why) = invariant.check(&view) {
+                panic!(
+                    "invariant `{}` violated at event #{}, t = {} ns, node {target} after {happened:?}: {why}",
+                    invariant.name(),
+                    view.event,
+                    view.now,
                 );
             }
         }
@@ -270,6 +319,8 @@ fn first_tick(index: NodeIndex, node_count: usize) -> Nanos {
 mod tests {
     use super::*;
     use crate::link::PerfectLink;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const ONE_SEC: Nanos = 1_000_000_000;
     const ONE_MS: Nanos = 1_000_000;
@@ -431,5 +482,64 @@ mod tests {
             first, second,
             "the simulator must be a pure function of its schedule"
         );
+    }
+
+    struct Recorder(Rc<RefCell<Vec<(u64, Happened)>>>);
+    impl Invariant for Recorder {
+        fn name(&self) -> &'static str {
+            "recorder"
+        }
+
+        fn check(&mut self, view: &View<'_>) -> Result<(), String> {
+            self.0.borrow_mut().push((view.event, view.happened.clone()));
+            Ok(())
+        }
+    }
+
+    struct AlwaysFails;
+    impl Invariant for AlwaysFails {
+        fn name(&self) -> &'static str {
+            "always-fails"
+        }
+
+        fn check(&mut self, _: &View<'_>) -> Result<(), String> {
+            Err("by design".into())
+        }
+    }
+
+    #[test]
+    fn invariants_are_checked_after_every_event() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut s = sim(1);
+        s.add_invariant(Recorder(seen.clone()));
+
+        s.schedule_request(ONE_MS, 0, KEY);
+        s.schedule_request(2 * ONE_MS, 0, KEY);
+        s.schedule_message(3 * ONE_MS, 0, 0, vec![0xde, 0xad]);
+        s.run_until(ONE_SEC);
+
+        let seen = seen.borrow();
+        let ticks = seen.iter().filter(|(_, h)| *h == Happened::Tick).count();
+        let deliveries = seen.iter().filter(|(_, h)| *h == Happened::Delivery).count();
+        let admissions = seen
+            .iter()
+            .filter(|(_, h)| matches!(h, Happened::Admission(_)))
+            .count();
+
+        assert_eq!(ticks, 6, "ticks at 0, 200, ..., 1000 ms");
+        assert_eq!(deliveries, 1);
+        assert_eq!(admissions, 2);
+        assert!(
+            seen.iter().map(|(n, _)| *n).eq(0..seen.len() as u64),
+            "event numbers must count every step without gaps"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invariant `always-fails` violated at event #0")]
+    fn a_violation_stops_the_run_at_the_offending_event() {
+        let mut s = sim(1);
+        s.add_invariant(AlwaysFails);
+        s.run_until(ONE_SEC);
     }
 }

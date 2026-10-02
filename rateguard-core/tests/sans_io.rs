@@ -4,7 +4,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const ALLOWED_CRATES: &[&str] = &["rateguard-core"];
+const ALLOWED_CRATES: &[&str] = &[
+    "rateguard-core",
+    "rateguard-proto",
+    "postcard",
+    "cobs",
+    "serde",
+    "serde_core",
+    "thiserror",
+];
 const FORBIDDEN: &[(&str, &str)] = &[
     (
         "Instant",
@@ -34,7 +42,7 @@ fn the_runtime_dependency_graph_holds_only_what_we_allow() {
             "--package",
             "rateguard-core",
             "--edges",
-            "normal",
+            "normal,no-proc-macro",
             "--target",
             "all",
             "--prefix",

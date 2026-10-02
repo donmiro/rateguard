@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rateguard-proto = { path = "../rateguard-proto" }
 
 [dev-dependencies]
 proptest = "1.11.0"

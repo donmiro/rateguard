@@ -1,0 +1,401 @@
+use rateguard_proto::{Status, Update};
+use std::collections::BTreeMap;
+
+use crate::boundary::PeerId;
+use crate::gcra::Nanos;
+use crate::membership::{Change, Membership};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    Ignored,
+    Accepted { from: Option<Status> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Member {
+    incarnation: u32,
+    status: Status,
+    since: Nanos,
+}
+impl Member {
+    fn update(&self, peer: PeerId) -> Update {
+        Update {
+            member: peer.get(),
+            incarnation: self.incarnation,
+            status: self.status,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberTable {
+    local: PeerId,
+    incarnation: u32,
+    members: BTreeMap<PeerId, Member>,
+    live: Vec<PeerId>,
+    changes: Vec<Change>,
+}
+impl MemberTable {
+    pub fn new(local: PeerId) -> Self {
+        Self {
+            local,
+            incarnation: 0,
+            members: BTreeMap::new(),
+            live: Vec::new(),
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn incarnation(&self) -> u32 {
+        self.incarnation
+    }
+
+    pub fn status(&self, peer: PeerId) -> Option<Status> {
+        if peer == self.local {
+            return Some(Status::Alive);
+        }
+        self.members.get(&peer).map(|member| member.status)
+    }
+
+    pub fn update_about(&self, peer: PeerId) -> Option<Update> {
+        if peer == self.local {
+            return Some(Update {
+                member: peer.get(),
+                incarnation: self.incarnation,
+                status: Status::Alive,
+            });
+        }
+        self.members.get(&peer).map(|member| member.update(peer))
+    }
+
+    pub fn apply(&mut self, update: Update, now: Nanos) -> Applied {
+        let peer = PeerId::new(update.member);
+        if peer == self.local {
+            return Applied::Ignored;
+        }
+
+        let from = self.members.get(&peer).copied();
+        if let Some(current) = from
+            && !update.supersedes(&current.update(peer))
+        {
+            return Applied::Ignored;
+        }
+
+        self.members.insert(
+            peer,
+            Member {
+                incarnation: update.incarnation,
+                status: update.status,
+                since: now,
+            },
+        );
+
+        let was_live = from.is_some_and(|member| member.status != Status::Dead);
+        let is_live = update.status != Status::Dead;
+        match (was_live, is_live) {
+            (false, true) => {
+                let at = self
+                    .live
+                    .binary_search(&peer)
+                    .expect_err("a peer outside the cluster is not among the live ones");
+                self.live.insert(at, peer);
+                self.changes.push(Change::Joined(peer));
+            }
+            (true, false) => {
+                let at = self
+                    .live
+                    .binary_search(&peer)
+                    .expect("a live peer is among the live ones");
+                self.live.remove(at);
+                self.changes.push(Change::Left(peer));
+            }
+            _ => {}
+        }
+
+        Applied::Accepted {
+            from: from.map(|member| member.status),
+        }
+    }
+
+    pub fn suspect(&mut self, peer: PeerId, now: Nanos) -> Option<Update> {
+        assert_ne!(peer, self.local, "a node never suspects itself");
+
+        let member = self.members.get(&peer)?;
+        if member.status != Status::Alive {
+            return None;
+        }
+        let update = Update {
+            status: Status::Suspect,
+            ..member.update(peer)
+        };
+        self.apply(update, now);
+        Some(update)
+    }
+
+    pub fn expire_suspects(&mut self, now: Nanos, timeout: Nanos) -> Vec<Update> {
+        assert!(
+            timeout > 0,
+            "a zero suspicion timeout is no suspicion at all"
+        );
+
+        let expired: Vec<Update> = self
+            .members
+            .iter()
+            .filter(|(_, member)| {
+                member.status == Status::Suspect && now.saturating_sub(member.since) >= timeout
+            })
+            .map(|(&peer, member)| Update {
+                status: Status::Dead,
+                ..member.update(peer)
+            })
+            .collect();
+
+        for &update in &expired {
+            self.apply(update, now);
+        }
+        expired
+    }
+}
+impl Membership for MemberTable {
+    fn local(&self) -> PeerId {
+        self.local
+    }
+
+    fn peers(&self) -> &[PeerId] {
+        &self.live
+    }
+
+    fn drain_changes(&mut self) -> Vec<Change> {
+        std::mem::take(&mut self.changes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::membership::check_contract;
+    use Status::{Alive, Dead, Suspect};
+
+    const ONE_SEC: Nanos = 1_000_000_000;
+    const TIMEOUT: Nanos = 5 * ONE_SEC;
+
+    fn id(raw: u64) -> PeerId {
+        PeerId::new(raw)
+    }
+
+    fn news(member: u64, incarnation: u32, status: Status) -> Update {
+        Update {
+            member,
+            incarnation,
+            status,
+        }
+    }
+
+    fn table() -> MemberTable {
+        MemberTable::new(id(0))
+    }
+
+    #[test]
+    fn a_fresh_table_knows_only_itself() {
+        let mut t = table();
+        assert_eq!(t.cluster_size(), 1);
+        assert_eq!(t.status(id(0)), Some(Alive));
+        assert_eq!(t.status(id(1)), None);
+        assert_eq!(t.update_about(id(0)), Some(news(0, 0, Alive)));
+        assert!(t.drain_changes().is_empty());
+        check_contract(&t).unwrap();
+    }
+
+    #[test]
+    fn hearing_of_a_peer_brings_it_into_the_cluster() {
+        let mut t = table();
+        assert_eq!(
+            t.apply(news(1, 0, Alive), 0),
+            Applied::Accepted { from: None }
+        );
+        assert_eq!(t.peers(), [id(1)]);
+        assert_eq!(t.drain_changes(), [Change::Joined(id(1))]);
+    }
+
+    #[test]
+    fn old_and_repeated_news_is_ignored() {
+        let mut t = table();
+        t.apply(news(1, 3, Alive), 0);
+
+        assert_eq!(t.apply(news(1, 3, Alive), 0), Applied::Ignored, "an echo");
+        assert_eq!(t.apply(news(1, 2, Suspect), 0), Applied::Ignored, "stale");
+        assert_eq!(t.update_about(id(1)), Some(news(1, 3, Alive)));
+    }
+
+    #[test]
+    fn a_suspect_still_counts_toward_the_cluster() {
+        let mut t = table();
+        t.apply(news(1, 0, Alive), 0);
+        t.drain_changes();
+
+        assert_eq!(t.suspect(id(1), ONE_SEC), Some(news(1, 0, Suspect)));
+        assert_eq!(t.status(id(1)), Some(Suspect));
+        assert_eq!(t.cluster_size(), 2);
+        assert!(
+            t.drain_changes().is_empty(),
+            "a pause must not reshuffle everyone's shares"
+        );
+    }
+
+    #[test]
+    fn only_a_higher_incarnation_clears_a_suspicion() {
+        let mut t = table();
+        t.apply(news(1, 4, Suspect), 0);
+
+        assert_eq!(t.apply(news(1, 4, Alive), 0), Applied::Ignored);
+        assert_eq!(t.status(id(1)), Some(Suspect));
+
+        assert_eq!(
+            t.apply(news(1, 5, Alive), 0),
+            Applied::Accepted {
+                from: Some(Suspect)
+            }
+        );
+        assert_eq!(t.status(id(1)), Some(Alive));
+    }
+
+    #[test]
+    fn only_an_alive_member_can_be_suspected() {
+        let mut t = table();
+        assert_eq!(t.suspect(id(1), 0), None, "a stranger");
+
+        t.apply(news(1, 0, Suspect), 0);
+        assert_eq!(t.suspect(id(1), ONE_SEC), None, "already suspected");
+
+        t.apply(news(2, 0, Dead), 0);
+        assert_eq!(t.suspect(id(2), 0), None, "already dead");
+    }
+
+    #[test]
+    #[should_panic(expected = "never suspects itself")]
+    fn a_node_cannot_suspect_itself() {
+        table().suspect(id(0), 0);
+    }
+
+    #[test]
+    fn an_unrefuted_suspicion_becomes_death_after_the_timeout() {
+        let mut t = table();
+        t.apply(news(1, 2, Alive), 0);
+        t.apply(news(2, 0, Alive), 0);
+        t.suspect(id(1), ONE_SEC);
+        t.drain_changes();
+
+        assert!(t.expire_suspects(ONE_SEC + TIMEOUT - 1, TIMEOUT).is_empty());
+        assert_eq!(
+            t.expire_suspects(ONE_SEC + TIMEOUT, TIMEOUT),
+            [news(1, 2, Dead)],
+            "death keeps the incarnation it was suspected in"
+        );
+        assert_eq!(t.peers(), [id(2)]);
+        assert_eq!(t.drain_changes(), [Change::Left(id(1))]);
+        assert!(
+            t.expire_suspects(100 * TIMEOUT, TIMEOUT).is_empty(),
+            "an alive member never expires"
+        );
+    }
+
+    #[test]
+    fn a_fresher_suspicion_restarts_the_timer() {
+        let mut t = table();
+        t.apply(news(1, 0, Alive), 0);
+        t.suspect(id(1), 0);
+        t.apply(news(1, 1, Suspect), 3 * ONE_SEC);
+
+        assert!(t.expire_suspects(TIMEOUT, TIMEOUT).is_empty());
+        assert_eq!(
+            t.expire_suspects(3 * ONE_SEC + TIMEOUT, TIMEOUT),
+            [news(1, 1, Dead)]
+        );
+    }
+
+    #[test]
+    fn the_dead_stay_dead_until_a_higher_incarnation() {
+        let mut t = table();
+        t.apply(news(1, 2, Alive), 0);
+        t.apply(news(1, 2, Dead), 0);
+        t.drain_changes();
+
+        assert_eq!(
+            t.apply(news(1, 2, Alive), ONE_SEC),
+            Applied::Ignored,
+            "a late echo"
+        );
+        assert_eq!(
+            t.apply(news(1, 3, Alive), ONE_SEC),
+            Applied::Accepted { from: Some(Dead) },
+            "a restart under the same ID"
+        );
+        assert_eq!(t.drain_changes(), [Change::Joined(id(1))]);
+    }
+
+    #[test]
+    fn a_stranger_heard_dead_leaves_a_tombstone_not_a_departure() {
+        let mut t = table();
+        t.apply(news(1, 2, Dead), 0);
+
+        assert!(t.peers().is_empty());
+        assert!(
+            t.drain_changes().is_empty(),
+            "it never was in peers(), so nothing has left"
+        );
+        assert_eq!(t.apply(news(1, 2, Alive), 0), Applied::Ignored);
+    }
+
+    #[test]
+    fn news_about_ourselves_is_not_taken_as_fact() {
+        let mut t = table();
+        assert_eq!(t.apply(news(0, 0, Suspect), 0), Applied::Ignored);
+        assert_eq!(t.apply(news(0, 7, Dead), 0), Applied::Ignored);
+        assert_eq!(t.status(id(0)), Some(Alive));
+        assert_eq!(t.cluster_size(), 1);
+    }
+
+    #[test]
+    fn replaying_the_changes_rebuilds_the_peers() {
+        let mut t = table();
+        let mut log = Vec::new();
+        let step = |t: &mut MemberTable, log: &mut Vec<Change>| {
+            check_contract(t).unwrap();
+            log.extend(t.drain_changes());
+        };
+
+        t.apply(news(1, 0, Alive), 0);
+        step(&mut t, &mut log);
+        t.apply(news(2, 0, Alive), 0);
+        t.apply(news(3, 0, Dead), 0);
+        t.apply(news(3, 0, Dead), 0);
+        step(&mut t, &mut log);
+        t.suspect(id(1), ONE_SEC);
+        step(&mut t, &mut log);
+        t.expire_suspects(ONE_SEC + TIMEOUT, TIMEOUT);
+        step(&mut t, &mut log);
+        t.apply(news(1, 1, Alive), 10 * ONE_SEC);
+        step(&mut t, &mut log);
+
+        assert_eq!(
+            log,
+            [
+                Change::Joined(id(1)),
+                Change::Joined(id(2)),
+                Change::Left(id(1)),
+                Change::Joined(id(1)),
+            ]
+        );
+
+        let mut rebuilt = BTreeSet::new();
+        for change in log {
+            match change {
+                Change::Joined(peer) => assert!(rebuilt.insert(peer)),
+                Change::Left(peer) => assert!(rebuilt.remove(&peer)),
+            }
+        }
+        assert!(rebuilt.iter().copied().eq(t.peers().iter().copied()));
+    }
+}

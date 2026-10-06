@@ -129,6 +129,21 @@ impl MemberTable {
         Some(update)
     }
 
+    pub fn dead(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.members
+            .iter()
+            .filter(|(_, member)| member.status == Status::Dead)
+            .map(|(&peer, _)| peer)
+    }
+
+    pub fn forget_dead(&mut self, now: Nanos, ttl: Nanos) -> usize {
+        let before = self.members.len();
+        self.members.retain(|_, member| {
+            member.status != Status::Dead || now.saturating_sub(member.since) < ttl
+        });
+        before - self.members.len()
+    }
+
     pub fn expire_suspects(&mut self, now: Nanos, timeout: Nanos) -> Vec<Update> {
         assert!(
             timeout > 0,
@@ -503,6 +518,38 @@ mod tests {
             a.expire_suspects(100 * TIMEOUT, TIMEOUT).is_empty(),
             "a refuted suspicion must not expire into death"
         );
+    }
+
+    #[test]
+    fn only_the_long_dead_are_forgotten() {
+        let mut t = table();
+        t.apply(news(1, 0, Dead), 0);
+        t.apply(news(2, 0, Suspect), 0);
+        t.apply(news(3, 0, Alive), 0);
+        t.apply(news(4, 0, Dead), ONE_SEC);
+        assert!(t.dead().eq([id(1), id(4)]));
+
+        assert_eq!(t.forget_dead(TIMEOUT - 1, TIMEOUT), 0);
+        assert_eq!(t.forget_dead(TIMEOUT, TIMEOUT), 1);
+        assert_eq!(t.status(id(1)), None);
+        assert_eq!(t.status(id(4)), Some(Dead), "died a second later");
+        assert_eq!(t.status(id(2)), Some(Suspect));
+        assert_eq!(t.status(id(3)), Some(Alive));
+        assert!(t.dead().eq([id(4)]));
+    }
+
+    #[test]
+    fn a_forgotten_member_is_a_stranger_again() {
+        let mut t = table();
+        t.apply(news(1, 3, Dead), 0);
+        t.forget_dead(TIMEOUT, TIMEOUT);
+
+        assert_eq!(
+            t.apply(news(1, 3, Alive), TIMEOUT),
+            Applied::Accepted { from: None },
+            "the price of a bounded table: a late echo is news again"
+        );
+        assert_eq!(t.peers(), [id(1)]);
     }
 
     #[test]

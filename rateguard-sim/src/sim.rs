@@ -4,7 +4,7 @@ use std::collections::BinaryHeap;
 use rateguard_core::boundary::{Action, Event, PeerId};
 use rateguard_core::gcra::{Decision, Nanos};
 use rateguard_core::limiter::Config;
-use rateguard_core::node::{Node, Timing};
+use rateguard_core::node::{Node, SwimConfig};
 
 use crate::invariant::{self, Happened, Invariant, View};
 use crate::link::{Link, NodeIndex};
@@ -70,15 +70,39 @@ pub struct Sim<L: Link> {
 }
 
 impl<L: Link> Sim<L> {
+    // Every node knows the whole cluster from the start.
     pub fn new(node_count: usize, config: Config, link: L) -> Self {
+        Self::build(node_count, config, link, |node, index| {
+            for other in (0..node_count).filter(|&other| other != index) {
+                node.introduce(peer_of(other));
+            }
+        })
+    }
+
+    // Every node knows only the seeds and has to join through them.
+    pub fn with_seeds(node_count: usize, config: Config, link: L, seeds: &[NodeIndex]) -> Self {
+        assert!(!seeds.is_empty(), "with no seed nobody can find anybody");
+        Self::build(node_count, config, link, |node, index| {
+            for &seed in seeds.iter().filter(|&&seed| seed != index) {
+                node.add_seed(peer_of(seed));
+            }
+        })
+    }
+
+    fn build(
+        node_count: usize,
+        config: Config,
+        link: L,
+        bootstrap: impl Fn(&mut Node, NodeIndex),
+    ) -> Self {
         assert!(
             node_count > 0,
             "a cluster on nobody has nothing to simulate"
         );
 
-        let timing = Timing::default();
+        let swim = SwimConfig::default();
         assert_eq!(
-            timing.protocol_period % TICK,
+            swim.protocol_period % TICK,
             0,
             "the tick must divide the protocol period, or rounds drift"
         );
@@ -96,13 +120,11 @@ impl<L: Link> Sim<L> {
         };
 
         for index in 0..node_count {
-            let mut node = Node::new(config, timing, peer_of(index), index as u64);
-            for other in (0..node_count).filter(|&other| other != index) {
-                node.introduce(peer_of(other));
-            }
+            let mut node = Node::new(config, swim, peer_of(index), index as u64);
+            bootstrap(&mut node, index);
             sim.nodes.push(node);
             sim.schedule(
-                first_tick(index, node_count, timing.protocol_period),
+                first_tick(index, node_count, swim.protocol_period),
                 index,
                 Kind::Tick,
             );
@@ -538,19 +560,22 @@ mod tests {
 
     struct Isolate {
         node: NodeIndex,
+        from: Nanos,
         until: Nanos,
     }
     impl Isolate {
         fn forever(node: NodeIndex) -> Self {
             Self {
                 node,
+                from: 0,
                 until: Nanos::MAX,
             }
         }
     }
     impl Link for Isolate {
         fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, _len: usize) -> Fate {
-            if now < self.until && (from == self.node || to == self.node) {
+            let cut = (self.from..self.until).contains(&now);
+            if cut && (from == self.node || to == self.node) {
                 Fate::Lost
             } else {
                 Fate::Delivered(now + ONE_MS)
@@ -603,23 +628,22 @@ mod tests {
 
     #[test]
     fn a_false_suspicion_is_refuted_across_the_cluster() {
-        struct DeafToOne;
-        impl Link for DeafToOne {
-            fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, _len: usize) -> Fate {
-                if from == 1 && to == 0 && now < ONE_SEC {
-                    Fate::Lost
-                } else {
-                    Fate::Delivered(now + ONE_MS)
-                }
-            }
-        }
-
-        let mut s = Sim::new(5, config(), DeafToOne);
-        s.run_until(ONE_SEC);
+        // Cut off from everyone, so no helper can vouch for it either.
+        let blackout = 1500 * ONE_MS;
+        let mut s = Sim::new(
+            5,
+            config(),
+            Isolate {
+                node: 1,
+                from: 0,
+                until: blackout,
+            },
+        );
+        s.run_until(blackout);
         assert_eq!(
             s.node(0).members().status(peer_of(1)),
             Some(Status::Suspect),
-            "node 0 probed node 1 within the first circuit and lost the ACK"
+            "node 0 probed node 1 within the first circuit and heard nothing"
         );
 
         s.run_until(5 * ONE_SEC);
@@ -639,7 +663,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "mutual burial: nobody probes the dead, so nothing is ever said to refute; needs reconnect to dead members, see ROADMAP"]
     fn a_buried_node_comes_back_once_it_can_talk() {
         let heal = 10 * ONE_SEC;
         let mut s = Sim::new(
@@ -647,6 +670,7 @@ mod tests {
             config(),
             Isolate {
                 node: 4,
+                from: 0,
                 until: heal,
             },
         );
@@ -659,6 +683,95 @@ mod tests {
         for index in 0..5 {
             assert_eq!(s.node(index).cluster_size(), 5, "node {index}");
         }
+    }
+
+    #[test]
+    fn a_node_gone_for_good_is_forgotten() {
+        let swim = SwimConfig::default();
+        let mut s = Sim::new(5, config(), Isolate::forever(4));
+        s.run_until(swim.suspicion_timeout + swim.tombstone_ttl + 10 * ONE_SEC);
+
+        for index in 0..4 {
+            let members = s.node(index).members();
+            assert_eq!(members.status(peer_of(4)), None, "node {index}");
+            assert_eq!(members.dead().count(), 0, "node {index}");
+        }
+        assert_eq!(s.node(4).members().dead().count(), 0);
+    }
+
+    #[test]
+    fn a_broken_link_between_two_nodes_raises_no_suspicion() {
+        struct CutPair;
+        impl Link for CutPair {
+            fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, _len: usize) -> Fate {
+                if (from, to) == (0, 1) || (from, to) == (1, 0) {
+                    Fate::Lost
+                } else {
+                    Fate::Delivered(now + ONE_MS)
+                }
+            }
+        }
+
+        let mut s = Sim::new(5, config(), CutPair);
+        for step in 1..=300 {
+            s.run_until(step * 100 * ONE_MS);
+            for index in 0..5 {
+                for other in (0..5).filter(|&other| other != index) {
+                    assert_eq!(
+                        s.node(index).members().status(peer_of(other)),
+                        Some(Status::Alive),
+                        "at {} ms node {index} doubts node {other}: PING-REQ must vouch for it",
+                        step * 100
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cluster_assembles_through_one_seed() {
+        let mut s = Sim::with_seeds(5, config(), PerfectLink::new(ONE_MS), &[0]);
+        assert_eq!(s.node(3).cluster_size(), 1, "nobody knows anybody yet");
+
+        s.run_until(3 * ONE_SEC);
+        everyone_sees_everyone(&s).unwrap();
+    }
+
+    #[test]
+    fn a_larger_cluster_assembles_through_one_seed() {
+        let mut s = Sim::with_seeds(20, config(), PerfectLink::new(ONE_MS), &[0]);
+        s.run_until(10 * ONE_SEC);
+        everyone_sees_everyone(&s).unwrap();
+    }
+
+    #[test]
+    fn a_split_longer_than_the_tombstones_heals_through_the_seed() {
+        let swim = SwimConfig::default();
+        let cut = 5 * ONE_SEC;
+        let heal = cut + swim.suspicion_timeout + swim.tombstone_ttl + 10 * ONE_SEC;
+        let mut s = Sim::with_seeds(
+            5,
+            config(),
+            Isolate {
+                node: 4,
+                from: cut,
+                until: heal,
+            },
+            &[0],
+        );
+
+        s.run_until(cut);
+        everyone_sees_everyone(&s).unwrap();
+
+        s.run_until(heal);
+        assert_eq!(
+            s.node(0).members().status(peer_of(4)),
+            None,
+            "node 4 is forgotten, so reconnect alone could never bring it back"
+        );
+
+        s.run_until(heal + 5 * ONE_SEC);
+        everyone_sees_everyone(&s).unwrap();
     }
 
     struct Recorder(Rc<RefCell<Vec<(u64, Happened)>>>);

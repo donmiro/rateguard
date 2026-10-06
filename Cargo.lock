@@ -263,6 +263,7 @@ name = "rateguard-sim"
 version = "0.1.0"
 dependencies = [
  "rateguard-core",
+ "rateguard-proto",
 ]
 
 [[package]]

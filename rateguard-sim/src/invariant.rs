@@ -62,15 +62,16 @@ impl Invariant for TrackedKeysBounded {
     }
 
     fn check(&mut self, view: &View<'_>) -> Result<(), String> {
-        if *view.happened != Happened::Tick {
+        let node = &view.nodes[view.target];
+        if *view.happened != Happened::Tick || node.last_round() != Some(view.now) {
             return Ok(());
         }
 
-        let tracked = view.nodes[view.target].limiter().tracked_keys();
+        let tracked = node.limiter().tracked_keys();
         let max = view.config.max_tracked_keys;
         if tracked > max {
             return Err(format!(
-                "{tracked} tracked keys after a tick, max_tracked_keys is {max}"
+                "{tracked} tracked keys after a round, max_tracked_keys is {max}"
             ));
         }
 
@@ -133,6 +134,7 @@ impl Invariant for AdmissionWindow {
 mod tests {
     use super::*;
     use rateguard_core::boundary::{Event, PeerId};
+    use rateguard_core::node::Timing;
 
     const KEY: u64 = 42;
 
@@ -170,7 +172,7 @@ mod tests {
 
     #[test]
     fn a_hot_set_over_its_size_is_caught() {
-        let mut node = Node::new(config(), PeerId::new(0), 0);
+        let mut node = Node::new(config(), Timing::default(), PeerId::new(0), 0);
         for _ in 0..5000 {
             node.check(KEY, 0);
         }
@@ -194,11 +196,15 @@ mod tests {
     }
 
     #[test]
-    fn tracked_keys_are_bounded_only_after_a_tick() {
-        let mut node = Node::new(config(), PeerId::new(0), 0);
+    fn tracked_keys_are_bounded_only_after_a_round() {
+        let mut node = Node::new(config(), Timing::default(), PeerId::new(0), 0);
         for key in 0..3 {
             node.check(key, 0);
         }
+        node.handle(Event::Tick, 0);
+        let between_rounds = 50_000_000;
+        node.handle(Event::Tick, between_rounds);
+
         let nodes = [node];
         let too_small = Config {
             max_tracked_keys: 2,
@@ -214,13 +220,22 @@ mod tests {
             TrackedKeysBounded
                 .check(&view(&nodes, &too_small, &allowed(0, KEY)))
                 .is_ok(),
-            "between ticks the map may grow, the cap is enforced by tick()"
+            "between rounds the map may grow, the cap is enforced by the round"
+        );
+        assert!(
+            TrackedKeysBounded
+                .check(&View {
+                    now: between_rounds,
+                    ..view(&nodes, &too_small, &Happened::Tick)
+                })
+                .is_ok(),
+            "a tick between rounds does not run the limiter"
         );
     }
 
     #[test]
     fn the_window_admits_the_rate_plus_one_burst_per_node() {
-        let nodes = [Node::new(config(), PeerId::new(0), 0)];
+        let nodes = [Node::new(config(), Timing::default(), PeerId::new(0), 0)];
         let config = config();
         let mut window = AdmissionWindow::new(ONE_SEC);
 
@@ -239,7 +254,7 @@ mod tests {
 
     #[test]
     fn the_window_forgets_what_slid_out_of_it() {
-        let nodes = [Node::new(config(), PeerId::new(0), 0)];
+        let nodes = [Node::new(config(), Timing::default(), PeerId::new(0), 0)];
         let config = config();
         let mut window = AdmissionWindow::new(ONE_SEC);
 
@@ -257,7 +272,7 @@ mod tests {
 
     #[test]
     fn the_window_counts_keys_apart_and_ignores_denials() {
-        let nodes = [Node::new(config(), PeerId::new(0), 0)];
+        let nodes = [Node::new(config(), Timing::default(), PeerId::new(0), 0)];
         let config = config();
         let mut window = AdmissionWindow::new(ONE_SEC);
 

@@ -161,9 +161,15 @@ impl MemberTable {
         }
     }
 
+    // A stale accusation is answered too, with the current incarnation: the
+    // accuser missed our refutation, and once the news has left every gossip
+    // buffer nothing else would ever tell it.
     fn refute(&mut self, news: Update) -> Applied {
         if !news.supersedes(&self.own_update()) {
-            return Applied::Ignored;
+            return match news.status {
+                Status::Alive => Applied::Ignored,
+                Status::Suspect | Status::Dead => Applied::Refuted(self.own_update()),
+            };
         }
         // Only a corrupt datagram reaches u32::MAX; a panic on it would let one packet kill the node.
         let Some(incarnation) = news.incarnation.checked_add(1) else {
@@ -409,23 +415,35 @@ mod tests {
     }
 
     #[test]
-    fn stale_news_and_echoes_about_ourselves_are_ignored() {
+    fn a_stale_accusation_is_answered_without_a_new_incarnation() {
         let mut t = table();
         t.apply(news(0, 4, Suspect), 0);
         assert_eq!(t.incarnation(), 5);
 
         assert_eq!(
             t.apply(news(0, 4, Suspect), 0),
-            Applied::Ignored,
-            "re-gossiped"
+            Applied::Refuted(news(0, 5, Alive)),
+            "re-gossiped: the accuser has not heard the refutation yet"
         );
-        assert_eq!(t.apply(news(0, 4, Dead), 0), Applied::Ignored, "stale");
         assert_eq!(
-            t.apply(news(0, 5, Alive), 0),
-            Applied::Ignored,
-            "our own echo"
+            t.apply(news(0, 2, Dead), 0),
+            Applied::Refuted(news(0, 5, Alive))
         );
-        assert_eq!(t.incarnation(), 5, "nothing above may bump it again");
+        assert_eq!(t.incarnation(), 5, "a stale accusation must not bump it");
+    }
+
+    #[test]
+    fn echoes_and_old_alives_about_ourselves_are_ignored() {
+        let mut t = table();
+        t.apply(news(0, 4, Suspect), 0);
+
+        assert_eq!(t.apply(news(0, 5, Alive), 0), Applied::Ignored, "an echo");
+        assert_eq!(
+            t.apply(news(0, 3, Alive), 0),
+            Applied::Ignored,
+            "an old life accuses no one"
+        );
+        assert_eq!(t.incarnation(), 5);
     }
 
     #[test]

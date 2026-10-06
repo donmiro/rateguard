@@ -1,6 +1,7 @@
 pub mod boundary;
 pub mod demand;
 pub mod gcra;
+pub mod gossip;
 pub mod hot_set;
 pub mod limiter;
 pub mod member;

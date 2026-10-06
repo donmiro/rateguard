@@ -4,12 +4,12 @@ use std::collections::BinaryHeap;
 use rateguard_core::boundary::{Action, Event, PeerId};
 use rateguard_core::gcra::{Decision, Nanos};
 use rateguard_core::limiter::Config;
-use rateguard_core::node::Node;
+use rateguard_core::node::{Node, Timing};
 
 use crate::invariant::{self, Happened, Invariant, View};
 use crate::link::{Link, NodeIndex};
 
-pub const PROTOCOL_PERIOD: Nanos = 200_000_000;
+pub const TICK: Nanos = 50_000_000;
 
 pub fn peer_of(index: NodeIndex) -> PeerId {
     PeerId::new(index as u64)
@@ -76,6 +76,13 @@ impl<L: Link> Sim<L> {
             "a cluster on nobody has nothing to simulate"
         );
 
+        let timing = Timing::default();
+        assert_eq!(
+            timing.protocol_period % TICK,
+            0,
+            "the tick must divide the protocol period, or rounds drift"
+        );
+
         let mut sim = Self {
             nodes: Vec::with_capacity(node_count),
             queue: BinaryHeap::new(),
@@ -89,12 +96,16 @@ impl<L: Link> Sim<L> {
         };
 
         for index in 0..node_count {
-            let mut node = Node::new(config, peer_of(index), index as u64);
+            let mut node = Node::new(config, timing, peer_of(index), index as u64);
             for other in (0..node_count).filter(|&other| other != index) {
                 node.introduce(peer_of(other));
             }
             sim.nodes.push(node);
-            sim.schedule(first_tick(index, node_count), index, Kind::Tick);
+            sim.schedule(
+                first_tick(index, node_count, timing.protocol_period),
+                index,
+                Kind::Tick,
+            );
         }
         sim
     }
@@ -211,7 +222,7 @@ impl<L: Link> Sim<L> {
             }
             Kind::Tick => {
                 self.dispatch(target, Event::Tick);
-                self.schedule(now + PROTOCOL_PERIOD, target, Kind::Tick);
+                self.schedule(now + TICK, target, Kind::Tick);
                 Happened::Tick
             }
             Kind::Deliver { from, bytes } => {
@@ -317,14 +328,16 @@ impl<L: Link> Sim<L> {
     }
 }
 
-fn first_tick(index: NodeIndex, node_count: usize) -> Nanos {
-    (index as u64 * PROTOCOL_PERIOD) / node_count as u64
+fn first_tick(index: NodeIndex, node_count: usize, period: Nanos) -> Nanos {
+    (index as u64 * period) / node_count as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::{NetConfig, PerfectLink, SeededLink};
+    use crate::link::{Fate, NetConfig, PerfectLink, SeededLink};
+    use crate::seed;
+    use rateguard_proto::Status;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -350,10 +363,11 @@ mod tests {
 
     #[test]
     fn ticks_are_staggered_acros_the_cluster() {
-        assert_eq!(first_tick(0, 5), 0);
-        assert_eq!(first_tick(1, 5), 40_000_000);
-        assert_eq!(first_tick(4, 5), 160_000_000);
-        assert_eq!(first_tick(0, 1), 0);
+        let period = 200 * ONE_MS;
+        assert_eq!(first_tick(0, 5, period), 0);
+        assert_eq!(first_tick(1, 5, period), 40_000_000);
+        assert_eq!(first_tick(4, 5, period), 160_000_000);
+        assert_eq!(first_tick(0, 1, period), 0);
     }
 
     #[test]
@@ -490,6 +504,163 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_perfect_wire_keeps_everyone_alive() {
+        let mut s = sim(5);
+        s.run_until(30 * ONE_SEC);
+
+        for index in 0..s.node_count() {
+            let node = s.node(index);
+            assert_eq!(node.cluster_size(), 5, "node {index}");
+            for other in (0..5).filter(|&other| other != index) {
+                assert_eq!(
+                    node.members().status(peer_of(other)),
+                    Some(Status::Alive),
+                    "node {index} doubts node {other} on a wire that loses nothing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_silent_cluster_falls_apart_into_loners() {
+        let dead = NetConfig {
+            loss: 1.0,
+            ..NetConfig::perfect(ONE_MS)
+        };
+        let mut s = Sim::new(5, config(), SeededLink::new(1, dead));
+        s.run_until(10 * ONE_SEC);
+
+        for index in 0..s.node_count() {
+            assert_eq!(s.node(index).cluster_size(), 1, "node {index}");
+        }
+    }
+
+    struct Isolate {
+        node: NodeIndex,
+        until: Nanos,
+    }
+    impl Isolate {
+        fn forever(node: NodeIndex) -> Self {
+            Self {
+                node,
+                until: Nanos::MAX,
+            }
+        }
+    }
+    impl Link for Isolate {
+        fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, _len: usize) -> Fate {
+            if now < self.until && (from == self.node || to == self.node) {
+                Fate::Lost
+            } else {
+                Fate::Delivered(now + ONE_MS)
+            }
+        }
+    }
+
+    #[test]
+    fn an_isolated_node_and_the_rest_bury_each_other() {
+        let mut s = Sim::new(5, config(), Isolate::forever(4));
+        s.run_until(10 * ONE_SEC);
+
+        assert_eq!(s.node(4).cluster_size(), 1, "the isolated node is alone");
+        for index in 0..4 {
+            let node = s.node(index);
+            assert_eq!(node.cluster_size(), 4, "node {index}");
+            assert_eq!(node.members().status(peer_of(4)), Some(Status::Dead));
+        }
+    }
+
+    fn everyone_sees_everyone(s: &Sim<impl Link>) -> Result<(), String> {
+        for index in 0..s.node_count() {
+            let node = s.node(index);
+            for other in (0..s.node_count()).filter(|&other| other != index) {
+                let status = node.members().status(peer_of(other));
+                if status == Some(Status::Dead) || status.is_none() {
+                    return Err(format!("node {index} holds node {other} as {status:?}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_lossy_wire_buries_nobody() {
+        seed::each_seed(3, |seed| {
+            let lossy = NetConfig {
+                loss: 0.3,
+                ..NetConfig::perfect(ONE_MS)
+            };
+            let mut s = Sim::new(5, config(), SeededLink::new(seed, lossy));
+            for step in 1..=300 {
+                s.run_until(step * 100 * ONE_MS);
+                if let Err(why) = everyone_sees_everyone(&s) {
+                    panic!("at {} ms over a 30% lossy wire: {why}", step * 100);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_false_suspicion_is_refuted_across_the_cluster() {
+        struct DeafToOne;
+        impl Link for DeafToOne {
+            fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, _len: usize) -> Fate {
+                if from == 1 && to == 0 && now < ONE_SEC {
+                    Fate::Lost
+                } else {
+                    Fate::Delivered(now + ONE_MS)
+                }
+            }
+        }
+
+        let mut s = Sim::new(5, config(), DeafToOne);
+        s.run_until(ONE_SEC);
+        assert_eq!(
+            s.node(0).members().status(peer_of(1)),
+            Some(Status::Suspect),
+            "node 0 probed node 1 within the first circuit and lost the ACK"
+        );
+
+        s.run_until(5 * ONE_SEC);
+        let refuted = s.node(1).members().incarnation();
+        assert!(refuted >= 1, "node 1 never refuted");
+        for index in (0..5).filter(|&index| index != 1) {
+            assert_eq!(
+                s.node(index).members().update_about(peer_of(1)),
+                Some(rateguard_proto::Update {
+                    member: 1,
+                    incarnation: refuted,
+                    status: Status::Alive,
+                }),
+                "node {index} missed the refutation"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "mutual burial: nobody probes the dead, so nothing is ever said to refute; needs reconnect to dead members, see ROADMAP"]
+    fn a_buried_node_comes_back_once_it_can_talk() {
+        let heal = 10 * ONE_SEC;
+        let mut s = Sim::new(
+            5,
+            config(),
+            Isolate {
+                node: 4,
+                until: heal,
+            },
+        );
+        s.run_until(heal);
+        assert_eq!(s.node(0).members().status(peer_of(4)), Some(Status::Dead));
+        assert_eq!(s.node(4).cluster_size(), 1);
+
+        s.run_until(heal + 3 * ONE_SEC);
+        everyone_sees_everyone(&s).unwrap();
+        for index in 0..5 {
+            assert_eq!(s.node(index).cluster_size(), 5, "node {index}");
+        }
+    }
+
     struct Recorder(Rc<RefCell<Vec<(u64, Happened)>>>);
     impl Invariant for Recorder {
         fn name(&self) -> &'static str {
@@ -537,7 +708,7 @@ mod tests {
             .filter(|(_, h)| matches!(h, Happened::Admission(_)))
             .count();
 
-        assert_eq!(ticks, 6, "ticks at 0, 200, ..., 1000 ms");
+        assert_eq!(ticks, 21, "ticks at 0, 50, ..., 1000 ms");
         assert_eq!(deliveries, 1);
         assert_eq!(admissions, 2);
         assert!(

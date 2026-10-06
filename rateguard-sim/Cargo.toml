@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 rateguard-core = { path = "../rateguard-core" }
+
+[dev-dependencies]
+rateguard-proto = { path = "../rateguard-proto" }

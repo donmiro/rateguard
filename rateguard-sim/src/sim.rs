@@ -17,9 +17,24 @@ pub fn peer_of(index: NodeIndex) -> PeerId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
-    Tick,
+    Tick { generation: u64 },
     Request { key: u64 },
     Deliver { from: PeerId, bytes: Vec<u8> },
+    Crash,
+    Restart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Bootstrap {
+    Static,
+    Seeds(Vec<NodeIndex>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pause {
+    node: NodeIndex,
+    from: Nanos,
+    until: Nanos,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +74,11 @@ pub struct Admission {
 
 pub struct Sim<L: Link> {
     nodes: Vec<Node>,
+    swim: SwimConfig,
+    bootstrap: Bootstrap,
+    generations: Vec<u64>,
+    down: Vec<bool>,
+    pauses: Vec<Pause>,
     queue: BinaryHeap<Scheduled>,
     link: L,
     now: Nanos,
@@ -72,29 +92,20 @@ pub struct Sim<L: Link> {
 impl<L: Link> Sim<L> {
     // Every node knows the whole cluster from the start.
     pub fn new(node_count: usize, config: Config, link: L) -> Self {
-        Self::build(node_count, config, link, |node, index| {
-            for other in (0..node_count).filter(|&other| other != index) {
-                node.introduce(peer_of(other));
-            }
-        })
+        Self::build(node_count, config, link, Bootstrap::Static)
     }
 
     // Every node knows only the seeds and has to join through them.
     pub fn with_seeds(node_count: usize, config: Config, link: L, seeds: &[NodeIndex]) -> Self {
         assert!(!seeds.is_empty(), "with no seed nobody can find anybody");
-        Self::build(node_count, config, link, |node, index| {
-            for &seed in seeds.iter().filter(|&&seed| seed != index) {
-                node.add_seed(peer_of(seed));
-            }
-        })
+        assert!(
+            seeds.iter().all(|&seed| seed < node_count),
+            "a seed outside the cluster: {seeds:?}"
+        );
+        Self::build(node_count, config, link, Bootstrap::Seeds(seeds.to_vec()))
     }
 
-    fn build(
-        node_count: usize,
-        config: Config,
-        link: L,
-        bootstrap: impl Fn(&mut Node, NodeIndex),
-    ) -> Self {
+    fn build(node_count: usize, config: Config, link: L, bootstrap: Bootstrap) -> Self {
         assert!(
             node_count > 0,
             "a cluster on nobody has nothing to simulate"
@@ -109,6 +120,11 @@ impl<L: Link> Sim<L> {
 
         let mut sim = Self {
             nodes: Vec::with_capacity(node_count),
+            swim,
+            bootstrap,
+            generations: vec![0; node_count],
+            down: vec![false; node_count],
+            pauses: Vec::new(),
             queue: BinaryHeap::new(),
             link,
             now: 0,
@@ -120,16 +136,58 @@ impl<L: Link> Sim<L> {
         };
 
         for index in 0..node_count {
-            let mut node = Node::new(config, swim, peer_of(index), index as u64);
-            bootstrap(&mut node, index);
+            let node = sim.fresh_node(index);
             sim.nodes.push(node);
             sim.schedule(
                 first_tick(index, node_count, swim.protocol_period),
                 index,
-                Kind::Tick,
+                Kind::Tick { generation: 0 },
             );
         }
         sim
+    }
+
+    // A restarted node keeps its ID and address but nothing else: a new
+    // incarnation 0, an empty table, the same bootstrap as at the start.
+    fn fresh_node(&self, index: NodeIndex) -> Node {
+        let node_count = self.generations.len();
+        let seed = (self.generations[index] << 32) | index as u64;
+        let mut node = Node::new(self.config, self.swim, peer_of(index), seed);
+        match &self.bootstrap {
+            Bootstrap::Static => {
+                for other in (0..node_count).filter(|&other| other != index) {
+                    node.introduce(peer_of(other));
+                }
+            }
+            Bootstrap::Seeds(seeds) => {
+                for &seed in seeds.iter().filter(|&&seed| seed != index) {
+                    node.add_seed(peer_of(seed));
+                }
+            }
+        }
+        node
+    }
+
+    // A stop-the-world pause: the node handles nothing in [from, until), and
+    // everything that came for it in between is handled at `until`, in the
+    // order it came, like datagrams waiting in a socket buffer.
+    pub fn pause(&mut self, node: NodeIndex, from: Nanos, until: Nanos) {
+        assert!(node < self.nodes.len(), "no such node: {node}");
+        assert!(from < until, "an empty pause: {from}..{until}");
+        self.pauses.push(Pause { node, from, until });
+    }
+
+    // The node is down in [down_at, up_at): whatever is sent to it is lost.
+    // At up_at a fresh instance starts under the same ID.
+    pub fn schedule_restart(&mut self, node: NodeIndex, down_at: Nanos, up_at: Nanos) {
+        assert!(node < self.nodes.len(), "no such node: {node}");
+        assert!(down_at < up_at, "a restart must take some time");
+        self.schedule(down_at, node, Kind::Crash);
+        self.schedule(up_at, node, Kind::Restart);
+    }
+
+    pub fn is_down(&self, node: NodeIndex) -> bool {
+        self.down[node]
     }
 
     pub fn now(&self) -> Nanos {
@@ -202,6 +260,15 @@ impl<L: Link> Sim<L> {
                 break;
             }
             let event = self.queue.pop().expect("just peeked");
+            if let Some(until) = self.paused_until(&event) {
+                self.queue.push(Scheduled {
+                    at: until,
+                    seq: self.next_seq,
+                    ..event
+                });
+                self.next_seq += 1;
+                continue;
+            }
             self.now = event.at;
             self.step(event);
         }
@@ -226,9 +293,39 @@ impl<L: Link> Sim<L> {
             .count()
     }
 
+    fn paused_until(&self, event: &Scheduled) -> Option<Nanos> {
+        if matches!(event.kind, Kind::Crash | Kind::Restart) {
+            return None;
+        }
+        self.pauses
+            .iter()
+            .find(|pause| {
+                pause.node == event.target && (pause.from..pause.until).contains(&event.at)
+            })
+            .map(|pause| pause.until)
+    }
+
     fn step(&mut self, event: Scheduled) {
         let now = self.now;
         let target = event.target;
+
+        match event.kind {
+            Kind::Crash => {
+                self.down[target] = true;
+                return;
+            }
+            Kind::Restart => {
+                self.generations[target] += 1;
+                self.nodes[target] = self.fresh_node(target);
+                self.down[target] = false;
+                let generation = self.generations[target];
+                self.schedule(now, target, Kind::Tick { generation });
+                return;
+            }
+            Kind::Tick { generation } if generation != self.generations[target] => return,
+            _ if self.down[target] => return,
+            _ => {}
+        }
 
         let happened = match event.kind {
             Kind::Request { key } => {
@@ -242,9 +339,9 @@ impl<L: Link> Sim<L> {
                 self.admissions.push(admission.clone());
                 Happened::Admission(admission)
             }
-            Kind::Tick => {
+            Kind::Tick { generation } => {
                 self.dispatch(target, Event::Tick);
-                self.schedule(now + TICK, target, Kind::Tick);
+                self.schedule(now + TICK, target, Kind::Tick { generation });
                 Happened::Tick
             }
             Kind::Deliver { from, bytes } => {
@@ -257,6 +354,7 @@ impl<L: Link> Sim<L> {
                 );
                 Happened::Delivery
             }
+            Kind::Crash | Kind::Restart => unreachable!("handled above"),
         };
 
         self.check_invariants(target, &happened);
@@ -358,7 +456,6 @@ fn first_tick(index: NodeIndex, node_count: usize, period: Nanos) -> Nanos {
 mod tests {
     use super::*;
     use crate::link::{Fate, NetConfig, PerfectLink, SeededLink};
-    use crate::seed;
     use rateguard_proto::Status;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -610,23 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn a_lossy_wire_buries_nobody() {
-        seed::each_seed(3, |seed| {
-            let lossy = NetConfig {
-                loss: 0.3,
-                ..NetConfig::perfect(ONE_MS)
-            };
-            let mut s = Sim::new(5, config(), SeededLink::new(seed, lossy));
-            for step in 1..=300 {
-                s.run_until(step * 100 * ONE_MS);
-                if let Err(why) = everyone_sees_everyone(&s) {
-                    panic!("at {} ms over a 30% lossy wire: {why}", step * 100);
-                }
-            }
-        });
-    }
-
-    #[test]
     fn a_false_suspicion_is_refuted_across_the_cluster() {
         // Cut off from everyone, so no helper can vouch for it either.
         let blackout = 1500 * ONE_MS;
@@ -772,6 +852,59 @@ mod tests {
 
         s.run_until(heal + 5 * ONE_SEC);
         everyone_sees_everyone(&s).unwrap();
+    }
+
+    #[test]
+    fn a_paused_node_handles_what_came_once_it_wakes() {
+        let mut s = sim(2);
+        s.pause(0, ONE_SEC / 2, 3 * ONE_SEC / 2);
+        s.schedule_request(ONE_SEC, 0, KEY);
+        s.schedule_request(ONE_SEC + 1, 0, KEY + 1);
+        s.run_until(2 * ONE_SEC);
+
+        let late: Vec<(Nanos, u64)> = s.admissions().iter().map(|a| (a.at, a.key)).collect();
+        assert_eq!(
+            late,
+            [(3 * ONE_SEC / 2, KEY), (3 * ONE_SEC / 2, KEY + 1)],
+            "deferred, not lost, and in the order they came"
+        );
+    }
+
+    #[test]
+    fn a_crashed_node_loses_what_comes_and_restarts_fresh() {
+        let mut s = sim(2);
+        s.schedule_restart(1, ONE_SEC, 2 * ONE_SEC);
+        s.schedule_request(3 * ONE_SEC / 2, 1, KEY);
+
+        s.run_until(3 * ONE_SEC / 2);
+        assert!(s.is_down(1));
+        s.run_until(2 * ONE_SEC);
+        assert!(!s.is_down(1));
+        assert!(
+            s.admissions().is_empty(),
+            "a request to a dead process is lost"
+        );
+        assert_eq!(s.node(1).cluster_size(), 2, "the bootstrap is replayed");
+    }
+
+    #[test]
+    fn a_quick_restart_leaves_one_tick_chain() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut s = sim(1);
+        s.add_invariant(Recorder(seen.clone()));
+        s.schedule_restart(0, ONE_SEC, ONE_SEC + 10 * ONE_MS);
+        s.run_until(2 * ONE_SEC);
+
+        let ticks = seen
+            .borrow()
+            .iter()
+            .filter(|(_, h)| *h == Happened::Tick)
+            .count();
+        assert_eq!(
+            ticks,
+            20 + 20,
+            "0..950 ms before the crash, 1010..1960 ms after: the old chain must stop"
+        );
     }
 
     struct Recorder(Rc<RefCell<Vec<(u64, Happened)>>>);

@@ -1,8 +1,7 @@
 # rateguard
 
-[![crates.io](https://img.shields.io/crates/v/rateguard.svg)](https://crates.io/crates/rateguard)
-[![docs.rs](https://docs.rs/rateguard/badge.svg)](https://docs.rs/rateguard)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/donmiro/rateguard/actions/workflows/ci.yml/badge.svg)](https://github.com/donmiro/rateguard/actions/workflows/ci.yml)
+[![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Distributed rate limiting for Rust services — one global limit across your
 whole fleet, with no Redis, no central service, and no network call on the
@@ -307,4 +306,15 @@ production.
 
 ## License
 
-MIT
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

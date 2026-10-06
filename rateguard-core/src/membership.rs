@@ -1,21 +1,43 @@
+//! The seam between membership and everything that depends on it.
+//!
+//! Allocation needs to know who is in the cluster, not how SWIM finds out,
+//! so membership sits behind the [`Membership`] trait and another
+//! implementation could take its place. Changes are drained rather than
+//! pushed to subscribers: the core is sans-I/O and owns no channels.
+
 use crate::boundary::PeerId;
 use std::collections::BTreeSet;
 
+/// A peer entering or leaving [`peers`](Membership::peers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
     Joined(PeerId),
     Left(PeerId),
 }
 
+/// Who is in the cluster, as the rest of the node needs to know it.
+///
+/// [`check_contract`] lists what every implementation must hold.
 pub trait Membership {
     fn local(&self) -> PeerId;
+
+    /// The live peers in ascending order, never including the node itself.
     fn peers(&self) -> &[PeerId];
+
+    /// The changes since the last call, in order. A join and a leave that
+    /// cancel out are both reported: a consumer may have per-peer state to
+    /// drop.
     fn drain_changes(&mut self) -> Vec<Change>;
+
+    /// N, the number of nodes sharing the limit, this one included.
     fn cluster_size(&self) -> usize {
         self.peers().len() + 1
     }
 }
 
+/// Checks the contract of [`Membership`]: no self among the peers, peers
+/// strictly ascending, and a cluster size that matches them. For tests and
+/// the simulator's invariants.
 pub fn check_contract(membership: &impl Membership) -> Result<(), String> {
     let local = membership.local();
     let peers = membership.peers();
@@ -42,6 +64,7 @@ pub fn check_contract(membership: &impl Membership) -> Result<(), String> {
     Ok(())
 }
 
+/// A membership set by hand, for tests and fixed fleets.
 #[derive(Debug, Clone)]
 pub struct ManualMembership {
     local: PeerId,

@@ -1,3 +1,15 @@
+//! Enforcement on one node: a GCRA per key, on a share of the limit.
+//!
+//! A cold key gets `R/N × α` and a hot key `R/N`; from Phase 4 a hot key
+//! gets a share proportional to its demand instead. [`Limiter::check`] is the
+//! hot path: one map lookup and one GCRA step, no I/O, and no allocation for
+//! a key it already knows. [`Limiter::tick`] does everything else once per
+//! protocol period.
+//!
+//! Memory is bounded by the config, not by how many keys there are: a key
+//! with no debt and no demand is dropped without loss, and under pressure
+//! the cold keys with the least demand go first.
+
 use std::collections::HashMap;
 
 use crate::demand::Demand;
@@ -8,12 +20,21 @@ const SILENT_DEMAND: f64 = 1e-3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
+    /// R: the cluster-wide limit for each key, in requests per second.
     pub limit_per_sec: u32,
+    /// How many requests a key may get back to back on one node.
     pub burst: u32,
+    /// α, in (0, 1]: the part of the per-node rate a cold key gets, and the
+    /// threshold at which it turns hot.
     pub alpha: f64,
+    /// How long a hot key stays hot after its demand drops below the
+    /// threshold.
     pub cooldown: Nanos,
     pub hot_set_size: usize,
+    /// Cap on the keys this node keeps any state for. Separate from
+    /// `hot_set_size` and at least as big: hot keys are never reclaimed.
     pub max_tracked_keys: usize,
+    /// How fast the demand average follows a change.
     pub demand_time_constant: Nanos,
 }
 impl Config {
@@ -39,6 +60,7 @@ struct KeyState {
     applied: Quota,
 }
 
+/// The limiter of one node.
 #[derive(Debug)]
 pub struct Limiter {
     config: Config,
@@ -55,6 +77,8 @@ impl Limiter {
         }
     }
 
+    /// Admits or denies one request for `key`. The attempt counts toward the
+    /// key's demand either way, cold keys included.
     pub fn check(&mut self, key: u64, now: Nanos, cluster_size: usize) -> Decision {
         let cold = self.cold_quota(cluster_size);
         let time_constant = self.config.demand_time_constant;
@@ -69,6 +93,8 @@ impl Limiter {
         state.gcra.check(now)
     }
 
+    /// Updates demand, moves keys between cold and hot, applies their new
+    /// quotas and enforces `max_tracked_keys`. Once per protocol period.
     pub fn tick(&mut self, now: Nanos, cluster_size: usize) {
         let threshold = self.per_node_rate(cluster_size) * self.config.alpha;
         let cold = self.cold_quota(cluster_size);

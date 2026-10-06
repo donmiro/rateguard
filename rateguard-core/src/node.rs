@@ -1,3 +1,29 @@
+//! One cluster member: the limiter and the membership protocol behind one
+//! sans-I/O interface.
+//!
+//! [`Node::check`] answers requests directly. [`Node::handle`] takes
+//! everything that comes from outside, a tick or a datagram, and returns the
+//! datagrams to send.
+//!
+//! The membership protocol is SWIM (Das, Gupta, Motivala, 2002). Every
+//! protocol period a node probes one peer, going round-robin over a shuffled
+//! list. With no ACK within `ack_timeout` it asks `indirect_probes` other
+//! peers to probe it (PING-REQ). With no answer by the end of the period the
+//! peer becomes a suspect, and a suspicion nobody refutes becomes death
+//! after `suspicion_timeout`. News rides on every message.
+//!
+//! On top of the paper:
+//!
+//! - Every message opens with the sender's own record, so whoever hears from
+//!   a node knows it. That is the whole join protocol: a newcomer knocks on a
+//!   seed and learns the others as they probe it.
+//! - A peer held as suspect or dead hears it on every message sent to it,
+//!   not only while the news is in the gossip buffer: it is the one node
+//!   that can refute it.
+//! - Every `reconnect_interval` the probe goes to a random dead member or
+//!   unknown seed instead. Without it, two sides that buried each other
+//!   would never speak again.
+
 use rateguard_proto::{self as proto, Message, Status, Update};
 use std::collections::BTreeMap;
 
@@ -13,13 +39,21 @@ use crate::{
 
 const ONE_MS: Nanos = 1_000_000;
 
+/// The parameters of the membership protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwimConfig {
+    /// T: one probe per period, and the period of the allocation round.
     pub protocol_period: Nanos,
+    /// How long to wait for a direct ACK before asking helpers. Shorter
+    /// than the period, which must leave room for the indirect round trip.
     pub ack_timeout: Nanos,
+    /// k: how many helpers a PING-REQ goes to.
     pub indirect_probes: usize,
+    /// How long a suspect has to refute before it is declared dead.
     pub suspicion_timeout: Nanos,
+    /// How often a probe goes to a dead member or an unknown seed instead.
     pub reconnect_interval: Nanos,
+    /// How long a dead member is remembered.
     pub tombstone_ttl: Nanos,
 }
 impl Default for SwimConfig {
@@ -56,6 +90,7 @@ struct Relay {
     expires_at: Nanos,
 }
 
+/// One cluster member.
 pub struct Node {
     limiter: Limiter,
     members: MemberTable,
@@ -75,6 +110,12 @@ pub struct Node {
     actions: Vec<Action>,
 }
 impl Node {
+    /// A node alone in its cluster. `seed` drives its random choices, so the
+    /// same seed replays the same run.
+    ///
+    /// # Panics
+    ///
+    /// If the timeouts do not fit together, see the messages for each.
     pub fn new(config: Config, swim: SwimConfig, local: PeerId, seed: u64) -> Self {
         assert!(swim.protocol_period > 0, "protocol_period must be > 0");
         assert!(
@@ -114,8 +155,9 @@ impl Node {
         }
     }
 
-    // Static membership, for tests and fixed fleets. A node that does not
-    // know the cluster joins it through add_seed instead.
+    /// Adds a peer as alive without asking it: static membership, for tests
+    /// and fixed fleets. A node that does not know the cluster joins it
+    /// through [`add_seed`](Node::add_seed) instead.
     pub fn introduce(&mut self, peer: PeerId) {
         assert_ne!(peer, self.members.local(), "a node is not its own peer");
         self.members.apply(
@@ -128,8 +170,11 @@ impl Node {
         );
     }
 
-    // A seed is only an address to knock on: it becomes a member once it
-    // answers, carrying its own record like every message does.
+    /// Adds an address to join through. A seed is not a member until it
+    /// answers, carrying its own record like every message does. While the
+    /// node has no peers it knocks on a seed every round; later the seeds it
+    /// has lost touch with join the reconnect rotation, which heals a split
+    /// even after both sides have forgotten each other.
     pub fn add_seed(&mut self, seed: PeerId) {
         assert_ne!(
             seed,
@@ -149,10 +194,12 @@ impl Node {
         &self.members
     }
 
+    /// The peer probed this period that has not answered yet.
     pub fn awaiting_ack(&self) -> Option<PeerId> {
         self.probe.as_ref().map(|probe| probe.target)
     }
 
+    /// When the last protocol round ran.
     pub fn last_round(&self) -> Option<Nanos> {
         self.last_round
     }
@@ -161,14 +208,29 @@ impl Node {
         &self.limiter
     }
 
+    /// The hot path: admits or denies a request for `key`. No I/O, no
+    /// locks, and the same latency whatever the state of the cluster.
+    ///
+    /// # Panics
+    ///
+    /// If `now` is earlier than a time already seen: time running backwards
+    /// would break GCRA silently.
     pub fn check(&mut self, key: u64, now: Nanos) -> Decision {
         self.advance(now);
         self.limiter.check(key, now, self.members.cluster_size())
     }
 
-    // A tick may come more often than the protocol period: the round runs
-    // once per period, the timeouts are checked on every tick. For rounds to
-    // keep their period exactly, the tick interval should divide it.
+    /// Handles an event and returns the datagrams to send.
+    ///
+    /// A tick may, and should, come more often than the protocol period: the
+    /// round runs once per period, the timeouts are checked on every tick.
+    /// For the ACK timeout to mean anything the tick must come at least that
+    /// often, and for rounds to keep their period exactly its interval
+    /// should divide the period.
+    ///
+    /// # Panics
+    ///
+    /// If `now` is earlier than a time already seen.
     pub fn handle(&mut self, event: Event<'_>, now: Nanos) -> &[Action] {
         self.advance(now);
         self.actions.clear();

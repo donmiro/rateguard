@@ -1,3 +1,13 @@
+//! The contract between the core and whoever drives it.
+//!
+//! The driver feeds [`Event`]s into
+//! [`Node::handle`](crate::node::Node::handle) and carries out the
+//! [`Action`]s it gets back. Requests do not come through here:
+//! [`Node::check`](crate::node::Node::check) answers them directly and
+//! without allocating, because the network takes no part in the decision.
+
+/// A cluster member's identity. Opaque to the core: the runtime maps it to an
+/// address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PeerId(u64);
 impl PeerId {
@@ -10,14 +20,22 @@ impl PeerId {
     }
 }
 
+/// Something that happened outside the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event<'a> {
+    /// Time passed. See [`Node::handle`](crate::node::Node::handle) for how
+    /// often it should come.
     Tick,
+    /// A datagram arrived. The bytes are borrowed: the core copies what it
+    /// keeps.
     MessageReceived { from: PeerId, bytes: &'a [u8] },
 }
 
+/// Something the core asks the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// Send the bytes to `peer` as one datagram. Losing it is fine: the
+    /// protocol is built for loss.
     SendTo { peer: PeerId, bytes: Vec<u8> },
 }
 

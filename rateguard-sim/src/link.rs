@@ -1,8 +1,11 @@
+//! Simulated networks.
+
 use rateguard_core::gcra::Nanos;
 use rateguard_core::rng::Rng;
 
 pub type NodeIndex = usize;
 
+/// What the network does with one datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fate {
     Lost,
@@ -20,6 +23,8 @@ impl Fate {
     }
 }
 
+/// The network between the nodes. It decides each datagram's fate the
+/// moment it is sent.
 pub trait Link {
     fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, len: usize) -> Fate;
 }
@@ -46,6 +51,7 @@ impl Link for PerfectLink {
     }
 }
 
+/// The knobs of a [`SeededLink`]. Probabilities are per datagram.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NetConfig {
     pub latency: Nanos,
@@ -68,6 +74,8 @@ impl NetConfig {
     }
 }
 
+/// A network that loses, delays, reorders and duplicates datagrams at
+/// random, reproducibly from its seed.
 pub struct SeededLink {
     config: NetConfig,
     rng: Rng,

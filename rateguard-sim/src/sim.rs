@@ -1,3 +1,5 @@
+//! The event loop: a priority queue of events in virtual time.
+
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -9,6 +11,8 @@ use rateguard_core::node::{Node, SwimConfig};
 use crate::invariant::{self, Happened, Invariant, View};
 use crate::link::{Link, NodeIndex};
 
+/// How often every node ticks: a quarter of the protocol period, so the ACK
+/// timeout is checked in time.
 pub const TICK: Nanos = 50_000_000;
 
 pub fn peer_of(index: NodeIndex) -> PeerId {
@@ -72,6 +76,7 @@ pub struct Admission {
     pub decision: Decision,
 }
 
+/// A simulated cluster.
 pub struct Sim<L: Link> {
     nodes: Vec<Node>,
     swim: SwimConfig,
@@ -87,15 +92,18 @@ pub struct Sim<L: Link> {
     config: Config,
     invariants: Vec<Box<dyn Invariant>>,
     events: u64,
+    datagrams: Vec<u64>,
+    largest_datagram: usize,
 }
 
 impl<L: Link> Sim<L> {
-    // Every node knows the whole cluster from the start.
+    /// A cluster where every node knows every other from the start.
     pub fn new(node_count: usize, config: Config, link: L) -> Self {
         Self::build(node_count, config, link, Bootstrap::Static)
     }
 
-    // Every node knows only the seeds and has to join through them.
+    /// A cluster where every node knows only the seeds and joins through
+    /// them.
     pub fn with_seeds(node_count: usize, config: Config, link: L, seeds: &[NodeIndex]) -> Self {
         assert!(!seeds.is_empty(), "with no seed nobody can find anybody");
         assert!(
@@ -133,6 +141,8 @@ impl<L: Link> Sim<L> {
             config,
             invariants: invariant::standard(),
             events: 0,
+            datagrams: vec![0; node_count],
+            largest_datagram: 0,
         };
 
         for index in 0..node_count {
@@ -168,17 +178,17 @@ impl<L: Link> Sim<L> {
         node
     }
 
-    // A stop-the-world pause: the node handles nothing in [from, until), and
-    // everything that came for it in between is handled at `until`, in the
-    // order it came, like datagrams waiting in a socket buffer.
+    /// A stop-the-world pause: the node handles nothing in `[from, until)`,
+    /// and everything that came for it meanwhile is handled at `until`, in
+    /// the order it came, like datagrams waiting in a socket buffer.
     pub fn pause(&mut self, node: NodeIndex, from: Nanos, until: Nanos) {
         assert!(node < self.nodes.len(), "no such node: {node}");
         assert!(from < until, "an empty pause: {from}..{until}");
         self.pauses.push(Pause { node, from, until });
     }
 
-    // The node is down in [down_at, up_at): whatever is sent to it is lost.
-    // At up_at a fresh instance starts under the same ID.
+    /// The node is down in `[down_at, up_at)`, and whatever is sent to it is
+    /// lost. At `up_at` a fresh instance starts under the same ID.
     pub fn schedule_restart(&mut self, node: NodeIndex, down_at: Nanos, up_at: Nanos) {
         assert!(node < self.nodes.len(), "no such node: {node}");
         assert!(down_at < up_at, "a restart must take some time");
@@ -188,6 +198,16 @@ impl<L: Link> Sim<L> {
 
     pub fn is_down(&self, node: NodeIndex) -> bool {
         self.down[node]
+    }
+
+    /// Datagrams the node sent, counted before the link decides their fate.
+    pub fn datagrams_sent(&self, node: NodeIndex) -> u64 {
+        self.datagrams[node]
+    }
+
+    /// The largest datagram any node sent, in bytes.
+    pub fn largest_datagram(&self) -> usize {
+        self.largest_datagram
     }
 
     pub fn now(&self) -> Nanos {
@@ -248,6 +268,7 @@ impl<L: Link> Sim<L> {
             },
         );
     }
+    /// Runs every event up to and including `deadline`.
     pub fn run_until(&mut self, deadline: Nanos) {
         assert!(
             deadline >= self.now,
@@ -320,6 +341,8 @@ impl<L: Link> Sim<L> {
                 self.down[target] = false;
                 let generation = self.generations[target];
                 self.schedule(now, target, Kind::Tick { generation });
+                self.check_invariants(target, &Happened::Restart);
+                self.events += 1;
                 return;
             }
             Kind::Tick { generation } if generation != self.generations[target] => return,
@@ -398,6 +421,8 @@ impl<L: Link> Sim<L> {
             link,
             now,
             next_seq,
+            datagrams,
+            largest_datagram,
             ..
         } = self;
         let now = *now;
@@ -406,6 +431,8 @@ impl<L: Link> Sim<L> {
         for action in nodes[source].handle(event, now) {
             match action {
                 Action::SendTo { peer, bytes } => {
+                    datagrams[source] += 1;
+                    *largest_datagram = (*largest_datagram).max(bytes.len());
                     let target = peer.get() as usize;
                     assert!(
                         target < node_count,

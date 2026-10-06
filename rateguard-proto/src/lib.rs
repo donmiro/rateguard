@@ -1,9 +1,21 @@
+//! The rateguard wire format: SWIM messages, encoded with `postcard`.
+//!
+//! Every message fits one UDP datagram of [`MAX_DATAGRAM`] bytes. The
+//! membership part is capped at [`MAX_UPDATES`] updates, under 300 bytes in
+//! the worst case, which leaves the rest of the datagram to the demand
+//! entries of the allocation layer.
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// The largest datagram, in bytes: under a typical 1500-byte MTU with room
+/// for IP and UDP headers, so nothing is ever fragmented.
 pub const MAX_DATAGRAM: usize = 1400;
+/// The most membership updates one message may carry.
 pub const MAX_UPDATES: usize = 16;
 
+/// A member's state. The declaration order is the order of precedence
+/// within one incarnation, and it is relied on: do not reorder.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Status {
     Alive,
@@ -11,6 +23,7 @@ pub enum Status {
     Dead,
 }
 
+/// A piece of news about one member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Update {
     pub member: u64,
@@ -18,6 +31,13 @@ pub struct Update {
     pub status: Status,
 }
 impl Update {
+    /// Whether this news is newer than `other`: a higher incarnation wins,
+    /// and within one incarnation `Dead` beats `Suspect` beats `Alive`.
+    /// News never supersedes itself, so an echo is never mistaken for news.
+    ///
+    /// # Panics
+    ///
+    /// If the two are about different members.
     pub fn supersedes(&self, other: &Update) -> bool {
         assert_eq!(
             self.member, other.member,
@@ -27,16 +47,16 @@ impl Update {
     }
 }
 
+/// A SWIM message. Every one carries membership news. The variant order is
+/// the wire format: do not reorder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
-    Ping {
-        seq: u32,
-        updates: Vec<Update>,
-    },
-    Ack {
-        seq: u32,
-        updates: Vec<Update>,
-    },
+    /// Are you alive? The answer is an `Ack` with the same `seq`.
+    Ping { seq: u32, updates: Vec<Update> },
+    /// The answer to a `Ping`, or to a `PingReq` relayed by a helper.
+    Ack { seq: u32, updates: Vec<Update> },
+    /// Probe `target` for me: I could not reach it myself. If it answers,
+    /// the helper sends me an `Ack` with this `seq`.
     PingReq {
         seq: u32,
         target: u64,
@@ -61,11 +81,16 @@ impl Message {
     }
 }
 
+/// Why a message could not be encoded or decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    /// More than [`MAX_UPDATES`] updates.
     TooManyUpdates(usize),
+    /// Larger than [`MAX_DATAGRAM`] bytes.
     TooLarge(usize),
+    /// Not a rateguard message.
     Malformed,
+    /// A valid message followed by extra bytes.
     TrailingBytes(usize),
 }
 impl fmt::Display for Error {
@@ -80,6 +105,7 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
+/// Encodes a message into one datagram.
 pub fn encode(message: &Message) -> Result<Vec<u8>, Error> {
     check_updates(message)?;
     let bytes = postcard::to_allocvec(message).expect("a Message always serialized");
@@ -89,6 +115,8 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
+/// Decodes one datagram. Anything that is not exactly one valid message is
+/// refused: the bytes come from the network.
 pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
     if bytes.len() > MAX_DATAGRAM {
         return Err(Error::TooLarge(bytes.len()));
@@ -247,5 +275,58 @@ mod tests {
             ..update(0, Status::Alive)
         };
         update(1, Status::Alive).supersedes(&other);
+    }
+
+    mod properties {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        fn update() -> impl Strategy<Value = Update> {
+            (
+                any::<u64>(),
+                any::<u32>(),
+                prop_oneof![
+                    Just(Status::Alive),
+                    Just(Status::Suspect),
+                    Just(Status::Dead)
+                ],
+            )
+                .prop_map(|(member, incarnation, status)| Update {
+                    member,
+                    incarnation,
+                    status,
+                })
+        }
+
+        fn message() -> impl Strategy<Value = Message> {
+            let updates = || prop::collection::vec(update(), 0..=MAX_UPDATES);
+            prop_oneof![
+                (any::<u32>(), updates()).prop_map(|(seq, updates)| Message::Ping { seq, updates }),
+                (any::<u32>(), updates()).prop_map(|(seq, updates)| Message::Ack { seq, updates }),
+                (any::<u32>(), any::<u64>(), updates()).prop_map(|(seq, target, updates)| {
+                    Message::PingReq {
+                        seq,
+                        target,
+                        updates,
+                    }
+                }),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn any_bytes_from_the_network_are_decoded_or_refused_never_a_panic(
+                bytes in prop::collection::vec(any::<u8>(), 0..2 * MAX_DATAGRAM)
+            ) {
+                let _ = decode(&bytes);
+            }
+
+            #[test]
+            fn every_valid_message_survives_the_wire(message in message()) {
+                let bytes = encode(&message).unwrap();
+                prop_assert!(bytes.len() <= MAX_DATAGRAM);
+                prop_assert_eq!(decode(&bytes).unwrap(), message);
+            }
+        }
     }
 }

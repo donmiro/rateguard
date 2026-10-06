@@ -1,5 +1,14 @@
+//! A key's demand: an exponentially weighted moving average of attempts per
+//! second.
+//!
+//! It counts attempts, not admissions. Counting admissions would close a
+//! feedback loop: a small share admits little, so demand looks small, so the
+//! share shrinks further. The weight of each tick depends on the time since
+//! the previous one, so the average does not depend on how often it ticks.
+
 use crate::gcra::Nanos;
 
+/// One key's demand, in attempts per second.
 #[derive(Debug, Clone, Copy)]
 pub struct Demand {
     current_rate: f64,
@@ -17,6 +26,8 @@ impl Demand {
         }
     }
 
+    /// Starts measuring at `now`, so the first tick already has an interval
+    /// to measure instead of spending it on a baseline.
     pub fn starting_at(time_constant: Nanos, now: Nanos) -> Self {
         Self {
             last_tick: Some(now),
@@ -24,10 +35,12 @@ impl Demand {
         }
     }
 
+    /// Counts a request, admitted or not.
     pub fn record_attempt(&mut self) {
         self.attempts_since_tick += 1;
     }
 
+    /// Folds the attempts since the last tick into the average.
     pub fn tick(&mut self, now: Nanos) {
         let Some(last) = self.last_tick else {
             self.last_tick = Some(now);

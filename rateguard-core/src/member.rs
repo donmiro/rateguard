@@ -1,3 +1,24 @@
+//! SWIM's member table: who is in the cluster, in which state and
+//! incarnation. A pure state machine, with no network at all.
+//!
+//! News about a member is an [`Update`], and newer news wins by
+//! [`Update::supersedes`]: a higher incarnation beats anything, and within
+//! one incarnation `Dead` beats `Suspect` beats `Alive`. Only the member
+//! itself raises its incarnation, to refute news about itself.
+//!
+//! Two departures from the SWIM paper, both on purpose:
+//!
+//! - `Dead` is not final. A higher incarnation brings a member back, so a
+//!   node restarted under the same ID, or one that was only paused, can
+//!   rejoin.
+//! - A stale accusation is answered too. A node that hears it is suspected
+//!   or dead in an older incarnation repeats its current `Alive`: the
+//!   accuser missed the refutation, and nothing else would tell it.
+//!
+//! A suspect still counts toward the cluster size, so a GC pause does not
+//! reshuffle everyone's shares. Only the dead leave
+//! [`peers`](Membership::peers).
+
 use rateguard_proto::{Status, Update};
 use std::collections::BTreeMap;
 
@@ -5,10 +26,17 @@ use crate::boundary::PeerId;
 use crate::gcra::Nanos;
 use crate::membership::{Change, Membership};
 
+/// What applying a piece of news did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
+    /// Old or repeated news: nothing changed.
     Ignored,
+    /// The news was new and is now in the table; pass it on. `from` is the
+    /// member's previous status, `None` for a stranger.
     Accepted { from: Option<Status> },
+    /// The news was about this node and wrong. Spread the update instead:
+    /// it is this node's current `Alive`, at a higher incarnation if that
+    /// was needed to win.
     Refuted(Update),
 }
 
@@ -28,6 +56,7 @@ impl Member {
     }
 }
 
+/// One node's view of the cluster.
 #[derive(Debug, Clone)]
 pub struct MemberTable {
     local: PeerId,
@@ -47,6 +76,8 @@ impl MemberTable {
         }
     }
 
+    /// This node's own incarnation. Only it can raise it, and only to
+    /// refute news about itself.
     pub fn incarnation(&self) -> u32 {
         self.incarnation
     }
@@ -58,6 +89,8 @@ impl MemberTable {
         self.members.get(&peer).map(|member| member.status)
     }
 
+    /// What this node would say about `peer`: the record to gossip, or to
+    /// compare news against. `None` for a stranger.
     pub fn update_about(&self, peer: PeerId) -> Option<Update> {
         if peer == self.local {
             return Some(self.own_update());
@@ -65,6 +98,8 @@ impl MemberTable {
         self.members.get(&peer).map(|member| member.update(peer))
     }
 
+    /// Applies news heard at `now`. News about this node itself is never
+    /// taken as fact: it is refuted or ignored.
     pub fn apply(&mut self, update: Update, now: Nanos) -> Applied {
         let peer = PeerId::new(update.member);
         if peer == self.local {
@@ -114,6 +149,9 @@ impl MemberTable {
         }
     }
 
+    /// Marks an alive member as suspect after a failed probe and returns the
+    /// news to gossip. `None` if the member was not alive: a suspicion is
+    /// never renewed, its timer runs from the first one.
     pub fn suspect(&mut self, peer: PeerId, now: Nanos) -> Option<Update> {
         assert_ne!(peer, self.local, "a node never suspects itself");
 
@@ -129,6 +167,7 @@ impl MemberTable {
         Some(update)
     }
 
+    /// Members known to be dead and not yet forgotten.
     pub fn dead(&self) -> impl Iterator<Item = PeerId> + '_ {
         self.members
             .iter()
@@ -136,6 +175,9 @@ impl MemberTable {
             .map(|(&peer, _)| peer)
     }
 
+    /// Drops the members dead for at least `ttl` and returns how many. A
+    /// forgotten member is a stranger again: late news about it is accepted
+    /// as new. That is the price of a table bounded in size.
     pub fn forget_dead(&mut self, now: Nanos, ttl: Nanos) -> usize {
         let before = self.members.len();
         self.members.retain(|_, member| {
@@ -144,6 +186,8 @@ impl MemberTable {
         before - self.members.len()
     }
 
+    /// Declares dead every suspect suspected for at least `timeout` and
+    /// returns the news to gossip.
     pub fn expire_suspects(&mut self, now: Nanos, timeout: Nanos) -> Vec<Update> {
         assert!(
             timeout > 0,

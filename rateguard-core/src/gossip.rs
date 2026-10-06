@@ -1,10 +1,13 @@
+//! The piggyback buffer: news waiting for a ride on outgoing messages.
+
 use rateguard_proto::Update;
 use std::collections::BTreeMap;
 
 pub const RETRANSMIT_MULT: u32 = 4;
 
-// SWIM spreads a piece of news λ·log(N) times: enough for an infection to
-// reach the whole cluster with high probability, and no more.
+/// How many times a piece of news is sent: λ·⌈log₁₀(N+1)⌉. SWIM's analysis
+/// shows λ·log(N) is enough for an infection to reach the whole cluster with
+/// high probability; more would be wasted bandwidth.
 pub fn retransmit_limit(cluster_size: usize) -> u32 {
     assert!(cluster_size > 0, "a cluster has at least the local node");
     let rounds = ((cluster_size + 1) as f64).log10().ceil() as u32;
@@ -26,14 +29,18 @@ impl Gossip {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.queue.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
+    /// Queues news to spread. It replaces older news about the same member
+    /// and restarts its count; stale news is refused.
     pub fn push(&mut self, update: Update) -> bool {
         if let Some(pending) = self.queue.get(&update.member)
             && !update.supersedes(&pending.update)
@@ -50,6 +57,8 @@ impl Gossip {
         true
     }
 
+    /// Takes up to `max` updates for one message, least sent first, and
+    /// drops the ones sent `limit` times.
     pub fn take(&mut self, max: usize, limit: u32) -> Vec<Update> {
         assert!(limit > 0, "news sent zero times reaches nobody");
 

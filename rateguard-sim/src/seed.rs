@@ -1,3 +1,6 @@
+//! Seeds and their replay. Pin one with `RATEGUARD_SEED=<n> cargo test` to
+//! replay a failed run exactly.
+
 use rateguard_core::rng::Rng;
 use std::collections::hash_map::RandomState;
 use std::env::{self, VarError};
@@ -6,12 +9,15 @@ use std::thread;
 
 pub const SEED_VAR: &str = "RATEGUARD_SEED";
 
+/// Runs a scenario on one seed: the pinned one, or a fresh one. On failure
+/// the seed is printed with the command that replays it.
 pub fn seeded(scenario: impl FnOnce(u64)) {
     let seed = pinned().unwrap_or_else(fresh);
     let _report = Report(seed);
     scenario(seed);
 }
 
+/// Runs a scenario on `count` fresh seeds, or only on the pinned one.
 pub fn each_seed(count: usize, mut scenario: impl FnMut(u64)) {
     for seed in plan(pinned(), count, fresh()) {
         let _report = Report(seed);

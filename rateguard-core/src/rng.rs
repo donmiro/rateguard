@@ -1,3 +1,10 @@
+//! A small deterministic PRNG.
+//!
+//! The protocol needs randomness: the probe order, the PING-REQ helpers, the
+//! reconnect targets. It must also replay: the same seed, the same run. Not
+//! for cryptography.
+
+/// SplitMix64. The whole state is one `u64`, so a seed is a full replay.
 #[derive(Debug, Clone)]
 pub struct Rng {
     state: u64,
@@ -15,10 +22,12 @@ impl Rng {
         z ^ (z >> 31)
     }
 
+    /// Uniform in `[0, 1)`.
     pub fn unit(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    /// Uniform in `0..=max`.
     pub fn up_to(&mut self, max: u64) -> u64 {
         let draw = self.next_u64();
         match max.checked_add(1) {
@@ -27,6 +36,7 @@ impl Rng {
         }
     }
 
+    /// Fisher-Yates: every order equally likely.
     pub fn shuffle<T>(&mut self, items: &mut [T]) {
         for i in (1..items.len()).rev() {
             let j = self.up_to(i as u64) as usize;

@@ -1,5 +1,8 @@
+//! Properties checked after every event of a simulation.
+
 use rateguard_core::gcra::{Decision, Nanos};
 use rateguard_core::limiter::Config;
+use rateguard_core::membership;
 use rateguard_core::node::Node;
 
 use std::collections::{HashMap, VecDeque};
@@ -14,6 +17,7 @@ pub enum Happened {
     Tick,
     Delivery,
     Admission(Admission),
+    Restart,
 }
 
 pub struct View<'a> {
@@ -25,17 +29,59 @@ pub struct View<'a> {
     pub config: &'a Config,
 }
 
+/// A property checked after every event of a run. A violation stops the run
+/// at the event that broke it.
 pub trait Invariant {
     fn name(&self) -> &'static str;
     fn check(&mut self, view: &View<'_>) -> Result<(), String>;
 }
 
+/// The invariants every simulation checks.
 pub fn standard() -> Vec<Box<dyn Invariant>> {
     vec![
         Box::new(HotSetBounded),
         Box::new(TrackedKeysBounded),
         Box::new(AdmissionWindow::new(ONE_SEC)),
+        Box::new(MembershipContract),
+        Box::new(IncarnationNeverDrops::default()),
     ]
+}
+
+pub struct MembershipContract;
+impl Invariant for MembershipContract {
+    fn name(&self) -> &'static str {
+        "membership-contract"
+    }
+
+    fn check(&mut self, view: &View<'_>) -> Result<(), String> {
+        membership::check_contract(view.nodes[view.target].members())
+    }
+}
+
+/// Only the node itself raises its incarnation, and only upward: a
+/// refutation that went back in time would lose to the very suspicion it
+/// answers. A restart is the one legitimate reset.
+#[derive(Default)]
+pub struct IncarnationNeverDrops {
+    seen: HashMap<NodeIndex, u32>,
+}
+impl Invariant for IncarnationNeverDrops {
+    fn name(&self) -> &'static str {
+        "incarnation-never-drops"
+    }
+
+    fn check(&mut self, view: &View<'_>) -> Result<(), String> {
+        let now = view.nodes[view.target].members().incarnation();
+        if *view.happened == Happened::Restart {
+            self.seen.insert(view.target, now);
+            return Ok(());
+        }
+        let before = self.seen.insert(view.target, now).unwrap_or(0);
+        if now < before {
+            return Err(format!("incarnation went from {before} down to {now}"));
+        }
+        Ok(())
+    }
 }
 
 pub struct HotSetBounded;
@@ -307,6 +353,74 @@ mod tests {
         assert!(
             window
                 .check(&view(&nodes, &config, &allowed(0, KEY + 1)))
+                .is_ok()
+        );
+    }
+
+    fn refuted_once() -> Node {
+        let mut node = Node::new(config(), SwimConfig::default(), PeerId::new(0), 0);
+        let accusation = rateguard_proto::encode(&rateguard_proto::Message::Ping {
+            seq: 1,
+            updates: vec![rateguard_proto::Update {
+                member: 0,
+                incarnation: 0,
+                status: rateguard_proto::Status::Suspect,
+            }],
+        })
+        .unwrap();
+        node.handle(
+            Event::MessageReceived {
+                from: PeerId::new(1),
+                bytes: &accusation,
+            },
+            0,
+        );
+        assert_eq!(node.members().incarnation(), 1);
+        node
+    }
+
+    #[test]
+    fn a_dropping_incarnation_is_caught_unless_the_node_restarted() {
+        let config = config();
+        let refuted = [refuted_once()];
+        let fresh = [Node::new(config, SwimConfig::default(), PeerId::new(0), 0)];
+
+        let mut invariant = IncarnationNeverDrops::default();
+        invariant
+            .check(&view(&refuted, &config, &Happened::Tick))
+            .unwrap();
+        let err = invariant
+            .check(&view(&fresh, &config, &Happened::Tick))
+            .unwrap_err();
+        assert!(err.contains("from 1 down to 0"), "{err}");
+
+        let mut invariant = IncarnationNeverDrops::default();
+        invariant
+            .check(&view(&refuted, &config, &Happened::Tick))
+            .unwrap();
+        assert!(
+            invariant
+                .check(&view(&fresh, &config, &Happened::Restart))
+                .is_ok()
+        );
+        assert!(
+            invariant
+                .check(&view(&fresh, &config, &Happened::Tick))
+                .is_ok(),
+            "the count restarts with the node"
+        );
+    }
+
+    #[test]
+    fn a_healthy_node_keeps_the_membership_contract() {
+        let config = config();
+        let mut node = Node::new(config, SwimConfig::default(), PeerId::new(0), 0);
+        node.introduce(PeerId::new(2));
+        node.introduce(PeerId::new(1));
+        let nodes = [node];
+        assert!(
+            MembershipContract
+                .check(&view(&nodes, &config, &Happened::Tick))
                 .is_ok()
         );
     }

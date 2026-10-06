@@ -37,8 +37,9 @@ if guard.check("api:tenant-42").is_allowed() {
 - **Shares follow demand.** Nodes exchange observed demand and take a
   proportional slice of the limit, so an uneven load balancer does not leave one
   node rejecting traffic while its neighbours idle.
-- **Bandwidth independent of traffic.** One UDP datagram per node per 200 ms,
-  whether you serve ten requests per second or a hundred thousand.
+- **Bandwidth independent of traffic.** Two UDP datagrams per node per 200 ms
+  in a healthy cluster, whether you serve ten requests per second or a
+  hundred thousand.
 - **Bounded memory.** Configured ceilings on tracked keys, independent of how
   many distinct keys your traffic actually contains.
 - **Network partitions are a configuration choice**, with proven overshoot bounds
@@ -235,7 +236,8 @@ always what you want.
 2. A healthy cluster in steady state admits between `R × (1 − ε)` and `R`.
 3. Under partition, the bounds above, according to the selected policy.
 4. Memory is `O(hot_keys × N)`, bounded by configuration.
-5. Bandwidth is one datagram per node per protocol period.
+5. Bandwidth in a healthy cluster is two datagrams per node per protocol
+   period: the node's own probe and, on average, one answer to a probe of it.
 
 ## Compared to a shared counter
 
@@ -243,7 +245,7 @@ always what you want.
 |---|---|---|
 | Decision latency | network round trip (~0.2–1 ms) | ~50 ns, local |
 | Store unavailable | service degrades | nothing to be unavailable |
-| Network load | linear in request volume | one datagram per node per 200 ms |
+| Network load | linear in request volume | two datagrams per node per 200 ms |
 | Memory | linear in key count | bounded by configuration |
 | Accuracy under partition | undefined | proven bounds, selected by config |
 | Operational cost | a datastore to run and scale | a UDP port |
@@ -282,9 +284,11 @@ hand it a fresh full quota.
 each uses only its own monotonic clock, and what travels between them are demand
 estimates.
 
-**How much traffic does gossip generate?** One datagram per node per protocol
-period, 200 ms by default, capped at a 1400-byte MTU. A fifty-node cluster
-exchanges roughly 350 KB/s in total, no matter how much traffic it serves.
+**How much traffic does gossip generate?** In a healthy cluster, two datagrams
+per node per protocol period (200 ms by default), each capped at a 1400-byte
+MTU. A fifty-node cluster exchanges at most about 700 KB/s in total, no matter
+how much traffic it serves. Failures add indirect probes for as long as they
+last.
 
 **Can I use it from services that aren't in Rust?** Not yet. A sidecar speaking
 gRPC/HTTP is planned.

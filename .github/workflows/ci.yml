@@ -22,6 +22,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Docs
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
       # Simulator sweeps draw fresh seeds on every run; a failure prints
       # the RATEGUARD_SEED=... line that replays it locally.
       - name: Test

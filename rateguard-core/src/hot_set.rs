@@ -1,3 +1,15 @@
+//! The keys that need coordination.
+//!
+//! A key is hot while its demand is above the threshold `R/N × α` (see
+//! [`limiter`](crate::limiter)). Below it a key is served locally on a fixed
+//! share, and all such keys together cannot exceed `R × α` cluster-wide. Hot
+//! keys have their demand gossiped and get a share proportional to it.
+//!
+//! A key that drops below the threshold stays hot for `cooldown` before it
+//! is demoted, so a key near the line does not flap. When the set is full a
+//! newcomer evicts the weakest key, but only if it beats it by 10%, for the
+//! same reason.
+
 use std::collections::HashMap;
 
 use crate::gcra::Nanos;
@@ -10,6 +22,7 @@ struct HotEntry {
     demand: f64,
 }
 
+/// The hot keys of one node, bounded in size.
 #[derive(Debug)]
 pub struct HotSet {
     cooldown: Nanos,
@@ -26,6 +39,8 @@ impl HotSet {
         }
     }
 
+    /// Feeds a key's current demand and returns whether the key is hot
+    /// afterwards.
     pub fn update(&mut self, key: u64, demand_rate: f64, threshold: f64, now: Nanos) -> bool {
         if demand_rate > threshold {
             self.promote(key, demand_rate)

@@ -89,8 +89,10 @@ impl<L: Link> Sim<L> {
         };
 
         for index in 0..node_count {
-            let mut node = Node::new(config);
-            node.set_cluster_size(node_count);
+            let mut node = Node::new(config, peer_of(index), index as u64);
+            for other in (0..node_count).filter(|&other| other != index) {
+                node.introduce(peer_of(other));
+            }
             sim.nodes.push(node);
             sim.schedule(first_tick(index, node_count), index, Kind::Tick);
         }
@@ -107,6 +109,10 @@ impl<L: Link> Sim<L> {
 
     pub fn pending(&self) -> usize {
         self.queue.len()
+    }
+
+    pub fn node(&self, index: NodeIndex) -> &Node {
+        &self.nodes[index]
     }
 
     pub fn admissions(&self) -> &[Admission] {
@@ -318,7 +324,7 @@ fn first_tick(index: NodeIndex, node_count: usize) -> Nanos {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::link::PerfectLink;
+    use crate::link::{NetConfig, PerfectLink, SeededLink};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -491,7 +497,9 @@ mod tests {
         }
 
         fn check(&mut self, view: &View<'_>) -> Result<(), String> {
-            self.0.borrow_mut().push((view.event, view.happened.clone()));
+            self.0
+                .borrow_mut()
+                .push((view.event, view.happened.clone()));
             Ok(())
         }
     }
@@ -520,7 +528,10 @@ mod tests {
 
         let seen = seen.borrow();
         let ticks = seen.iter().filter(|(_, h)| *h == Happened::Tick).count();
-        let deliveries = seen.iter().filter(|(_, h)| *h == Happened::Delivery).count();
+        let deliveries = seen
+            .iter()
+            .filter(|(_, h)| *h == Happened::Delivery)
+            .count();
         let admissions = seen
             .iter()
             .filter(|(_, h)| matches!(h, Happened::Admission(_)))
@@ -533,6 +544,37 @@ mod tests {
             seen.iter().map(|(n, _)| *n).eq(0..seen.len() as u64),
             "event numbers must count every step without gaps"
         );
+    }
+
+    #[test]
+    fn every_probe_on_a_perfect_wire_is_answered() {
+        let mut s = sim(5);
+        s.run_until(ONE_SEC + 10 * ONE_MS);
+
+        for index in 0..s.node_count() {
+            assert_eq!(
+                s.node(index).awaiting_ack(),
+                None,
+                "node {index} pinged at most 50 ms ago, the round trip is 2 ms"
+            );
+        }
+    }
+
+    #[test]
+    fn every_probe_on_a_dead_wire_hangs() {
+        let dead = NetConfig {
+            loss: 1.0,
+            ..NetConfig::perfect(ONE_MS)
+        };
+        let mut s = Sim::new(5, config(), SeededLink::new(1, dead));
+        s.run_until(ONE_SEC + 10 * ONE_MS);
+
+        for index in 0..s.node_count() {
+            assert!(
+                s.node(index).awaiting_ack().is_some(),
+                "node {index} heard back over a wire that loses everything"
+            );
+        }
     }
 
     #[test]

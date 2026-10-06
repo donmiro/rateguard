@@ -132,7 +132,7 @@ impl Invariant for AdmissionWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rateguard_core::boundary::Event;
+    use rateguard_core::boundary::{Event, PeerId};
 
     const KEY: u64 = 42;
 
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn a_hot_set_over_its_size_is_caught() {
-        let mut node = Node::new(config());
+        let mut node = Node::new(config(), PeerId::new(0), 0);
         for _ in 0..5000 {
             node.check(KEY, 0);
         }
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn tracked_keys_are_bounded_only_after_a_tick() {
-        let mut node = Node::new(config());
+        let mut node = Node::new(config(), PeerId::new(0), 0);
         for key in 0..3 {
             node.check(key, 0);
         }
@@ -220,12 +220,16 @@ mod tests {
 
     #[test]
     fn the_window_admits_the_rate_plus_one_burst_per_node() {
-        let nodes = [Node::new(config())];
+        let nodes = [Node::new(config(), PeerId::new(0), 0)];
         let config = config();
         let mut window = AdmissionWindow::new(ONE_SEC);
 
         for _ in 0..1010 {
-            assert!(window.check(&view(&nodes, &config, &allowed(0, KEY))).is_ok());
+            assert!(
+                window
+                    .check(&view(&nodes, &config, &allowed(0, KEY)))
+                    .is_ok()
+            );
         }
         let err = window
             .check(&view(&nodes, &config, &allowed(0, KEY)))
@@ -235,7 +239,7 @@ mod tests {
 
     #[test]
     fn the_window_forgets_what_slid_out_of_it() {
-        let nodes = [Node::new(config())];
+        let nodes = [Node::new(config(), PeerId::new(0), 0)];
         let config = config();
         let mut window = AdmissionWindow::new(ONE_SEC);
 
@@ -253,7 +257,7 @@ mod tests {
 
     #[test]
     fn the_window_counts_keys_apart_and_ignores_denials() {
-        let nodes = [Node::new(config())];
+        let nodes = [Node::new(config(), PeerId::new(0), 0)];
         let config = config();
         let mut window = AdmissionWindow::new(ONE_SEC);
 

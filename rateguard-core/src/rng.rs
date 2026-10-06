@@ -26,6 +26,13 @@ impl Rng {
             Some(span) => ((draw as u128 * span as u128) >> 64) as u64,
         }
     }
+
+    pub fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            let j = self.up_to(i as u64) as usize;
+            items.swap(i, j);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +78,25 @@ mod tests {
         assert_eq!(seen, [true; 4], "both ends of 0..=3 must be reachable");
 
         rng.up_to(u64::MAX);
+    }
+
+    #[test]
+    fn a_shuffle_reaches_every_order_and_loses_nothing() {
+        use std::collections::HashSet;
+
+        let mut rng = Rng::new(3);
+        let mut orders = HashSet::new();
+        for _ in 0..1000 {
+            let mut items = [0, 1, 2];
+            rng.shuffle(&mut items);
+            let mut sorted = items;
+            sorted.sort();
+            assert_eq!(sorted, [0, 1, 2], "a shuffle only moves items around");
+            orders.insert(items);
+        }
+        assert_eq!(orders.len(), 6, "all 3! orders must be reachable");
+
+        rng.shuffle::<u8>(&mut []);
+        rng.shuffle(&mut [7]);
     }
 }

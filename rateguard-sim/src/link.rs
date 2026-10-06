@@ -1,6 +1,5 @@
 use rateguard_core::gcra::Nanos;
-
-use crate::rng::Rng;
+use rateguard_core::rng::Rng;
 
 pub type NodeIndex = usize;
 

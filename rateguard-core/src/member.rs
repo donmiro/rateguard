@@ -9,6 +9,7 @@ use crate::membership::{Change, Membership};
 pub enum Applied {
     Ignored,
     Accepted { from: Option<Status> },
+    Refuted(Update),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,11 +60,7 @@ impl MemberTable {
 
     pub fn update_about(&self, peer: PeerId) -> Option<Update> {
         if peer == self.local {
-            return Some(Update {
-                member: peer.get(),
-                incarnation: self.incarnation,
-                status: Status::Alive,
-            });
+            return Some(self.own_update());
         }
         self.members.get(&peer).map(|member| member.update(peer))
     }
@@ -71,7 +68,7 @@ impl MemberTable {
     pub fn apply(&mut self, update: Update, now: Nanos) -> Applied {
         let peer = PeerId::new(update.member);
         if peer == self.local {
-            return Applied::Ignored;
+            return self.refute(update);
         }
 
         let from = self.members.get(&peer).copied();
@@ -154,6 +151,26 @@ impl MemberTable {
             self.apply(update, now);
         }
         expired
+    }
+
+    fn own_update(&self) -> Update {
+        Update {
+            member: self.local.get(),
+            incarnation: self.incarnation,
+            status: Status::Alive,
+        }
+    }
+
+    fn refute(&mut self, news: Update) -> Applied {
+        if !news.supersedes(&self.own_update()) {
+            return Applied::Ignored;
+        }
+        // Only a corrupt datagram reaches u32::MAX; a panic on it would let one packet kill the node.
+        let Some(incarnation) = news.incarnation.checked_add(1) else {
+            return Applied::Ignored;
+        };
+        self.incarnation = incarnation;
+        Applied::Refuted(self.own_update())
     }
 }
 impl Membership for MemberTable {
@@ -349,12 +366,125 @@ mod tests {
     }
 
     #[test]
-    fn news_about_ourselves_is_not_taken_as_fact() {
+    fn a_suspicion_about_ourselves_is_refuted_with_a_higher_incarnation() {
         let mut t = table();
-        assert_eq!(t.apply(news(0, 0, Suspect), 0), Applied::Ignored);
-        assert_eq!(t.apply(news(0, 7, Dead), 0), Applied::Ignored);
+        assert_eq!(
+            t.apply(news(0, 0, Suspect), 0),
+            Applied::Refuted(news(0, 1, Alive))
+        );
+        assert_eq!(t.incarnation(), 1);
         assert_eq!(t.status(id(0)), Some(Alive));
-        assert_eq!(t.cluster_size(), 1);
+        assert_eq!(t.update_about(id(0)), Some(news(0, 1, Alive)));
+    }
+
+    #[test]
+    fn being_declared_dead_is_refuted_too() {
+        let mut t = table();
+        assert_eq!(
+            t.apply(news(0, 0, Dead), 0),
+            Applied::Refuted(news(0, 1, Alive)),
+            "a node back from a pause must be able to rejoin"
+        );
+    }
+
+    #[test]
+    fn a_refutation_outbids_the_news_not_our_own_count() {
+        let mut t = table();
+        assert_eq!(
+            t.apply(news(0, 7, Suspect), 0),
+            Applied::Refuted(news(0, 8, Alive)),
+            "after a restart the cluster remembers incarnation 7, so 1 would lose"
+        );
+        assert_eq!(t.incarnation(), 8);
+    }
+
+    #[test]
+    fn a_higher_alive_about_ourselves_is_refuted_as_well() {
+        let mut t = table();
+        assert_eq!(
+            t.apply(news(0, 3, Alive), 0),
+            Applied::Refuted(news(0, 4, Alive)),
+            "a previous life of ours must not outrank the current one"
+        );
+    }
+
+    #[test]
+    fn stale_news_and_echoes_about_ourselves_are_ignored() {
+        let mut t = table();
+        t.apply(news(0, 4, Suspect), 0);
+        assert_eq!(t.incarnation(), 5);
+
+        assert_eq!(
+            t.apply(news(0, 4, Suspect), 0),
+            Applied::Ignored,
+            "re-gossiped"
+        );
+        assert_eq!(t.apply(news(0, 4, Dead), 0), Applied::Ignored, "stale");
+        assert_eq!(
+            t.apply(news(0, 5, Alive), 0),
+            Applied::Ignored,
+            "our own echo"
+        );
+        assert_eq!(t.incarnation(), 5, "nothing above may bump it again");
+    }
+
+    #[test]
+    fn a_refutation_leaves_the_peers_alone() {
+        let mut t = table();
+        t.apply(news(1, 0, Alive), 0);
+        t.drain_changes();
+
+        t.apply(news(0, 0, Suspect), 0);
+        assert_eq!(t.peers(), [id(1)]);
+        assert_eq!(t.cluster_size(), 2);
+        assert!(t.drain_changes().is_empty());
+        check_contract(&t).unwrap();
+    }
+
+    #[test]
+    fn a_refutation_always_supersedes_what_it_refutes() {
+        for incarnation in [0, 1, 41, u32::MAX - 1] {
+            for status in [Alive, Suspect, Dead] {
+                let mut t = MemberTable::new(id(0));
+                let claim = news(0, incarnation, status);
+                if let Applied::Refuted(answer) = t.apply(claim, 0) {
+                    assert!(answer.supersedes(&claim), "{answer:?} vs {claim:?}");
+                } else {
+                    assert_eq!((incarnation, status), (0, Alive), "only our own echo");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_incarnation_that_cannot_be_outbid_is_ignored_not_a_panic() {
+        let mut t = table();
+        assert_eq!(t.apply(news(0, u32::MAX, Dead), 0), Applied::Ignored);
+        assert_eq!(t.incarnation(), 0);
+    }
+
+    #[test]
+    fn a_suspected_node_clears_its_name_across_two_tables() {
+        let mut a = MemberTable::new(id(1));
+        let mut b = MemberTable::new(id(2));
+        a.apply(b.update_about(id(2)).unwrap(), 0);
+
+        let suspicion = a.suspect(id(2), ONE_SEC).unwrap();
+        let Applied::Refuted(answer) = b.apply(suspicion, ONE_SEC) else {
+            panic!("b must refute the suspicion about itself");
+        };
+
+        assert_eq!(
+            a.apply(answer, 2 * ONE_SEC),
+            Applied::Accepted {
+                from: Some(Suspect)
+            }
+        );
+        assert_eq!(a.status(id(2)), Some(Alive));
+        assert!(
+            a.expire_suspects(100 * TIMEOUT, TIMEOUT).is_empty(),
+            "a refuted suspicion must not expire into death"
+        );
     }
 
     #[test]

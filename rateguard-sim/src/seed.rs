@@ -1,4 +1,4 @@
-use crate::rng::Rng;
+use rateguard_core::rng::Rng;
 use std::collections::hash_map::RandomState;
 use std::env::{self, VarError};
 use std::hash::{BuildHasher, Hasher};

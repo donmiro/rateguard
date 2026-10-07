@@ -213,12 +213,20 @@ impl AtomicGcra {
             return;
         }
         let (old_t, new_t) = (old.t_nanos() as f64, quota.t_nanos() as f64);
-        let _ = self
-            .tat
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |tat| {
-                let debt_slots = tat.saturating_sub(now) as f64 / old_t;
-                Some(now.saturating_add((debt_slots * new_t).round() as u64))
-            });
+        // A plain compare-and-swap loop: `fetch_update` is deprecated on
+        // newer toolchains and its replacement missing on older ones.
+        let mut tat = self.tat.load(Ordering::Acquire);
+        loop {
+            let debt_slots = tat.saturating_sub(now) as f64 / old_t;
+            let rescaled = now.saturating_add((debt_slots * new_t).round() as u64);
+            match self
+                .tat
+                .compare_exchange_weak(tat, rescaled, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(seen) => tat = seen,
+            }
+        }
     }
 
     /// See [`Gcra::has_debt`].

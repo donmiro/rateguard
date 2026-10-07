@@ -35,6 +35,7 @@ use crate::{
     limiter::{Config, Limiter},
     member::{Applied, MemberTable},
     membership::{Change, Membership},
+    partition::{self, PartitionPolicy, SizeHistory},
     peer_demand::{self, PeerDemand},
     rng::Rng,
 };
@@ -114,6 +115,10 @@ pub struct Node {
     round_number: u16,
     rounds_run: u64,
     own_demand: Vec<KeyDemand>,
+    policy: PartitionPolicy,
+    sizes: SizeHistory,
+    held_size: usize,
+    floored_until: Nanos,
 }
 impl Node {
     /// A node alone in its cluster. `seed` drives its random choices, so the
@@ -162,6 +167,10 @@ impl Node {
             round_number: 0,
             rounds_run: 0,
             own_demand: Vec::new(),
+            policy: PartitionPolicy::default(),
+            sizes: SizeHistory::new(hold_of(PartitionPolicy::default())),
+            held_size: 0,
+            floored_until: 0,
         }
     }
 
@@ -200,6 +209,23 @@ impl Node {
         self.members.cluster_size()
     }
 
+    /// What the node does when its cluster shrinks; see [`PartitionPolicy`].
+    pub fn set_partition_policy(&mut self, policy: PartitionPolicy) {
+        self.policy = policy;
+        self.sizes = SizeHistory::new(hold_of(policy));
+        self.held_size = 0;
+    }
+
+    pub fn partition_policy(&self) -> PartitionPolicy {
+        self.policy
+    }
+
+    // N as allocation sees it: the membership's, or under HoldDown the
+    // largest of the hold. Cold and hot keys use the same one (spec §4.1).
+    fn allocation_size(&self) -> usize {
+        self.members.cluster_size().max(self.held_size)
+    }
+
     pub fn members(&self) -> &MemberTable {
         &self.members
     }
@@ -232,7 +258,7 @@ impl Node {
     /// would break GCRA silently.
     pub fn check(&mut self, key: u64, now: Nanos) -> Decision {
         self.advance(now);
-        self.limiter.check(key, now, self.members.cluster_size())
+        self.limiter.check(key, now, self.allocation_size())
     }
 
     /// Handles an event and returns the datagrams to send.
@@ -281,12 +307,15 @@ impl Node {
             self.gossip.push(suspicion);
         }
         self.rounds_run = self.rounds_run.saturating_add(1);
+        self.apply_policy(now);
         self.apply_shares(now);
         self.report_demand();
-        self.follow_changes();
-        let stale = peer_demand::stale_after_rounds(self.members.cluster_size());
-        self.peer_demand
-            .expire(now, stale * self.swim.protocol_period);
+        self.follow_changes(now);
+        let stale = peer_demand::stale_after_rounds(self.allocation_size());
+        self.peer_demand.expire(
+            now,
+            stale * self.swim.protocol_period + hold_of(self.policy),
+        );
 
         // Reconnect: once in a while the probe goes to someone we have lost
         // instead. Nobody probes the dead, so after a mutual burial nothing
@@ -386,7 +415,7 @@ impl Node {
 
     // SWIM inserts a newcomer at a random place among the peers still to be
     // probed this round, so it is probed within the round it joined.
-    fn follow_changes(&mut self) {
+    fn follow_changes(&mut self, now: Nanos) {
         for change in self.members.drain_changes() {
             match change {
                 Change::Joined(peer) if !self.order[self.next..].contains(&peer) => {
@@ -395,7 +424,7 @@ impl Node {
                     self.order.insert(at, peer);
                 }
                 Change::Joined(_) => {}
-                Change::Left(peer) => self.peer_demand.forget(peer),
+                Change::Left(peer) => self.peer_demand.leave(peer, now, hold_of(self.policy)),
             }
         }
     }
@@ -565,8 +594,42 @@ impl Node {
     // the peers reported (spec §4.3). Until the node has been up long enough to hear
     // from every peer, what it has not heard may be demand: it learns, and
     // takes no more than an even split.
+    // Spec §5.1. HoldDown holds the cluster size here, and the demand of
+    // the peers that left in follow_changes. Quorum caps every key at the
+    // floor while this node sees no majority of the cluster it knows: the
+    // live peers, suspects not counted, against all of them, the dead too.
+    //
+    // A node that regains its quorum stays at the floor until every peer
+    // has had time to hear it: the majority forgot its demand during the
+    // split and, until it hears it again, still hands all of R out among
+    // itself.
+    fn apply_policy(&mut self, now: Nanos) {
+        let size = self.members.cluster_size();
+        self.held_size = self.sizes.record(now, size);
+
+        if self.policy != PartitionPolicy::Quorum {
+            self.limiter.set_cap(None);
+            return;
+        }
+        let alive = 1 + self
+            .members
+            .peers()
+            .iter()
+            .filter(|&&peer| self.members.status(peer) == Some(Status::Alive))
+            .count();
+        let known = size + self.members.dead().count();
+        if !partition::has_quorum(alive, known) {
+            let heard_within = peer_demand::stale_after_rounds(known) * self.swim.protocol_period;
+            self.floored_until = now + heard_within;
+        }
+        let config = self.limiter.config();
+        let floor = config.limit_per_sec as f64 * config.floor_factor / known as f64;
+        self.limiter
+            .set_cap((now < self.floored_until).then_some(floor));
+    }
+
     fn apply_shares(&mut self, now: Nanos) {
-        let cluster_size = self.members.cluster_size();
+        let cluster_size = self.allocation_size();
         let config = *self.limiter.config();
         let learning = self.rounds_run <= peer_demand::stale_after_rounds(cluster_size);
         let peers = &self.peer_demand;
@@ -633,9 +696,18 @@ impl Node {
     }
 }
 
+// How long HoldDown holds; nothing for the other policies.
+fn hold_of(policy: PartitionPolicy) -> Nanos {
+    match policy {
+        PartitionPolicy::HoldDown(hold) => hold,
+        PartitionPolicy::Optimistic | PartitionPolicy::Quorum => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition::PartitionPolicy;
     use crate::peer_demand::stale_after_rounds;
     use Status::{Alive, Dead, Suspect};
     use proto::{DemandReport, KeyDemand};
@@ -681,10 +753,14 @@ mod tests {
     }
 
     fn measured_interval(node: &mut Node, now: Nanos) -> Nanos {
+        measured_interval_of(node, KEY, now)
+    }
+
+    fn measured_interval_of(node: &mut Node, key: u64, now: Nanos) -> Nanos {
         for _ in 0..config().burst {
-            assert_eq!(node.check(KEY, now), Decision::Allow);
+            assert_eq!(node.check(key, now), Decision::Allow);
         }
-        let Decision::Deny { retry_at } = node.check(KEY, now) else {
+        let Decision::Deny { retry_at } = node.check(key, now) else {
             panic!("burst must be exhausted");
         };
         retry_at - now
@@ -1583,6 +1659,8 @@ mod tests {
     #[test]
     fn a_peer_that_leaves_the_cluster_is_forgotten() {
         let mut n = node_with([1]);
+        // HoldDown would keep counting it; see the partition tests.
+        n.set_partition_policy(PartitionPolicy::Optimistic);
         deliver(&mut n, 1, reporting(1, 3), 0);
         // Peer 1 never answers: suspected after a round, dead once the
         // suspicion times out, well before its demand would go stale.
@@ -1596,6 +1674,23 @@ mod tests {
     }
 
     #[test]
+    fn under_hold_down_a_peer_that_left_still_counts_until_the_hold_ends() {
+        let hold = 30 * PERIOD;
+        let mut n = node_with([1]);
+        n.set_partition_policy(PartitionPolicy::HoldDown(hold));
+        deliver(&mut n, 1, reporting(1, 3), 0);
+        let mut now = 0;
+        while n.members().status(PeerId::new(1)) != Some(Dead) {
+            now += TICK;
+            n.handle(Event::Tick, now);
+        }
+        n.handle(Event::Tick, now + hold - PERIOD);
+        assert!(!n.peer_demand().is_empty(), "held");
+        n.handle(Event::Tick, now + hold + PERIOD);
+        assert!(n.peer_demand().is_empty(), "released");
+    }
+
+    #[test]
     fn a_peer_not_heard_from_for_too_long_goes_stale() {
         let patient = SwimConfig {
             suspicion_timeout: 1000 * PERIOD,
@@ -1603,6 +1698,7 @@ mod tests {
             ..SWIM
         };
         let mut n = Node::new(config(), patient, LOCAL, 1);
+        n.set_partition_policy(PartitionPolicy::Optimistic);
         n.introduce(PeerId::new(1));
         deliver(&mut n, 1, reporting(1, 3), 0);
 
@@ -1710,6 +1806,96 @@ mod tests {
     fn a_key_a_peer_holds_only_secondary_stays_cold_here() {
         let n = lukewarm_with_peer(false);
         assert!(!n.limiter().is_hot(KEY));
+    }
+
+    // Four peers that never answer: all of them dead once the suspicion
+    // times out. Returns the time they are all buried.
+    fn abandoned(policy: PartitionPolicy) -> (Node, Nanos) {
+        let mut n = node_with([1, 2, 3, 4]);
+        n.set_partition_policy(policy);
+        let mut now = 0;
+        while n.cluster_size() > 1 {
+            now += TICK;
+            n.handle(Event::Tick, now);
+        }
+        (n, now)
+    }
+
+    // The rate a key new at `now` gets: after the next round, to let the
+    // policy see the latest membership.
+    fn cold_rate_after_round(n: &mut Node, now: Nanos) -> f64 {
+        let round = now.next_multiple_of(PERIOD);
+        n.handle(Event::Tick, round);
+        ONE_SEC as f64 / measured_interval_of(n, KEY + 7, round) as f64
+    }
+
+    #[test]
+    fn a_node_that_regains_its_quorum_stays_at_the_floor_until_it_is_heard() {
+        let (mut n, buried) = abandoned(PartitionPolicy::Quorum);
+        // The peers come back: every one of them says so.
+        let back = buried.next_multiple_of(PERIOD) + PERIOD;
+        for peer in 1..=4 {
+            let hello = Message::Ping {
+                seq: 1,
+                updates: vec![news(peer, 1, Alive)],
+                demand: Vec::new(),
+            };
+            deliver(&mut n, peer, hello, back);
+        }
+        assert_eq!(cold_rate_after_round(&mut n, back), 20.0, "just regained");
+
+        // From now on the peers answer every probe, refuting any suspicion
+        // the unanswered rounds above raised.
+        let mut now = back.next_multiple_of(PERIOD);
+        while now < back + stale_after_rounds(5) * PERIOD {
+            now += PERIOD;
+            for (peer, message) in sent(n.handle(Event::Tick, now)) {
+                if let Message::Ping { seq, .. } = message {
+                    let answer = Message::Ack {
+                        seq,
+                        updates: vec![news(peer.get(), 5, Alive)],
+                        demand: Vec::new(),
+                    };
+                    deliver(&mut n, peer.get(), answer, now + 1);
+                }
+            }
+        }
+        assert_eq!(n.cluster_size(), 5);
+        assert_eq!(cold_rate_after_round(&mut n, now + 1), 100.0, "α × R / 5");
+    }
+
+    #[test]
+    fn the_default_policy_is_a_ten_second_hold_down() {
+        assert_eq!(
+            node().partition_policy(),
+            PartitionPolicy::HoldDown(10 * ONE_SEC)
+        );
+    }
+
+    #[test]
+    fn optimistic_follows_the_surviving_cluster_at_once() {
+        let (mut n, buried) = abandoned(PartitionPolicy::Optimistic);
+        // Alone: α × R / 1.
+        assert_eq!(cold_rate_after_round(&mut n, buried), 500.0);
+    }
+
+    #[test]
+    fn hold_down_keeps_the_old_size_for_its_duration() {
+        let hold = 20 * PERIOD;
+        let (mut n, buried) = abandoned(PartitionPolicy::HoldDown(hold));
+        assert_eq!(cold_rate_after_round(&mut n, buried), 100.0, "α × R / 5");
+        assert_eq!(
+            cold_rate_after_round(&mut n, buried + hold + PERIOD),
+            500.0,
+            "α × R / 1"
+        );
+    }
+
+    #[test]
+    fn without_a_quorum_every_key_drops_to_the_floor() {
+        let (mut n, buried) = abandoned(PartitionPolicy::Quorum);
+        // R × β / 5, the five the node knows of, the dead included.
+        assert_eq!(cold_rate_after_round(&mut n, buried), 20.0);
     }
 
     #[test]

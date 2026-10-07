@@ -55,6 +55,8 @@ struct Snapshot {
     round: u16,
     heard_at: Nanos,
     keys: HashMap<u64, (f32, bool)>,
+    /// The peer left, but its demand still counts until then.
+    held_until: Option<Nanos>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,7 @@ impl PeerDemand {
                 round: report.round,
                 heard_at: now,
                 keys,
+                held_until: None,
             },
         );
     }
@@ -107,10 +110,25 @@ impl PeerDemand {
         self.peers.remove(&peer);
     }
 
-    /// Drops the snapshots last heard `max_age` ago or earlier.
+    /// The peer left the cluster. With a zero `hold` it is forgotten at
+    /// once; otherwise its demand keeps counting for `hold`, as
+    /// [`PartitionPolicy::HoldDown`](crate::partition::PartitionPolicy)
+    /// wants, unless it reports again first.
+    pub fn leave(&mut self, peer: PeerId, now: Nanos, hold: Nanos) {
+        if hold == 0 {
+            self.forget(peer);
+        } else if let Some(snapshot) = self.peers.get_mut(&peer) {
+            snapshot.held_until = Some(now + hold);
+        }
+    }
+
+    /// Drops the snapshots last heard `max_age` ago or earlier, and the
+    /// held ones whose hold has ended.
     pub fn expire(&mut self, now: Nanos, max_age: Nanos) {
-        self.peers
-            .retain(|_, snapshot| now < snapshot.heard_at + max_age);
+        self.peers.retain(|_, snapshot| match snapshot.held_until {
+            Some(until) => now < until,
+            None => now < snapshot.heard_at + max_age,
+        });
     }
 
     pub fn get(&self, peer: PeerId, key: u64) -> Option<Heard> {
@@ -324,6 +342,37 @@ mod tests {
         t.apply(PEER, &report(4, 120.0), 1);
         assert!(t.hot_elsewhere(KEY));
         assert!(!t.hot_elsewhere(KEY + 1));
+    }
+
+    #[test]
+    fn a_peer_that_leaves_with_no_hold_is_forgotten() {
+        let mut t = PeerDemand::new(PERIOD);
+        t.apply(PEER, &report(3, 120.0), 0);
+        t.leave(PEER, 1, 0);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn a_held_peer_outlives_staleness_until_the_hold_ends() {
+        let mut t = PeerDemand::new(PERIOD);
+        t.apply(PEER, &report(3, 120.0), 0);
+        t.leave(PEER, PERIOD, 50 * PERIOD);
+
+        t.expire(51 * PERIOD - 1, 10 * PERIOD);
+        assert_eq!(demand(&t), Some(120.0), "still counted while held");
+        t.expire(51 * PERIOD, 10 * PERIOD);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn a_held_peer_that_reports_again_is_back() {
+        let mut t = PeerDemand::new(PERIOD);
+        t.apply(PEER, &report(3, 120.0), 0);
+        t.leave(PEER, PERIOD, 50 * PERIOD);
+        t.apply(PEER, &report(4, 90.0), 2 * PERIOD);
+
+        t.expire(12 * PERIOD, 10 * PERIOD);
+        assert!(t.is_empty(), "back to the ordinary staleness rule");
     }
 
     #[test]

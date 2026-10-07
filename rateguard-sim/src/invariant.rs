@@ -127,13 +127,22 @@ impl Invariant for TrackedKeysBounded {
 
 pub struct AdmissionWindow {
     window: Nanos,
+    limits: u32,
     allowed: HashMap<u64, VecDeque<Nanos>>,
 }
 impl AdmissionWindow {
     pub fn new(window: Nanos) -> Self {
+        Self::scaled(window, 1)
+    }
+
+    /// Up to `limits` times R in the window, bursts aside: the bound of a
+    /// cluster split into that many groups under an optimistic policy.
+    pub fn scaled(window: Nanos, limits: u32) -> Self {
         assert!(window > 0, "an empty window admits nothing to check");
+        assert!(limits > 0, "a bound of zero admits nothing");
         Self {
             window,
+            limits,
             allowed: HashMap::new(),
         }
     }
@@ -161,7 +170,8 @@ impl Invariant for AdmissionWindow {
         }
 
         let admitted = times.len() as u128;
-        let rate_part = view.config.limit_per_sec as u128 * self.window as u128;
+        let rate_part =
+            self.limits as u128 * view.config.limit_per_sec as u128 * self.window as u128;
         let burst_part = view.nodes.len() as u128 * view.config.burst as u128 * ONE_SEC as u128;
 
         if admitted * ONE_SEC as u128 > rate_part + burst_part {

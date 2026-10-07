@@ -82,6 +82,7 @@ pub struct Limiter {
     config: Config,
     hot_set: HotSet,
     keys: HashMap<u64, KeyState>,
+    cap: Option<f64>,
 }
 impl Limiter {
     pub fn new(config: Config) -> Self {
@@ -90,7 +91,16 @@ impl Limiter {
             hot_set: HotSet::new(config.cooldown, config.hot_set_size),
             keys: HashMap::new(),
             config,
+            cap: None,
         }
+    }
+
+    /// Holds every key, hot or cold, at no more than `cap` requests per
+    /// second, or lifts the cap. New keys follow at once, known ones from
+    /// the next tick. For a node that has lost its quorum, see
+    /// [`PartitionPolicy::Quorum`](crate::partition::PartitionPolicy).
+    pub fn set_cap(&mut self, cap: Option<f64>) {
+        self.cap = cap;
     }
 
     /// Admits or denies one request for `key`. The attempt counts toward the
@@ -131,7 +141,8 @@ impl Limiter {
     ) {
         let threshold = self.per_node_rate(cluster_size) * self.config.alpha;
         let cold = self.cold_quota(cluster_size);
-        let (burst, keys, hot_set) = (self.config.burst, &mut self.keys, &mut self.hot_set);
+        let (burst, cap) = (self.config.burst, self.cap.unwrap_or(f64::INFINITY));
+        let (keys, hot_set) = (&mut self.keys, &mut self.hot_set);
 
         keys.retain(|&key, state| {
             state.demand.tick(now);
@@ -144,7 +155,7 @@ impl Limiter {
             }
 
             let wanted = if is_hot {
-                quota_for(share(key, state.demand.rate()), burst)
+                quota_for(share(key, state.demand.rate()).min(cap), burst)
             } else {
                 cold
             };
@@ -218,8 +229,9 @@ impl Limiter {
     }
 
     fn cold_quota(&self, cluster_size: usize) -> Quota {
+        let cap = self.cap.unwrap_or(f64::INFINITY);
         quota_for(
-            self.per_node_rate(cluster_size) * self.config.alpha,
+            (self.per_node_rate(cluster_size) * self.config.alpha).min(cap),
             self.config.burst,
         )
     }
@@ -379,6 +391,45 @@ mod tests {
         l.tick_with_shares(60 * ONE_SEC, N, |_| true, |_, _| 250.0);
         assert!(!l.is_hot(KEY));
         assert_eq!(l.tracked_keys(), 0, "reclaimed as before");
+    }
+
+    fn interval_at(l: &mut Limiter, key: u64, t: Nanos) -> Nanos {
+        for _ in 0..config().burst {
+            assert_eq!(l.check(key, t, N), Decision::Allow);
+        }
+        let Decision::Deny { retry_at } = l.check(key, t, N) else {
+            panic!("burst must be exhausted");
+        };
+        retry_at - t
+    }
+
+    #[test]
+    fn a_cap_holds_every_key_down_hot_or_cold() {
+        let mut l = limiter();
+        drive_until_hot(&mut l);
+        l.check(KEY + 1, ONE_SEC, N);
+
+        l.set_cap(Some(20.0));
+        l.tick_with_shares(2 * ONE_SEC, N, |_| false, |_, _| 250.0);
+        assert_eq!(
+            interval_at(&mut l, KEY, 3 * ONE_SEC),
+            50_000_000,
+            "hot: 20, not 250"
+        );
+        assert_eq!(
+            interval_at(&mut l, KEY + 1, 3 * ONE_SEC),
+            50_000_000,
+            "cold: 20, not 100"
+        );
+        assert_eq!(
+            interval_at(&mut l, KEY + 2, 3 * ONE_SEC),
+            50_000_000,
+            "a new key too, before any tick"
+        );
+
+        l.set_cap(None);
+        l.tick_with_shares(4 * ONE_SEC, N, |_| false, |_, _| 250.0);
+        assert_eq!(interval_at(&mut l, KEY, 5 * ONE_SEC), 4_000_000, "lifted");
     }
 
     #[test]

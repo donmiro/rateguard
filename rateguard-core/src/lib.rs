@@ -24,5 +24,6 @@ pub mod limiter;
 pub mod member;
 pub mod membership;
 pub mod node;
+pub mod partition;
 pub mod peer_demand;
 pub mod rng;

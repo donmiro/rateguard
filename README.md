@@ -8,8 +8,8 @@ whole fleet, with no Redis, no central service, and no network call on the
 request path.**
 
 > **Status: not released yet.** The sans-I/O core (`rateguard-core`) is
-> mostly done: enforcement, SWIM membership and demand-based shares, tested
-> in a deterministic simulator. Still missing: the partition policies, and
+> mostly done: enforcement, SWIM membership, demand-based shares and the
+> partition policies, tested in a deterministic simulator. Still missing:
 > the `rateguard` runtime crate with its UDP transport and the `Guard` API
 > shown below. Nothing is published on crates.io yet.
 

@@ -7,6 +7,7 @@ use rateguard_core::boundary::{Action, Event, PeerId};
 use rateguard_core::gcra::{Decision, Nanos};
 use rateguard_core::limiter::Config;
 use rateguard_core::node::{Node, SwimConfig};
+use rateguard_core::partition::PartitionPolicy;
 
 use crate::invariant::{self, Happened, Invariant, View};
 use crate::link::{Link, NodeIndex};
@@ -80,6 +81,7 @@ pub struct Admission {
 pub struct Sim<L: Link> {
     nodes: Vec<Node>,
     swim: SwimConfig,
+    policy: PartitionPolicy,
     bootstrap: Bootstrap,
     generations: Vec<u64>,
     down: Vec<bool>,
@@ -129,6 +131,7 @@ impl<L: Link> Sim<L> {
         let mut sim = Self {
             nodes: Vec::with_capacity(node_count),
             swim,
+            policy: PartitionPolicy::default(),
             bootstrap,
             generations: vec![0; node_count],
             down: vec![false; node_count],
@@ -163,6 +166,7 @@ impl<L: Link> Sim<L> {
         let node_count = self.generations.len();
         let seed = (self.generations[index] << 32) | index as u64;
         let mut node = Node::new(self.config, self.swim, peer_of(index), seed);
+        node.set_partition_policy(self.policy);
         match &self.bootstrap {
             Bootstrap::Static => {
                 for other in (0..node_count).filter(|&other| other != index) {
@@ -228,6 +232,23 @@ impl<L: Link> Sim<L> {
 
     pub fn admissions(&self) -> &[Admission] {
         &self.admissions
+    }
+
+    /// Sets the partition policy of every node, restarted ones included.
+    pub fn set_partition_policy(&mut self, policy: PartitionPolicy) {
+        self.policy = policy;
+        for node in &mut self.nodes {
+            node.set_partition_policy(policy);
+        }
+    }
+
+    /// Stops checking an invariant, to replace it with a looser one: the
+    /// standard admission window, say, under a policy that overshoots on
+    /// purpose.
+    pub fn remove_invariant(&mut self, name: &str) {
+        let before = self.invariants.len();
+        self.invariants.retain(|invariant| invariant.name() != name);
+        assert!(self.invariants.len() < before, "no invariant named {name}");
     }
 
     pub fn add_invariant(&mut self, invariant: impl Invariant + 'static) {

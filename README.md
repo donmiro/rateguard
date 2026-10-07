@@ -161,7 +161,7 @@ let mut node = Node::new(
         limit_per_sec: 1_000,
         burst: 10,
         alpha: 0.5,
-        floor_factor: 0.1,
+        floor_factor: 0.05,
         cooldown: 5 * ONE_SEC,
         hot_set_size: 64,
         max_tracked_keys: 4_096,

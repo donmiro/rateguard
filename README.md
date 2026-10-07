@@ -22,7 +22,7 @@ let guard = Guard::builder()
     .limit(1_000)                       // 1000 rps per key, across every instance
     .spawn()?;
 
-// ~50 ns. No I/O, no lock shared with the network, no .await.
+// ~25 ns. No I/O, no lock shared with the network, no .await.
 // Still true if every other node in the cluster is gone.
 if guard.check("api:tenant-42").is_allowed() {
     serve(request)
@@ -36,7 +36,7 @@ if guard.check("api:tenant-42").is_allowed() {
 - **One limit for the whole fleet.** Run ten instances of your service, keep a
   single limit of 1000 rps per key across all of them.
 - **No datastore on the request path.** Decisions are made from local memory in
-  about 50 nanoseconds. There is no Redis to deploy, scale, or lose.
+  about 25 nanoseconds. There is no Redis to deploy, scale, or lose.
 - **Immune to cluster failure.** If gossip stops, every node keeps enforcing with
   the last share it knew. Nothing on the request path can fail, because nothing
   on the request path talks to anyone.
@@ -206,7 +206,7 @@ node.handle(Event::MessageReceived { from, bytes: &datagram }, now_nanos);
 ### Three layers
 
 ```
-   request ──► [ enforcement ]   local, ~50 ns, exact, no I/O
+   request ──► [ enforcement ]   local, ~25 ns, exact, no I/O
                      ▲              GCRA over the share this node holds
                      │ "your share: 340 rps"
               [ allocation  ]   over the network, every 200 ms, approximate
@@ -269,6 +269,24 @@ cluster. No design can avoid that; `rateguard` makes it an explicit choice.
 pod restart lasting seconds, and holding the limit steady through those is nearly
 always what you want.
 
+## Performance
+
+`check()`, measured with `criterion` on an Apple M4 Pro
+(`cargo bench -p rateguard --bench check`):
+
+| Case | Per check |
+|---|---|
+| One hot key, one thread | 25 ns |
+| 4096 keys in turn | 30 ns |
+| One hot key, the network hung (the cluster as good as gone) | 25 ns |
+| 8 threads, a key each | 27 ns |
+| 8 threads on one key, back to back | 1.4–1.9 µs |
+
+The last line is the one cost to know. An exact limit means every check on a key
+writes the same word, so cores hitting one key at once queue for it: about 6
+million checks a second on a single key per instance. Far beyond what one tenant
+sends to one instance in practice, but not free.
+
 ## Guarantees
 
 1. `check()` performs no I/O and takes no lock shared with a network task. Its
@@ -286,7 +304,7 @@ always what you want.
 
 | | Redis / Memcached | rateguard |
 |---|---|---|
-| Decision latency | network round trip (~0.2–1 ms) | ~50 ns, local |
+| Decision latency | network round trip (~0.2–1 ms) | ~25 ns, local |
 | Store unavailable | service degrades | nothing to be unavailable |
 | Network load | linear in request volume | two datagrams per node per 200 ms |
 | Memory | linear in key count | bounded by configuration |

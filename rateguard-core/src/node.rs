@@ -365,7 +365,7 @@ impl Node {
         let stale = peer_demand::stale_after_rounds(self.allocation_size());
         self.peer_demand.expire(
             now,
-            stale * self.swim.protocol_period + hold_of(self.policy),
+            (stale * self.swim.protocol_period).saturating_add(hold_of(self.policy)),
         );
 
         // Reconnect: once in a while the probe goes to someone we have lost
@@ -504,6 +504,12 @@ impl Node {
     // News is applied before the reply is built: a suspect answers the PING
     // that told it of the suspicion with an ACK that already refutes it.
     fn receive(&mut self, from: PeerId, bytes: &[u8], now: Nanos) {
+        // A node may hear itself, through a seed list that names it under
+        // another address or a transport that loops back; it is not its
+        // own peer.
+        if from == self.members.local() {
+            return;
+        }
         let Ok(message) = proto::decode(bytes) else {
             return;
         };
@@ -2211,6 +2217,31 @@ mod tests {
         n.add_seed(PeerId::new(1), addr(1));
         // R × β over itself and its seed; the test config has β = 0.1.
         assert_eq!(n.new_key_quota(), Quota::new(50, config().burst));
+    }
+
+    // A node can hear itself: a seed list naming it under another address,
+    // or a transport that loops back. It is not its own peer.
+    // A hold-down as long as time itself: nothing may overflow.
+    #[test]
+    fn an_endless_hold_down_overflows_nothing() {
+        let (mut n, buried) = abandoned(PartitionPolicy::HoldDown(u64::MAX));
+        assert_eq!(
+            cold_rate_after_round(&mut n, buried),
+            100.0,
+            "α × R / 5, held"
+        );
+    }
+
+    #[test]
+    fn a_message_from_the_node_itself_is_ignored() {
+        let mut n = node_with([1]);
+        let echo = reporting(LOCAL.get(), 3);
+        assert!(
+            deliver(&mut n, LOCAL.get(), echo, 0).is_empty(),
+            "no answer to itself"
+        );
+        assert!(n.peer_demand().is_empty(), "its own demand is not a peer's");
+        assert_eq!(n.cluster_size(), 2);
     }
 
     #[test]

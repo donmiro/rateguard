@@ -70,7 +70,7 @@ impl SizeHistory {
             && self
                 .samples
                 .front()
-                .is_some_and(|&(at, _)| at + self.window <= now)
+                .is_some_and(|&(at, _)| at.saturating_add(self.window) <= now)
         {
             self.samples.pop_front();
         }

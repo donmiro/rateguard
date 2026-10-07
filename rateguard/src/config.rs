@@ -15,6 +15,14 @@ const ALPHA: f64 = 0.5;
 /// §10.3).
 const BETA: f64 = 0.05;
 const ONE_SEC: u64 = 1_000_000_000;
+/// The most keys one node keeps state for: a table of 2²¹ slots, 64 MB.
+const MAX_TRACKED_KEYS: usize = 1 << 20;
+
+/// A duration in nanoseconds, the longest ones held at `u64::MAX` (584
+/// years) rather than cut down to whatever their low bits say.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// What a node does when its cluster shrinks: the CAP trade-off as a
 /// setting. When the network splits into k groups, each sees only itself.
@@ -42,9 +50,7 @@ impl PartitionPolicy {
     fn to_core(self) -> partition::PartitionPolicy {
         match self {
             PartitionPolicy::Optimistic => partition::PartitionPolicy::Optimistic,
-            PartitionPolicy::HoldDown(hold) => {
-                partition::PartitionPolicy::HoldDown(hold.as_nanos() as u64)
-            }
+            PartitionPolicy::HoldDown(hold) => partition::PartitionPolicy::HoldDown(nanos(hold)),
             PartitionPolicy::Quorum => partition::PartitionPolicy::Quorum,
         }
     }
@@ -136,7 +142,10 @@ impl Builder {
             settings.advertise = socket.local_addr().map_err(Error::Bind)?;
         }
         socket.set_nonblocking(true).map_err(Error::Bind)?;
-        let socket = tokio::net::UdpSocket::from_std(socket).map_err(Error::Bind)?;
+        // Like timers, a runtime built without IO only shows by trying.
+        let socket = std::panic::catch_unwind(|| tokio::net::UdpSocket::from_std(socket))
+            .map_err(|_| Error::NoIo)?
+            .map_err(Error::Bind)?;
         Ok(start(settings, socket, ticker))
     }
 
@@ -164,6 +173,12 @@ impl Builder {
         if advertise.ip().is_unspecified() {
             return Err(Error::UnspecifiedAdvertise);
         }
+        // Port 0 is the OS's pick, known only once bound. Without an
+        // explicit advertise, spawn() advertises the bound socket; with one,
+        // port 0 on either side means nobody could reach the node.
+        if self.advertise.is_some() && (advertise.port() == 0 || bind.port() == 0) {
+            return Err(Error::AdvertisePortZero);
+        }
         let seeds = self
             .seeds
             .iter()
@@ -187,7 +202,10 @@ impl Builder {
         if tracked_keys < hot_keys {
             return Err(Error::TooFewTrackedKeys);
         }
-        let period = self.period.unwrap_or(Duration::from_millis(200)).as_nanos() as u64;
+        if tracked_keys > MAX_TRACKED_KEYS {
+            return Err(Error::TooManyTrackedKeys(tracked_keys));
+        }
+        let period = nanos(self.period.unwrap_or(Duration::from_millis(200)));
         if period / 4 == 0 {
             return Err(Error::ZeroPeriod);
         }
@@ -312,10 +330,17 @@ pub enum Error {
     /// A burst over the 16,777,215 a quota holds.
     TooLargeBurst(u32),
     TooFewTrackedKeys,
+    /// More tracked keys than the 1,048,576 a node keeps.
+    TooManyTrackedKeys(usize),
+    /// Port 0 advertised, or bound to while advertising another port:
+    /// nobody could reach the node.
+    AdvertisePortZero,
     /// Not called from within a tokio runtime.
     NoRuntime,
     /// The tokio runtime was built without timers (`enable_time`).
     NoTimer,
+    /// The tokio runtime was built without IO (`enable_io`).
+    NoIo,
     Bind(std::io::Error),
 }
 impl fmt::Display for Error {
@@ -341,11 +366,19 @@ impl fmt::Display for Error {
                 rateguard_proto::MAX_DEMAND_KEYS
             ),
             Error::TooFewTrackedKeys => write!(f, "fewer tracked keys than hot keys"),
+            Error::TooManyTrackedKeys(n) => {
+                write!(f, "{n} tracked keys, at most {MAX_TRACKED_KEYS}")
+            }
+            Error::AdvertisePortZero => write!(
+                f,
+                "port 0 is only known once bound: nobody could reach the advertised address"
+            ),
             Error::TooLargeBurst(burst) => {
                 write!(f, "a burst of {burst}, at most {MAX_BURST} fit")
             }
             Error::NoRuntime => write!(f, "not within a tokio runtime"),
             Error::NoTimer => write!(f, "the tokio runtime has no timers enabled"),
+            Error::NoIo => write!(f, "the tokio runtime has no IO enabled"),
             Error::Bind(error) => write!(f, "cannot bind: {error}"),
         }
     }
@@ -391,6 +424,15 @@ mod tests {
             .settings()
             .unwrap();
         assert_eq!(s.core.burst, rateguard_core::gcra::MAX_BURST);
+    }
+
+    #[test]
+    fn durations_too_long_for_nanoseconds_are_held_at_the_longest() {
+        let s = valid()
+            .partition_policy(PartitionPolicy::HoldDown(Duration::MAX))
+            .settings()
+            .unwrap();
+        assert_eq!(s.policy, partition::PartitionPolicy::HoldDown(u64::MAX));
     }
 
     #[test]
@@ -446,6 +488,19 @@ mod tests {
             (valid().hot_keys(65), |e| matches!(e, TooManyHotKeys(65))),
             (valid().tracked_keys(10), |e| matches!(e, TooFewTrackedKeys)),
             (valid().burst(u32::MAX), |e| matches!(e, TooLargeBurst(_))),
+            (valid().advertise("10.0.0.1:0"), |e| {
+                matches!(e, AdvertisePortZero)
+            }),
+            (
+                Builder::new()
+                    .bind("10.0.0.1:0")
+                    .advertise("10.0.0.1:7946")
+                    .limit(10),
+                |e| matches!(e, AdvertisePortZero),
+            ),
+            (valid().tracked_keys(usize::MAX), |e| {
+                matches!(e, TooManyTrackedKeys(_))
+            }),
         ];
         for (builder, expected) in cases {
             let error = builder.settings().unwrap_err();

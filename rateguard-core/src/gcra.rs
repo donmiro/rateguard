@@ -205,8 +205,17 @@ impl AtomicGcra {
         }
     }
 
-    /// Like [`Gcra::set_quota`]: the debt carries over in requests. A check
-    /// racing the change may be judged by either quota; both are valid.
+    /// Like [`Gcra::set_quota`]: the debt carries over in requests.
+    ///
+    /// The quota and the TAT are two words, changed one after the other. A
+    /// check landing between the two is charged at the new interval and then
+    /// rescaled as if it had been charged at the old one. When the share
+    /// drops, that check costs up to `new_t² / old_t` more than it should
+    /// (1000 → 25 a second: 1.6 s of extra debt, so denials for that long);
+    /// when it rises, it costs less, by under one new interval. The window
+    /// is a few nanoseconds once per tick, and closing it would take
+    /// versioning the pair, which no longer fits one atomic word. Accepted:
+    /// the costly side is the strict one.
     pub fn set_quota(&self, quota: Quota, now: Nanos) {
         let old = Quota::unpack(self.quota.swap(quota.pack(), Ordering::AcqRel));
         if old == quota {

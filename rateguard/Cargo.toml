@@ -19,6 +19,11 @@ turmoil = ["dep:turmoil"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time", "macros"] }
+criterion = "0.8"
+
+[[bench]]
+name = "check"
+harness = false
 
 [target.'cfg(rateguard_loom)'.dev-dependencies]
 loom = "0.7"

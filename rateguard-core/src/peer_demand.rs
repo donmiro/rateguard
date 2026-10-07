@@ -84,7 +84,7 @@ impl PeerDemand {
         }
         if let Some(old) = self.peers.get(&from)
             && !round_is_newer(report.round, old.round)
-            && now < old.heard_at + self.reorder_window
+            && now < old.heard_at.saturating_add(self.reorder_window)
         {
             return;
         }
@@ -118,7 +118,7 @@ impl PeerDemand {
         if hold == 0 {
             self.forget(peer);
         } else if let Some(snapshot) = self.peers.get_mut(&peer) {
-            snapshot.held_until = Some(now + hold);
+            snapshot.held_until = Some(now.saturating_add(hold));
         }
     }
 
@@ -127,7 +127,7 @@ impl PeerDemand {
     pub fn expire(&mut self, now: Nanos, max_age: Nanos) {
         self.peers.retain(|_, snapshot| match snapshot.held_until {
             Some(until) => now < until,
-            None => now < snapshot.heard_at + max_age,
+            None => now < snapshot.heard_at.saturating_add(max_age),
         });
     }
 

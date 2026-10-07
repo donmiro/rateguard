@@ -179,3 +179,104 @@ fn a_period_too_short_to_tick_is_an_error() {
         .map(drop);
     assert!(matches!(result, Err(Error::ZeroPeriod)), "{result:?}");
 }
+
+#[test]
+fn a_runtime_without_io_is_an_error_not_a_panic() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(async {
+        Guard::builder()
+            .bind("127.0.0.1:0")
+            .limit(10)
+            .spawn()
+            .map(drop)
+    });
+    assert!(matches!(result, Err(Error::NoIo)), "{result:?}");
+}
+
+// A transport whose sends never complete, and which says when it is gone.
+struct Stuck(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Transport for Stuck {
+    fn send_to(&self, _: &[u8], _: SocketAddr) -> impl Future<Output = io::Result<usize>> + Send {
+        std::future::pending()
+    }
+    fn recv_from(
+        &self,
+        _: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send {
+        std::future::pending()
+    }
+}
+impl Drop for Stuck {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn a_node_stuck_sending_still_stops_with_its_last_guard() {
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = Guard::builder()
+        .bind("10.0.0.1:7946")
+        .seeds(["10.0.0.2:7946"])
+        .limit(100)
+        .spawn_on(Stuck(dropped.clone()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(guard);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the node and its transport are gone"
+    );
+}
+
+// Spec §6: many threads, many keys, and no key admitted more than its rate
+// over the run plus one burst, however the threads interleave.
+#[test]
+fn no_key_gets_more_than_its_rate_and_a_burst_under_contention() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (limit, burst, keys) = (100, 5, 32);
+    let guard = runtime.block_on(async {
+        Guard::builder()
+            .bind("127.0.0.1:0")
+            .limit(limit)
+            .burst(burst)
+            .spawn()
+            .unwrap()
+    });
+    let admitted: Vec<AtomicU64> = (0..keys).map(|_| AtomicU64::new(0)).collect();
+    let names: Vec<String> = (0..keys).map(|k| format!("key-{k}")).collect();
+
+    let start = std::time::Instant::now();
+    let run = Duration::from_millis(1500);
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let (guard, admitted, names) = (&guard, &admitted, &names);
+            s.spawn(move || {
+                let mut k = t;
+                while start.elapsed() < run {
+                    k = (k + 1) % keys;
+                    if guard.check(&names[k]).is_allowed() {
+                        admitted[k].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let ceiling = (limit as f64 * elapsed).ceil() as u64 + burst as u64;
+    for (k, count) in admitted.iter().enumerate() {
+        let count = count.load(Ordering::Relaxed);
+        assert!(
+            count <= ceiling,
+            "key {k}: {count} admitted, at most {ceiling}"
+        );
+        assert!(count > 0, "key {k} admitted nothing");
+    }
+}

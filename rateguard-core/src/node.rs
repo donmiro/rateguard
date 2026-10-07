@@ -24,13 +24,13 @@
 //!   unknown seed instead. Without it, two sides that buried each other
 //!   would never speak again.
 
-use rateguard_proto::{self as proto, DemandReport, KeyDemand, Message, Status, Update};
+use rateguard_proto::{self as proto, Address, DemandReport, KeyDemand, Message, Status, Update};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     allocation::{self, View},
     boundary::{Action, Event, PeerId},
-    gcra::{Decision, Nanos},
+    gcra::{Decision, Nanos, Quota},
     gossip::{self, Gossip},
     limiter::{Config, Limiter},
     member::{Applied, MemberTable},
@@ -107,7 +107,7 @@ pub struct Node {
     gossip: Gossip,
     swim: SwimConfig,
     rng: Rng,
-    seeds: Vec<PeerId>,
+    seeds: Vec<(PeerId, Address)>,
     order: Vec<PeerId>,
     next: usize,
     seq: u32,
@@ -137,7 +137,7 @@ impl Node {
     /// # Panics
     ///
     /// If the timeouts do not fit together, see the messages for each.
-    pub fn new(config: Config, swim: SwimConfig, local: PeerId, seed: u64) -> Self {
+    pub fn new(config: Config, swim: SwimConfig, local: PeerId, addr: Address, seed: u64) -> Self {
         assert!(swim.protocol_period > 0, "protocol_period must be > 0");
         assert!(
             swim.ack_timeout > 0 && swim.ack_timeout < swim.protocol_period,
@@ -158,7 +158,7 @@ impl Node {
 
         Self {
             limiter: Limiter::new(config),
-            members: MemberTable::new(local),
+            members: MemberTable::new(local, addr),
             gossip: Gossip::new(),
             swim,
             rng: Rng::new(seed),
@@ -190,11 +190,12 @@ impl Node {
     /// Adds a peer as alive without asking it: static membership, for tests
     /// and fixed fleets. A node that does not know the cluster joins it
     /// through [`add_seed`](Node::add_seed) instead.
-    pub fn introduce(&mut self, peer: PeerId) {
+    pub fn introduce(&mut self, peer: PeerId, addr: Address) {
         assert_ne!(peer, self.members.local(), "a node is not its own peer");
         self.members.apply(
             Update {
                 member: peer.get(),
+                addr,
                 incarnation: 0,
                 status: Status::Alive,
             },
@@ -207,16 +208,52 @@ impl Node {
     /// node has no peers it knocks on a seed every round; later the seeds it
     /// has lost touch with join the reconnect rotation, which heals a split
     /// even after both sides have forgotten each other.
-    pub fn add_seed(&mut self, seed: PeerId) {
+    pub fn add_seed(&mut self, seed: PeerId, addr: Address) {
         assert_ne!(
             seed,
             self.members.local(),
             "a node cannot join through itself"
         );
-        if !self.seeds.contains(&seed) {
-            self.seeds.push(seed);
+        if !self.seeds.iter().any(|&(known, _)| known == seed) {
+            self.seeds.push((seed, addr));
         }
         self.refresh_cap(self.last_now);
+    }
+
+    /// Counts attempts collected by a runtime that enforces in its own table;
+    /// [`quota`](Node::quota) is the way back.
+    ///
+    /// # Panics
+    ///
+    /// If `now` is earlier than a time already seen.
+    pub fn record_attempts(&mut self, key: u64, n: u64, now: Nanos) {
+        self.advance(now);
+        let cluster_size = self.allocation_size();
+        self.limiter.record_attempts(key, n, now, cluster_size);
+    }
+
+    /// The quota `key` is held to after the last round, every cap included.
+    pub fn quota(&self, key: u64) -> Option<Quota> {
+        self.limiter.quota(key)
+    }
+
+    /// The quota a key not seen before starts with.
+    pub fn new_key_quota(&self) -> Quota {
+        self.limiter.new_key_quota(self.allocation_size())
+    }
+
+    pub fn is_tracked(&self, key: u64) -> bool {
+        self.limiter.tracked(key)
+    }
+
+    /// Where to send to `peer`: a member's own address, or a seed's.
+    pub fn address(&self, peer: PeerId) -> Option<Address> {
+        self.members.address(peer).or_else(|| {
+            self.seeds
+                .iter()
+                .find(|&&(seed, _)| seed == peer)
+                .map(|&(_, addr)| addr)
+        })
     }
 
     pub fn cluster_size(&self) -> usize {
@@ -357,7 +394,7 @@ impl Node {
             .chain(
                 self.seeds
                     .iter()
-                    .copied()
+                    .map(|&(seed, _)| seed)
                     .filter(|&seed| self.members.status(seed).is_none()),
             )
             .collect();
@@ -883,13 +920,13 @@ mod tests {
     }
 
     fn node() -> Node {
-        Node::new(config(), SWIM, LOCAL, 1)
+        Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), 1)
     }
 
     fn node_with(peers: impl IntoIterator<Item = u64>) -> Node {
         let mut n = node();
         for peer in peers {
-            n.introduce(PeerId::new(peer));
+            n.introduce(PeerId::new(peer), addr(peer));
         }
         n
     }
@@ -965,9 +1002,14 @@ mod tests {
         }
     }
 
+    fn addr(member: u64) -> Address {
+        Address::V4([10, 0, 0, member as u8], 7946)
+    }
+
     fn news(member: u64, incarnation: u32, status: Status) -> Update {
         Update {
             member,
+            addr: addr(member),
             incarnation,
             status,
         }
@@ -999,7 +1041,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not its own peer")]
     fn a_node_cannot_introduce_itself() {
-        node().introduce(LOCAL);
+        node().introduce(LOCAL, addr(LOCAL.get()));
     }
 
     #[test]
@@ -1009,7 +1051,7 @@ mod tests {
             suspicion_timeout: PERIOD - 1,
             ..SWIM
         };
-        Node::new(config(), swim, LOCAL, 1);
+        Node::new(config(), swim, LOCAL, addr(LOCAL.get()), 1);
     }
 
     #[test]
@@ -1090,7 +1132,7 @@ mod tests {
     fn a_newcomer_is_probed_within_the_current_circuit() {
         let mut n = node_with([1, 2, 3]);
         let first = answered_round(&mut n, 0);
-        n.introduce(PeerId::new(9));
+        n.introduce(PeerId::new(9), addr(9));
 
         let rest: Vec<PeerId> = (1..4).map(|k| answered_round(&mut n, k)).collect();
         assert!(rest.contains(&PeerId::new(9)), "{rest:?}");
@@ -1391,8 +1433,8 @@ mod tests {
             tombstone_ttl: 1000 * PERIOD,
             ..SWIM
         };
-        let mut n = Node::new(config(), quiet, LOCAL, 1);
-        n.introduce(PeerId::new(1));
+        let mut n = Node::new(config(), quiet, LOCAL, addr(LOCAL.get()), 1);
+        n.introduce(PeerId::new(1), addr(1));
         let death = news(7, 0, Dead);
         let carrying = |updates: Vec<Update>| Message::Ack {
             seq: 999,
@@ -1606,7 +1648,7 @@ mod tests {
     #[test]
     fn a_lone_node_knocks_on_its_seed_every_round() {
         let mut n = node();
-        n.add_seed(PeerId::new(5));
+        n.add_seed(PeerId::new(5), addr(5));
         for k in 0..4 {
             assert_eq!(round(&mut n, k).0, PeerId::new(5), "round {k}");
         }
@@ -1616,7 +1658,7 @@ mod tests {
     #[test]
     fn a_seed_that_answers_becomes_a_member() {
         let mut n = node();
-        n.add_seed(PeerId::new(5));
+        n.add_seed(PeerId::new(5), addr(5));
         let (_, seq) = round(&mut n, 0);
 
         let answer = Message::Ack {
@@ -1635,7 +1677,7 @@ mod tests {
     #[test]
     fn an_unknown_seed_joins_the_reconnect_rotation() {
         let mut n = node_with([1]);
-        n.add_seed(PeerId::new(5));
+        n.add_seed(PeerId::new(5), addr(5));
 
         let mut knocks = 0;
         for k in 0..20 {
@@ -1652,7 +1694,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot join through itself")]
     fn a_node_is_not_its_own_seed() {
-        node().add_seed(LOCAL);
+        node().add_seed(LOCAL, addr(LOCAL.get()));
     }
 
     #[test]
@@ -1662,7 +1704,7 @@ mod tests {
             ack_timeout: PERIOD,
             ..SWIM
         };
-        Node::new(config(), swim, LOCAL, 1);
+        Node::new(config(), swim, LOCAL, addr(LOCAL.get()), 1);
     }
 
     #[test]
@@ -1685,9 +1727,9 @@ mod tests {
     #[test]
     fn the_same_seed_probes_in_the_same_order() {
         let order = |seed| {
-            let mut n = Node::new(config(), SWIM, LOCAL, seed);
+            let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed);
             for peer in 1..=6 {
-                n.introduce(PeerId::new(peer));
+                n.introduce(PeerId::new(peer), addr(peer));
             }
             (0..12)
                 .map(|k| answered_round(&mut n, k))
@@ -1840,9 +1882,9 @@ mod tests {
             tombstone_ttl: 1000 * PERIOD,
             ..SWIM
         };
-        let mut n = Node::new(config(), patient, LOCAL, 1);
+        let mut n = Node::new(config(), patient, LOCAL, addr(LOCAL.get()), 1);
         n.set_partition_policy(PartitionPolicy::Optimistic);
-        n.introduce(PeerId::new(1));
+        n.introduce(PeerId::new(1), addr(1));
         deliver(&mut n, 1, reporting(1, 3), 0);
 
         let stale = stale_after_rounds(2);
@@ -1862,8 +1904,8 @@ mod tests {
             tombstone_ttl: 1000 * PERIOD,
             ..SWIM
         };
-        let mut n = Node::new(config(), patient, LOCAL, 1);
-        n.introduce(PeerId::new(1));
+        let mut n = Node::new(config(), patient, LOCAL, addr(LOCAL.get()), 1);
+        n.introduce(PeerId::new(1), addr(1));
         heat(&mut n);
         n
     }
@@ -2049,7 +2091,7 @@ mod tests {
     fn waiting_for(policy: PartitionPolicy) -> Node {
         let mut n = node();
         n.set_partition_policy(policy);
-        n.add_seed(PeerId::new(1));
+        n.add_seed(PeerId::new(1), addr(1));
         n
     }
 
@@ -2130,6 +2172,45 @@ mod tests {
         let (mut n, buried) = abandoned(PartitionPolicy::Quorum);
         // R × β / 5, the five the node knows of, the dead included.
         assert_eq!(cold_rate_after_round(&mut n, buried), 20.0);
+    }
+
+    #[test]
+    fn a_member_heard_of_through_gossip_is_reachable() {
+        let mut n = node_with([1]);
+        let rumor = Message::Ack {
+            seq: 9,
+            updates: vec![news(1, 0, Alive), news(5, 0, Alive)],
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 1, rumor, 0);
+        assert_eq!(n.address(PeerId::new(5)), Some(addr(5)));
+    }
+
+    #[test]
+    fn a_seed_is_reachable_before_it_answers() {
+        let mut n = node();
+        n.add_seed(PeerId::new(3), addr(3));
+        assert_eq!(n.address(PeerId::new(3)), Some(addr(3)));
+    }
+
+    #[test]
+    fn a_node_fed_attempts_hands_out_quotas() {
+        let mut n = node();
+        n.handle(Event::Tick, 0);
+        n.record_attempts(KEY, 2000, 0);
+        assert!(n.is_tracked(KEY));
+        n.handle(Event::Tick, ONE_SEC);
+        assert!(n.limiter().is_hot(KEY));
+        // Alone, nobody to learn from: the share is the whole limit.
+        assert_eq!(n.quota(KEY), Some(Quota::new(1000, config().burst)));
+    }
+
+    #[test]
+    fn a_waiting_node_starts_new_keys_at_the_floor() {
+        let mut n = node();
+        n.add_seed(PeerId::new(1), addr(1));
+        // R × β over itself and its seed; the test config has β = 0.1.
+        assert_eq!(n.new_key_quota(), Quota::new(50, config().burst));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use rateguard_core::gcra::{Decision, Nanos};
 use rateguard_core::limiter::Config;
 use rateguard_core::node::{Node, SwimConfig};
 use rateguard_core::partition::PartitionPolicy;
+use rateguard_proto::Address;
 
 use crate::invariant::{self, Happened, Invariant, View};
 use crate::link::{Link, NodeIndex};
@@ -18,6 +19,12 @@ pub const TICK: Nanos = 50_000_000;
 
 pub fn peer_of(index: NodeIndex) -> PeerId {
     PeerId::new(index as u64)
+}
+
+/// The address node `index` listens on: synthetic, `10.0.x.y:7946`. The
+/// simulator never sends to it; the core only carries it.
+pub fn address_of(index: NodeIndex) -> Address {
+    Address::V4([10, 0, (index >> 8) as u8, index as u8], 7946)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,17 +172,23 @@ impl<L: Link> Sim<L> {
     fn fresh_node(&self, index: NodeIndex) -> Node {
         let node_count = self.generations.len();
         let seed = (self.generations[index] << 32) | index as u64;
-        let mut node = Node::new(self.config, self.swim, peer_of(index), seed);
+        let mut node = Node::new(
+            self.config,
+            self.swim,
+            peer_of(index),
+            address_of(index),
+            seed,
+        );
         node.set_partition_policy(self.policy);
         match &self.bootstrap {
             Bootstrap::Static => {
                 for other in (0..node_count).filter(|&other| other != index) {
-                    node.introduce(peer_of(other));
+                    node.introduce(peer_of(other), address_of(other));
                 }
             }
             Bootstrap::Seeds(seeds) => {
                 for &seed in seeds.iter().filter(|&&seed| seed != index) {
-                    node.add_seed(peer_of(seed));
+                    node.add_seed(peer_of(seed), address_of(seed));
                 }
             }
         }
@@ -785,6 +798,7 @@ mod tests {
                 s.node(index).members().update_about(peer_of(1)),
                 Some(rateguard_proto::Update {
                     member: 1,
+                    addr: address_of(1),
                     incarnation: refuted,
                     status: Status::Alive,
                 }),

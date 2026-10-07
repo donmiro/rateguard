@@ -106,17 +106,36 @@ impl Limiter {
     /// Admits or denies one request for `key`. The attempt counts toward the
     /// key's demand either way, cold keys included.
     pub fn check(&mut self, key: u64, now: Nanos, cluster_size: usize) -> Decision {
+        let state = self.entry(key, now, cluster_size);
+        state.demand.record_attempt();
+        state.gcra.check(now)
+    }
+
+    /// Counts `n` attempts for `key` without deciding on them: for a runtime
+    /// that enforces in its own table and only needs the allocation.
+    pub fn record_attempts(&mut self, key: u64, n: u64, now: Nanos, cluster_size: usize) {
+        self.entry(key, now, cluster_size).demand.record_attempts(n);
+    }
+
+    /// The quota `key` is held to, if it is tracked.
+    pub fn quota(&self, key: u64) -> Option<Quota> {
+        self.keys.get(&key).map(|state| state.applied)
+    }
+
+    /// The quota a key not seen before starts with: the cold share, under
+    /// the cap if one is set.
+    pub fn new_key_quota(&self, cluster_size: usize) -> Quota {
+        self.cold_quota(cluster_size)
+    }
+
+    fn entry(&mut self, key: u64, now: Nanos, cluster_size: usize) -> &mut KeyState {
         let cold = self.cold_quota(cluster_size);
         let time_constant = self.config.demand_time_constant;
-
-        let state = self.keys.entry(key).or_insert_with(|| KeyState {
+        self.keys.entry(key).or_insert_with(|| KeyState {
             demand: Demand::starting_at(time_constant, now),
             gcra: Gcra::new(cold),
             applied: cold,
-        });
-
-        state.demand.record_attempt();
-        state.gcra.check(now)
+        })
     }
 
     /// Updates demand, moves keys between cold and hot, applies their new
@@ -435,6 +454,34 @@ mod tests {
         l.set_cap(None);
         l.tick_with_shares(4 * ONE_SEC, N, |_| false, |_, _| 250.0);
         assert_eq!(interval_at(&mut l, KEY, 5 * ONE_SEC), 4_000_000, "lifted");
+    }
+
+    #[test]
+    fn recorded_attempts_heat_a_key_like_checks_do() {
+        let (mut by_check, mut by_record) = (limiter(), limiter());
+        by_check.tick(0, N);
+        by_record.tick(0, N);
+        for _ in 0..500 {
+            by_check.check(KEY, 0, N);
+        }
+        by_record.record_attempts(KEY, 500, 0, N);
+        by_check.tick(ONE_SEC, N);
+        by_record.tick(ONE_SEC, N);
+        assert!(by_record.is_hot(KEY));
+        assert_eq!(by_record.quota(KEY), by_check.quota(KEY));
+    }
+
+    #[test]
+    fn a_new_key_starts_at_the_capped_cold_quota() {
+        let mut l = limiter();
+        assert_eq!(
+            l.new_key_quota(N),
+            Quota::new(100, config().burst),
+            "α × R / N"
+        );
+        l.set_cap(Some(20.0));
+        assert_eq!(l.new_key_quota(N), Quota::new(20, config().burst));
+        assert_eq!(l.quota(KEY), None, "not tracked");
     }
 
     #[test]

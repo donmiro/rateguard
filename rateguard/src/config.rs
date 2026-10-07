@@ -1,0 +1,434 @@
+//! The builder: what a node is told, checked before anything starts.
+
+use std::fmt;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use rateguard_core::limiter::Config;
+use rateguard_core::node::SwimConfig;
+use rateguard_core::partition;
+
+/// α: the part of the per-node rate a cold key gets, and the hot threshold.
+const ALPHA: f64 = 0.5;
+/// β: the floor of a hot key's share; calibrated in the simulator (spec
+/// §10.3).
+const BETA: f64 = 0.05;
+const ONE_SEC: u64 = 1_000_000_000;
+
+/// What a node does when its cluster shrinks: the CAP trade-off as a
+/// setting. When the network splits into k groups, each sees only itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionPolicy {
+    /// Shares follow the surviving cluster at once: up to k times the limit
+    /// during a split, nothing ever left unused.
+    Optimistic,
+    /// For this long after the cluster shrinks, shares are computed as if it
+    /// had not: about the limit for that long, k times it after. Most
+    /// apparent splits are a GC pause or a restart lasting seconds.
+    HoldDown(Duration),
+    /// A node that cannot see a majority of the cluster it knows drops every
+    /// key to a small floor: the limit plus the minority's floors during a
+    /// split, and the minority all but stops serving.
+    Quorum,
+}
+impl Default for PartitionPolicy {
+    /// A 10-second hold-down.
+    fn default() -> Self {
+        PartitionPolicy::HoldDown(Duration::from_secs(10))
+    }
+}
+impl PartitionPolicy {
+    fn to_core(self) -> partition::PartitionPolicy {
+        match self {
+            PartitionPolicy::Optimistic => partition::PartitionPolicy::Optimistic,
+            PartitionPolicy::HoldDown(hold) => {
+                partition::PartitionPolicy::HoldDown(hold.as_nanos() as u64)
+            }
+            PartitionPolicy::Quorum => partition::PartitionPolicy::Quorum,
+        }
+    }
+}
+
+/// Configures and starts a node; see [`Guard::builder`](crate::Guard).
+#[derive(Debug, Clone, Default)]
+pub struct Builder {
+    bind: Option<String>,
+    advertise: Option<String>,
+    seeds: Vec<String>,
+    limit: Option<u32>,
+    burst: Option<u32>,
+    policy: Option<PartitionPolicy>,
+    period: Option<Duration>,
+    hot_keys: Option<usize>,
+    tracked_keys: Option<usize>,
+}
+
+impl Builder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The UDP address to listen on, as `ip:port`.
+    pub fn bind(mut self, addr: impl Into<String>) -> Self {
+        self.bind = Some(addr.into());
+        self
+    }
+
+    /// The address the other nodes reach this one at. Required when binding
+    /// to an unspecified IP (`0.0.0.0`, `::`); in Kubernetes, the pod IP.
+    pub fn advertise(mut self, addr: impl Into<String>) -> Self {
+        self.advertise = Some(addr.into());
+        self
+    }
+
+    /// Peers to join through, as `ip:port`; any live member is enough.
+    pub fn seeds<S: Into<String>>(mut self, seeds: impl IntoIterator<Item = S>) -> Self {
+        self.seeds = seeds.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Requests per second per key, across the whole cluster.
+    pub fn limit(mut self, per_sec: u32) -> Self {
+        self.limit = Some(per_sec);
+        self
+    }
+
+    /// How many requests a key may get back to back on one node. Defaults
+    /// to `limit / 20`, and never less than 1.
+    pub fn burst(mut self, burst: u32) -> Self {
+        self.burst = Some(burst);
+        self
+    }
+
+    /// What to do when the cluster shrinks; defaults to a 10 s hold-down.
+    pub fn partition_policy(mut self, policy: PartitionPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// How often nodes exchange membership and demand; defaults to 200 ms.
+    pub fn protocol_period(mut self, period: Duration) -> Self {
+        self.period = Some(period);
+        self
+    }
+
+    /// How many keys one node coordinates at once; at most 64, the default.
+    pub fn hot_keys(mut self, n: usize) -> Self {
+        self.hot_keys = Some(n);
+        self
+    }
+
+    /// The ceiling on keys one node keeps state for; defaults to 4096.
+    pub fn tracked_keys(mut self, n: usize) -> Self {
+        self.tracked_keys = Some(n);
+        self
+    }
+
+    /// Binds the socket and starts the node in the current tokio runtime.
+    pub fn spawn(self) -> Result<crate::Guard, Error> {
+        let mut settings = self.settings()?;
+        tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
+        let ticker = ticker(&settings)?;
+        let socket = std::net::UdpSocket::bind(settings.bind).map_err(Error::Bind)?;
+        // Advertising the bind address: the port the OS picked if it was 0.
+        if self.advertise.is_none() {
+            settings.advertise = socket.local_addr().map_err(Error::Bind)?;
+        }
+        socket.set_nonblocking(true).map_err(Error::Bind)?;
+        let socket = tokio::net::UdpSocket::from_std(socket).map_err(Error::Bind)?;
+        Ok(start(settings, socket, ticker))
+    }
+
+    /// [`spawn`](Builder::spawn) over a transport of the caller's, for tests
+    /// and simulators; `bind` is then only checked, not bound.
+    #[doc(hidden)]
+    pub fn spawn_on<T: crate::Transport>(self, transport: T) -> Result<crate::Guard, Error> {
+        let settings = self.settings()?;
+        tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
+        let ticker = ticker(&settings)?;
+        Ok(start(settings, transport, ticker))
+    }
+
+    pub(crate) fn settings(&self) -> Result<Settings, Error> {
+        let address = |text: &String| {
+            text.parse::<SocketAddr>()
+                .map_err(|_| Error::BadAddress(text.clone()))
+        };
+        let bind = address(self.bind.as_ref().ok_or(Error::MissingBind)?)?;
+        let advertise = match &self.advertise {
+            Some(text) => address(text)?,
+            None if bind.ip().is_unspecified() => return Err(Error::MissingAdvertise),
+            None => bind,
+        };
+        if advertise.ip().is_unspecified() {
+            return Err(Error::UnspecifiedAdvertise);
+        }
+        let seeds = self
+            .seeds
+            .iter()
+            .map(|text| text.parse().map_err(|_| Error::BadSeed(text.clone())))
+            .collect::<Result<Vec<SocketAddr>, _>>()?;
+
+        let limit = self.limit.ok_or(Error::MissingLimit)?;
+        if limit == 0 {
+            return Err(Error::ZeroLimit);
+        }
+        let hot_keys = self.hot_keys.unwrap_or(rateguard_proto::MAX_DEMAND_KEYS);
+        if hot_keys == 0 || hot_keys > rateguard_proto::MAX_DEMAND_KEYS {
+            return Err(Error::TooManyHotKeys(hot_keys));
+        }
+        let tracked_keys = self.tracked_keys.unwrap_or(4096);
+        if tracked_keys < hot_keys {
+            return Err(Error::TooFewTrackedKeys);
+        }
+        let period = self.period.unwrap_or(Duration::from_millis(200)).as_nanos() as u64;
+        if period / 4 == 0 {
+            return Err(Error::ZeroPeriod);
+        }
+
+        let core = Config {
+            limit_per_sec: limit,
+            burst: self.burst.unwrap_or(limit / 20).max(1),
+            alpha: ALPHA,
+            floor_factor: BETA,
+            cooldown: 5 * ONE_SEC,
+            hot_set_size: hot_keys,
+            max_tracked_keys: tracked_keys,
+            demand_time_constant: ONE_SEC,
+        };
+        // The defaults are tuned for 200 ms; whatever must outlast a period
+        // is stretched to one if the period is longer.
+        let defaults = SwimConfig::default();
+        let swim = SwimConfig {
+            protocol_period: period,
+            ack_timeout: period / 2,
+            suspicion_timeout: defaults.suspicion_timeout.max(period),
+            reconnect_interval: defaults.reconnect_interval.max(period),
+            ..defaults
+        };
+        Ok(Settings {
+            bind,
+            advertise,
+            seeds,
+            core,
+            swim,
+            policy: self.policy.unwrap_or_default().to_core(),
+        })
+    }
+}
+
+// The background task's ticker, made here rather than in the task: a
+// runtime built without timers would otherwise only show in the task,
+// which would die at once and leave a node that started "fine" and never
+// runs a round. tokio offers no way to ask, so the attempt is the test.
+fn ticker(settings: &Settings) -> Result<tokio::time::Interval, Error> {
+    let tick = Duration::from_nanos(settings.swim.protocol_period / 4);
+    let ticker =
+        std::panic::catch_unwind(|| tokio::time::interval(tick)).map_err(|_| Error::NoTimer)?;
+    Ok(ticker)
+}
+
+fn start<T: crate::Transport>(
+    settings: Settings,
+    transport: T,
+    ticker: tokio::time::Interval,
+) -> crate::Guard {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use rateguard_core::node::Node;
+    use rateguard_proto::Address;
+
+    let me = Address::from(settings.advertise);
+    let local = crate::key::peer_id(me);
+    // Only the order of probes depends on it; any value will do.
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    let mut node = Node::new(
+        settings.core,
+        settings.swim,
+        local,
+        me,
+        local.get() ^ entropy,
+    );
+    node.set_partition_policy(settings.policy);
+    for seed in settings.seeds {
+        let address = Address::from(seed);
+        let id = crate::key::peer_id(address);
+        // One seed list for the whole fleet names the seeds themselves too.
+        if id != local {
+            node.add_seed(id, address);
+        }
+    }
+
+    let shared = Arc::new(crate::guard::Shared {
+        table: crate::table::KeyTable::new(settings.core.max_tracked_keys, node.new_key_quota()),
+        cluster_size: AtomicUsize::new(node.cluster_size()),
+        epoch: tokio::time::Instant::now(),
+    });
+    tokio::spawn(crate::driver::run(
+        node,
+        transport,
+        Arc::downgrade(&shared),
+        ticker,
+    ));
+    crate::Guard { shared }
+}
+
+/// A builder's settings, checked.
+#[derive(Debug, Clone)]
+pub(crate) struct Settings {
+    pub bind: SocketAddr,
+    pub advertise: SocketAddr,
+    pub seeds: Vec<SocketAddr>,
+    pub core: Config,
+    pub swim: SwimConfig,
+    pub policy: partition::PartitionPolicy,
+}
+
+/// Why a node could not start.
+#[derive(Debug)]
+pub enum Error {
+    MissingBind,
+    /// `bind` or `advertise` is not an `ip:port`.
+    BadAddress(String),
+    MissingLimit,
+    ZeroLimit,
+    ZeroPeriod,
+    /// Bound to an unspecified IP with no address to advertise.
+    MissingAdvertise,
+    /// The advertised address is an unspecified IP: nobody could reach it.
+    UnspecifiedAdvertise,
+    /// A seed is not an `ip:port`; DNS names are not supported yet.
+    BadSeed(String),
+    TooManyHotKeys(usize),
+    TooFewTrackedKeys,
+    /// Not called from within a tokio runtime.
+    NoRuntime,
+    /// The tokio runtime was built without timers (`enable_time`).
+    NoTimer,
+    Bind(std::io::Error),
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::MissingBind => write!(f, "no address to bind"),
+            Error::BadAddress(text) => write!(f, "not an ip:port: {text}"),
+            Error::MissingLimit => write!(f, "no limit"),
+            Error::ZeroLimit => write!(f, "a limit of 0 admits nothing"),
+            Error::ZeroPeriod => write!(f, "a protocol period too short to tick"),
+            Error::MissingAdvertise => write!(
+                f,
+                "bound to an unspecified IP: set the address to advertise"
+            ),
+            Error::UnspecifiedAdvertise => write!(
+                f,
+                "the advertised address is an unspecified IP, nobody could reach it"
+            ),
+            Error::BadSeed(text) => write!(f, "a seed is not an ip:port: {text}"),
+            Error::TooManyHotKeys(n) => write!(
+                f,
+                "{n} hot keys, between 1 and {} fit",
+                rateguard_proto::MAX_DEMAND_KEYS
+            ),
+            Error::TooFewTrackedKeys => write!(f, "fewer tracked keys than hot keys"),
+            Error::NoRuntime => write!(f, "not within a tokio runtime"),
+            Error::NoTimer => write!(f, "the tokio runtime has no timers enabled"),
+            Error::Bind(error) => write!(f, "cannot bind: {error}"),
+        }
+    }
+}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Bind(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> Builder {
+        Builder::new().bind("10.0.0.1:7946").limit(1000)
+    }
+
+    #[test]
+    fn defaults_follow_the_spec() {
+        let s = valid().settings().unwrap();
+        assert_eq!(
+            s.advertise,
+            "10.0.0.1:7946".parse().unwrap(),
+            "the bind address"
+        );
+        assert_eq!(s.core.burst, 50, "limit / 20");
+        assert_eq!(s.core.hot_set_size, 64);
+        assert_eq!(s.core.max_tracked_keys, 4096);
+        assert_eq!((s.core.alpha, s.core.floor_factor), (0.5, 0.05));
+        assert_eq!(s.swim.protocol_period, 200_000_000);
+        assert_eq!(s.policy, partition::PartitionPolicy::HoldDown(10 * ONE_SEC));
+    }
+
+    #[test]
+    fn a_small_limit_still_gets_a_burst_of_one() {
+        let s = Builder::new()
+            .bind("10.0.0.1:1")
+            .limit(7)
+            .settings()
+            .unwrap();
+        assert_eq!(s.core.burst, 1);
+    }
+
+    #[test]
+    fn a_shorter_period_scales_the_timeouts_that_must_outlast_it() {
+        let s = valid()
+            .protocol_period(Duration::from_millis(50))
+            .settings()
+            .unwrap();
+        assert_eq!(s.swim.protocol_period, 50_000_000);
+        assert_eq!(s.swim.ack_timeout, 25_000_000);
+        let s = valid()
+            .protocol_period(Duration::from_secs(3))
+            .settings()
+            .unwrap();
+        assert!(s.swim.reconnect_interval >= s.swim.protocol_period);
+        assert!(s.swim.suspicion_timeout >= s.swim.protocol_period);
+    }
+
+    #[test]
+    fn every_bad_configuration_is_an_error() {
+        use Error::*;
+        type Case = (Builder, fn(&Error) -> bool);
+        let cases: Vec<Case> = vec![
+            (Builder::new().limit(1000), |e| matches!(e, MissingBind)),
+            (Builder::new().bind("nowhere").limit(1000), |e| {
+                matches!(e, BadAddress(_))
+            }),
+            (Builder::new().bind("10.0.0.1:1"), |e| {
+                matches!(e, MissingLimit)
+            }),
+            (valid().limit(0), |e| matches!(e, ZeroLimit)),
+            (valid().protocol_period(Duration::ZERO), |e| {
+                matches!(e, ZeroPeriod)
+            }),
+            (valid().bind("0.0.0.0:7946"), |e| {
+                matches!(e, MissingAdvertise)
+            }),
+            (
+                valid().bind("0.0.0.0:7946").advertise("0.0.0.0:7946"),
+                |e| matches!(e, UnspecifiedAdvertise),
+            ),
+            (valid().seeds(["node-a:7946"]), |e| matches!(e, BadSeed(_))),
+            (valid().hot_keys(65), |e| matches!(e, TooManyHotKeys(65))),
+            (valid().tracked_keys(10), |e| matches!(e, TooFewTrackedKeys)),
+        ];
+        for (builder, expected) in cases {
+            let error = builder.settings().unwrap_err();
+            assert!(expected(&error), "{error:?}");
+            assert!(!error.to_string().is_empty());
+        }
+    }
+}

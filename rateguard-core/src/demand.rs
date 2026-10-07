@@ -40,6 +40,12 @@ impl Demand {
         self.attempts_since_tick += 1;
     }
 
+    /// Counts `n` requests at once, admitted or not: what a runtime that
+    /// enforces elsewhere collected since the last tick.
+    pub fn record_attempts(&mut self, n: u64) {
+        self.attempts_since_tick += n;
+    }
+
     /// Folds the attempts since the last tick into the average.
     pub fn tick(&mut self, now: Nanos) {
         let Some(last) = self.last_tick else {

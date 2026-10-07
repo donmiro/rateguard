@@ -5,7 +5,7 @@ use proptest::prelude::*;
 use rateguard_core::boundary::PeerId;
 use rateguard_core::member::MemberTable;
 use rateguard_core::membership::{Membership, check_contract};
-use rateguard_proto::{Status, Update};
+use rateguard_proto::{Address, Status, Update};
 
 const LOCAL: u64 = 0;
 const MEMBERS: u64 = 6;
@@ -22,6 +22,7 @@ fn update() -> impl Strategy<Value = Update> {
     )
         .prop_map(|(member, incarnation, status)| Update {
             member,
+            addr: Address::V4([10, 0, 0, member as u8], 7946),
             incarnation,
             status,
         })
@@ -35,7 +36,10 @@ fn news() -> impl Strategy<Value = (Vec<Update>, Vec<Update>)> {
 }
 
 fn heard(news: &[Update]) -> MemberTable {
-    let mut table = MemberTable::new(PeerId::new(LOCAL));
+    let mut table = MemberTable::new(
+        PeerId::new(LOCAL),
+        Address::V4([10, 0, 0, LOCAL as u8], 7946),
+    );
     for &update in news {
         table.apply(update, 0);
     }

@@ -19,7 +19,7 @@
 //! reshuffle everyone's shares. Only the dead leave
 //! [`peers`](Membership::peers).
 
-use rateguard_proto::{Status, Update};
+use rateguard_proto::{Address, Status, Update};
 use std::collections::BTreeMap;
 
 use crate::boundary::PeerId;
@@ -42,6 +42,7 @@ pub enum Applied {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Member {
+    addr: Address,
     incarnation: u32,
     status: Status,
     since: Nanos,
@@ -50,6 +51,7 @@ impl Member {
     fn update(&self, peer: PeerId) -> Update {
         Update {
             member: peer.get(),
+            addr: self.addr,
             incarnation: self.incarnation,
             status: self.status,
         }
@@ -60,15 +62,17 @@ impl Member {
 #[derive(Debug, Clone)]
 pub struct MemberTable {
     local: PeerId,
+    addr: Address,
     incarnation: u32,
     members: BTreeMap<PeerId, Member>,
     live: Vec<PeerId>,
     changes: Vec<Change>,
 }
 impl MemberTable {
-    pub fn new(local: PeerId) -> Self {
+    pub fn new(local: PeerId, addr: Address) -> Self {
         Self {
             local,
+            addr,
             incarnation: 0,
             members: BTreeMap::new(),
             live: Vec::new(),
@@ -91,6 +95,14 @@ impl MemberTable {
 
     /// What this node would say about `peer`: the record to gossip, or to
     /// compare news against. `None` for a stranger.
+    /// Where `peer` listens, this node included.
+    pub fn address(&self, peer: PeerId) -> Option<Address> {
+        if peer == self.local {
+            return Some(self.addr);
+        }
+        self.members.get(&peer).map(|member| member.addr)
+    }
+
     pub fn update_about(&self, peer: PeerId) -> Option<Update> {
         if peer == self.local {
             return Some(self.own_update());
@@ -116,6 +128,7 @@ impl MemberTable {
         self.members.insert(
             peer,
             Member {
+                addr: update.addr,
                 incarnation: update.incarnation,
                 status: update.status,
                 since: now,
@@ -215,6 +228,7 @@ impl MemberTable {
     fn own_update(&self) -> Update {
         Update {
             member: self.local.get(),
+            addr: self.addr,
             incarnation: self.incarnation,
             status: Status::Alive,
         }
@@ -267,16 +281,31 @@ mod tests {
         PeerId::new(raw)
     }
 
+    fn addr(member: u64) -> Address {
+        Address::V4([10, 0, 0, member as u8], 7946)
+    }
+
     fn news(member: u64, incarnation: u32, status: Status) -> Update {
         Update {
             member,
+            addr: addr(member),
             incarnation,
             status,
         }
     }
 
     fn table() -> MemberTable {
-        MemberTable::new(id(0))
+        MemberTable::new(id(0), addr(0))
+    }
+
+    #[test]
+    fn a_member_is_known_with_its_address() {
+        let mut t = table();
+        t.apply(news(1, 0, Alive), 0);
+        assert_eq!(t.address(id(1)), Some(addr(1)));
+        assert_eq!(t.address(id(0)), Some(addr(0)), "itself too");
+        assert_eq!(t.address(id(9)), None);
+        assert_eq!(t.update_about(id(0)).unwrap().addr, addr(0));
     }
 
     #[test]
@@ -522,7 +551,7 @@ mod tests {
     fn a_refutation_always_supersedes_what_it_refutes() {
         for incarnation in [0, 1, 41, u32::MAX - 1] {
             for status in [Alive, Suspect, Dead] {
-                let mut t = MemberTable::new(id(0));
+                let mut t = MemberTable::new(id(0), addr(0));
                 let claim = news(0, incarnation, status);
                 if let Applied::Refuted(answer) = t.apply(claim, 0) {
                     assert!(answer.supersedes(&claim), "{answer:?} vs {claim:?}");
@@ -542,8 +571,8 @@ mod tests {
 
     #[test]
     fn a_suspected_node_clears_its_name_across_two_tables() {
-        let mut a = MemberTable::new(id(1));
-        let mut b = MemberTable::new(id(2));
+        let mut a = MemberTable::new(id(1), addr(1));
+        let mut b = MemberTable::new(id(2), addr(2));
         a.apply(b.update_about(id(2)).unwrap(), 0);
 
         let suspicion = a.suspect(id(2), ONE_SEC).unwrap();

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["rateguard-core", "rateguard-sim", "rateguard-proto"]
+members = ["rateguard-core", "rateguard-sim", "rateguard-proto", "rateguard"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"

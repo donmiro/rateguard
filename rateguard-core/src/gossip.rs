@@ -93,6 +93,7 @@ mod tests {
     fn news(member: u64, incarnation: u32, status: Status) -> Update {
         Update {
             member,
+            addr: rateguard_proto::Address::V4([10, 0, 0, member as u8], 7946),
             incarnation,
             status,
         }

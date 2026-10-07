@@ -1,0 +1,27 @@
+[package]
+name = "rateguard"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Distributed rate limiting without a datastore: one global limit, enforced locally"
+
+[dependencies]
+rateguard-core = { path = "../rateguard-core" }
+rateguard-proto = { path = "../rateguard-proto" }
+tokio = { version = "1", features = ["net", "rt", "time", "macros"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+turmoil = { version = "0.7", optional = true }
+
+[features]
+# A Transport for turmoil's simulated UDP, for the wiring tests.
+turmoil = ["dep:turmoil"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time", "macros"] }
+
+[target.'cfg(rateguard_loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rateguard_loom)"] }

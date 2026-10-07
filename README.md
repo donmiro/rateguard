@@ -7,17 +7,17 @@
 whole fleet, with no Redis, no central service, and no network call on the
 request path.**
 
-> **Status: not released yet.** The sans-I/O core (`rateguard-core`) is
-> mostly done: enforcement, SWIM membership, demand-based shares and the
-> partition policies, tested in a deterministic simulator. Still missing:
-> the `rateguard` runtime crate with its UDP transport and the `Guard` API
-> shown below. Nothing is published on crates.io yet.
+> **Status: not released yet.** The core, the simulator and the `rateguard`
+> runtime with the `Guard` API below are done and tested; benchmarks, the
+> accuracy report and the API documentation are next. Nothing is published on
+> crates.io yet.
 
 ```rust
 use rateguard::Guard;
 
 let guard = Guard::builder()
     .bind("0.0.0.0:7946")
+    .advertise("10.0.0.3:7946")         // where the other instances reach this one
     .seeds(["10.0.0.1:7946", "10.0.0.2:7946"])
     .limit(1_000)                       // 1000 rps per key, across every instance
     .spawn()?;
@@ -77,6 +77,7 @@ use std::time::Duration;
 
 let guard = Guard::builder()
     .bind("0.0.0.0:7946")
+    .advertise("10.0.0.3:7946")
     .seeds(["10.0.0.1:7946", "10.0.0.2:7946"])
     .limit(1_000)
     .burst(50)
@@ -90,7 +91,9 @@ match guard.check("api:tenant-42") {
 ```
 
 `Guard` is cheap to clone and `Send + Sync`. Clone it into every handler, task,
-or piece of state that needs it; all clones share one limiter.
+or piece of state that needs it; all clones share one limiter. `spawn()` needs a
+tokio runtime to run the node in; `check()` does not, and works from any thread.
+The node stops when the last clone is dropped.
 
 ### Keys
 
@@ -103,8 +106,15 @@ guard.check("ip:203.0.113.7");              // per client address
 guard.check(&format!("{tenant}:{endpoint}")); // per customer, per endpoint
 ```
 
-Key cardinality is not a capacity concern: cold keys cost nothing on the network
-and the per-key table has a configured ceiling. Ten million keys are fine.
+Cold keys cost nothing on the network, and memory does not grow with the number
+of keys: the per-key table is allocated once, with room for twice
+`tracked_keys`, and a key that has gone quiet frees its place. Many distinct keys
+over time are fine. What the table bounds is how many keys are *active at once*:
+up to one and a half times `tracked_keys` every key gets a place of its own;
+beyond that, the extra ones share a single allowance at the cold rate. That
+errs on the strict side, never the loose one, but it can deny a well-behaved
+key; size `tracked_keys` to at least the number of keys you expect to be busy at
+the same moment.
 
 ### With `axum`
 
@@ -132,13 +142,14 @@ async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Res
 | Option | Default | Meaning |
 |---|---|---|
 | `limit(rps)` | required | Requests per second per key, across the entire fleet |
-| `burst(n)` | `limit / 20` | How much of the limit may be spent instantaneously |
-| `bind(addr)` | required | UDP address for gossip |
-| `seeds([..])` | `[]` | Peers to join through; any live member is enough |
+| `burst(n)` | `limit / 20`, at least 1 | How much of the limit may be spent instantaneously |
+| `bind(addr)` | required | UDP address for gossip, as `ip:port` |
+| `advertise(addr)` | the `bind` address | Where the other instances reach this one; required when binding to `0.0.0.0` or `::`. In Kubernetes, the pod IP |
+| `seeds([..])` | `[]` | Peers to join through, as `ip:port` (no DNS names yet); any live member is enough |
 | `partition_policy(p)` | `HoldDown(10s)` | Behaviour when the cluster splits |
 | `protocol_period(d)` | `200 ms` | How often nodes exchange membership and demand |
 | `hot_keys(n)` | `64` | How many keys may be coordinated at once, at most 64 |
-| `tracked_keys(n)` | `4096` | Ceiling on the per-key table |
+| `tracked_keys(n)` | `4096` | Keys one instance keeps state for at once; the table holds twice as many |
 
 ### Without the network
 
@@ -169,9 +180,13 @@ let mut node = Node::new(
     },
     SwimConfig::default(),
     PeerId::new(1), // this node
+    my_address,     // a rateguard_proto::Address, gossiped so others can reach it
     rng_seed,       // drives its random choices: same seed, same run
 );
-node.add_seed(PeerId::new(0)); // the cluster size N comes from membership
+node.add_seed(PeerId::new(0), seed_address); // N comes from membership
+
+// Send each datagram to node.address(peer); a received datagram's sender is
+// the member of its first record, see the rateguard crate.
 
 // Keys are 64-bit hashes; the original string never leaves your process.
 match node.check(key_hash, now_nanos) {
@@ -260,7 +275,10 @@ always what you want.
    latency is independent of cluster state, including a fully collapsed one.
 2. A healthy cluster in steady state admits between `R × (1 − ε)` and `R`.
 3. Under partition, the bounds above, according to the selected policy.
-4. Memory is `O(hot_keys × N)`, bounded by configuration.
+4. Memory is bounded by configuration: the coordination state is
+   `O(hot_keys × N)`, and the per-key table is allocated once: two 32-byte
+   slots per tracked key, rounded up to a power of two (256 KB at the default
+   4096).
 5. Bandwidth in a healthy cluster is two datagrams per node per protocol
    period: the node's own probe and, on average, one answer to a probe of it.
 

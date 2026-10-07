@@ -21,7 +21,7 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Docs
         run: cargo doc --workspace --no-deps --locked
         env:
@@ -30,3 +30,14 @@ jobs:
       # the RATEGUARD_SEED=... line that replays it locally.
       - name: Test
         run: cargo test --workspace --locked
+      # The key table's races, explored exhaustively. A crate-local cfg:
+      # `--cfg loom` would switch tokio into its own loom build too.
+      - name: Loom
+        run: cargo test -p rateguard --lib --release --locked table
+        env:
+          RUSTFLAGS: --cfg rateguard_loom
+          # Bugs show within a few preemptions; unbounded, three threads over
+          # sixteen candidate slots take far too long.
+          LOOM_MAX_PREEMPTIONS: 3
+      - name: Turmoil
+        run: cargo test -p rateguard --features turmoil --locked --test turmoil

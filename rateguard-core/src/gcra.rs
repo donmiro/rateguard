@@ -7,6 +7,7 @@
 //! forward. Unlike `governor`, the quota can change in flight
 //! ([`Gcra::set_quota`]): a node's share changes every protocol period.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Time in nanoseconds since an origin the caller picks. Only differences
@@ -30,6 +31,18 @@ impl Quota {
             rate_per_sec,
             burst,
         }
+    }
+
+    /// The quota as one word, for an `AtomicU64`.
+    pub fn pack(self) -> u64 {
+        ((self.rate_per_sec as u64) << 32) | self.burst as u64
+    }
+
+    /// # Panics
+    ///
+    /// If the word does not hold a quota made by [`pack`](Quota::pack).
+    pub fn unpack(packed: u64) -> Self {
+        Self::new((packed >> 32) as u32, packed as u32)
     }
 
     fn t_nanos(&self) -> Nanos {
@@ -112,6 +125,75 @@ impl Gcra {
         let tau = self.quota.tau_nanos();
         let earliest = tat.saturating_sub(tau);
         (now < earliest).then(|| Duration::from_nanos(earliest - now))
+    }
+}
+
+/// [`Gcra`] for many threads: the TAT in one atomic word, a decision in
+/// one compare-and-swap. TAT 0 stands for "never admitted" and behaves like
+/// a fresh limiter, as `None` does in `Gcra`.
+#[derive(Debug)]
+pub struct AtomicGcra {
+    quota: AtomicU64,
+    tat: AtomicU64,
+}
+impl AtomicGcra {
+    pub fn new(quota: Quota) -> Self {
+        Self {
+            quota: AtomicU64::new(quota.pack()),
+            tat: AtomicU64::new(0),
+        }
+    }
+
+    pub fn quota(&self) -> Quota {
+        Quota::unpack(self.quota.load(Ordering::Relaxed))
+    }
+
+    /// Admits or denies one request at `now`.
+    pub fn check(&self, now: Nanos) -> Decision {
+        let quota = self.quota();
+        let (t, tau) = (quota.t_nanos(), quota.tau_nanos());
+        let mut tat = self.tat.load(Ordering::Acquire);
+        loop {
+            let earliest = tat.saturating_sub(tau);
+            if now < earliest {
+                return Decision::Deny { retry_at: earliest };
+            }
+            let next = tat.max(now) + t;
+            match self
+                .tat
+                .compare_exchange_weak(tat, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Decision::Allow,
+                Err(seen) => tat = seen,
+            }
+        }
+    }
+
+    /// Like [`Gcra::set_quota`]: the debt carries over in requests. A check
+    /// racing the change may be judged by either quota; both are valid.
+    pub fn set_quota(&self, quota: Quota, now: Nanos) {
+        let old = Quota::unpack(self.quota.swap(quota.pack(), Ordering::AcqRel));
+        if old == quota {
+            return;
+        }
+        let (old_t, new_t) = (old.t_nanos() as f64, quota.t_nanos() as f64);
+        let _ = self
+            .tat
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |tat| {
+                let debt_slots = tat.saturating_sub(now) as f64 / old_t;
+                Some(now.saturating_add((debt_slots * new_t).round() as u64))
+            });
+    }
+
+    /// See [`Gcra::has_debt`].
+    pub fn has_debt(&self, now: Nanos) -> bool {
+        self.tat.load(Ordering::Acquire) > now
+    }
+
+    /// Back to a fresh limiter on `quota`, for a slot handed to another key.
+    pub fn reset(&self, quota: Quota) {
+        self.quota.store(quota.pack(), Ordering::Release);
+        self.tat.store(0, Ordering::Release);
     }
 }
 
@@ -200,5 +282,60 @@ mod tests {
 
         g.set_quota(quota(100, 10), t0);
         assert!(matches!(g.check(t0), Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn a_quota_packs_into_one_word() {
+        let q = Quota::new(1234, 56);
+        assert_eq!(Quota::unpack(q.pack()), q);
+    }
+
+    mod atomic_equivalence {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Check(Nanos),
+            SetQuota(u32, u32, Nanos),
+        }
+
+        fn ops() -> impl Strategy<Value = Vec<Op>> {
+            prop::collection::vec(
+                prop_oneof![
+                    4 => (0u64..50_000_000).prop_map(Op::Check),
+                    1 => (1u32..5_000, 1u32..50, 0u64..50_000_000)
+                        .prop_map(|(r, b, dt)| Op::SetQuota(r, b, dt)),
+                ],
+                1..200,
+            )
+        }
+
+        proptest! {
+            // Single-threaded, the atomic GCRA is the reference one.
+            #[test]
+            fn decides_exactly_like_the_reference(
+                (rate, burst) in (1u32..5_000, 1u32..50),
+                ops in ops(),
+            ) {
+                let mut reference = Gcra::new(Quota::new(rate, burst));
+                let atomic = AtomicGcra::new(Quota::new(rate, burst));
+                let mut now = 0;
+                for op in ops {
+                    match op {
+                        Op::Check(dt) => {
+                            now += dt;
+                            prop_assert_eq!(atomic.check(now), reference.check(now));
+                        }
+                        Op::SetQuota(r, b, dt) => {
+                            now += dt;
+                            reference.set_quota(Quota::new(r, b), now);
+                            atomic.set_quota(Quota::new(r, b), now);
+                        }
+                    }
+                    prop_assert_eq!(atomic.has_debt(now), reference.has_debt(now));
+                }
+            }
+        }
     }
 }

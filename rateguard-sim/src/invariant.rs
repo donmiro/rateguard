@@ -189,6 +189,7 @@ impl Invariant for AdmissionWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::address_of;
     use rateguard_core::boundary::{Event, PeerId};
     use rateguard_core::node::SwimConfig;
 
@@ -229,7 +230,13 @@ mod tests {
 
     #[test]
     fn a_hot_set_over_its_size_is_caught() {
-        let mut node = Node::new(config(), SwimConfig::default(), PeerId::new(0), 0);
+        let mut node = Node::new(
+            config(),
+            SwimConfig::default(),
+            PeerId::new(0),
+            address_of(0),
+            0,
+        );
         for _ in 0..5000 {
             node.check(KEY, 0);
         }
@@ -254,7 +261,13 @@ mod tests {
 
     #[test]
     fn tracked_keys_are_bounded_only_after_a_round() {
-        let mut node = Node::new(config(), SwimConfig::default(), PeerId::new(0), 0);
+        let mut node = Node::new(
+            config(),
+            SwimConfig::default(),
+            PeerId::new(0),
+            address_of(0),
+            0,
+        );
         for key in 0..3 {
             node.check(key, 0);
         }
@@ -296,6 +309,7 @@ mod tests {
             config(),
             SwimConfig::default(),
             PeerId::new(0),
+            address_of(0),
             0,
         )];
         let config = config();
@@ -320,6 +334,7 @@ mod tests {
             config(),
             SwimConfig::default(),
             PeerId::new(0),
+            address_of(0),
             0,
         )];
         let config = config();
@@ -343,6 +358,7 @@ mod tests {
             config(),
             SwimConfig::default(),
             PeerId::new(0),
+            address_of(0),
             0,
         )];
         let config = config();
@@ -369,11 +385,18 @@ mod tests {
     }
 
     fn refuted_once() -> Node {
-        let mut node = Node::new(config(), SwimConfig::default(), PeerId::new(0), 0);
+        let mut node = Node::new(
+            config(),
+            SwimConfig::default(),
+            PeerId::new(0),
+            address_of(0),
+            0,
+        );
         let accusation = rateguard_proto::encode(&rateguard_proto::Message::Ping {
             seq: 1,
             updates: vec![rateguard_proto::Update {
                 member: 0,
+                addr: address_of(0),
                 incarnation: 0,
                 status: rateguard_proto::Status::Suspect,
             }],
@@ -395,7 +418,13 @@ mod tests {
     fn a_dropping_incarnation_is_caught_unless_the_node_restarted() {
         let config = config();
         let refuted = [refuted_once()];
-        let fresh = [Node::new(config, SwimConfig::default(), PeerId::new(0), 0)];
+        let fresh = [Node::new(
+            config,
+            SwimConfig::default(),
+            PeerId::new(0),
+            address_of(0),
+            0,
+        )];
 
         let mut invariant = IncarnationNeverDrops::default();
         invariant
@@ -426,9 +455,15 @@ mod tests {
     #[test]
     fn a_healthy_node_keeps_the_membership_contract() {
         let config = config();
-        let mut node = Node::new(config, SwimConfig::default(), PeerId::new(0), 0);
-        node.introduce(PeerId::new(2));
-        node.introduce(PeerId::new(1));
+        let mut node = Node::new(
+            config,
+            SwimConfig::default(),
+            PeerId::new(0),
+            address_of(0),
+            0,
+        );
+        node.introduce(PeerId::new(2), address_of(2));
+        node.introduce(PeerId::new(1), address_of(1));
         let nodes = [node];
         assert!(
             MembershipContract

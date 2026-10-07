@@ -1,20 +1,24 @@
 //! The rateguard wire format: SWIM messages, encoded with `postcard`.
 //!
 //! Every message fits one UDP datagram of [`MAX_DATAGRAM`] bytes. The
-//! membership part is capped at [`MAX_UPDATES`] updates, under 300 bytes in
-//! the worst case; the rest is left to the demand of the allocation layer,
-//! capped at [`MAX_REPORTS`] reports and [`MAX_DEMAND_KEYS`] keys in all.
+//! membership part is capped at [`MAX_UPDATES`] updates, under 460 bytes in
+//! the worst case, IPv6 addresses included; the rest is left to the demand
+//! of the allocation layer, capped at [`MAX_REPORTS`] report of at most
+//! [`MAX_DEMAND_KEYS`] keys.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// The largest datagram, in bytes: under a typical 1500-byte MTU with room
 /// for IP and UDP headers, so nothing is ever fragmented.
 pub const MAX_DATAGRAM: usize = 1400;
 /// The most membership updates one message may carry.
-pub const MAX_UPDATES: usize = 16;
-/// The most demand reports one message may carry.
-pub const MAX_REPORTS: usize = 16;
+pub const MAX_UPDATES: usize = 12;
+/// The most demand reports one message may carry. Demand is exchanged first
+/// hand (spec §10.8): a message carries the sender's report only. The format
+/// still groups by origin, for aggregation later.
+pub const MAX_REPORTS: usize = 1;
 /// The most keys one message may carry demand for, over all its reports.
 pub const MAX_DEMAND_KEYS: usize = 64;
 
@@ -27,10 +31,38 @@ pub enum Status {
     Dead,
 }
 
+/// Where a member listens. Its own type rather than `SocketAddr`: the wire
+/// format is this crate's to keep stable, the serde form of `SocketAddr` is
+/// not. IPv6 flow info and scope are not carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Address {
+    V4([u8; 4], u16),
+    V6([u8; 16], u16),
+}
+impl From<SocketAddr> for Address {
+    fn from(socket: SocketAddr) -> Self {
+        match socket.ip() {
+            IpAddr::V4(ip) => Address::V4(ip.octets(), socket.port()),
+            IpAddr::V6(ip) => Address::V6(ip.octets(), socket.port()),
+        }
+    }
+}
+impl From<Address> for SocketAddr {
+    fn from(address: Address) -> Self {
+        match address {
+            Address::V4(ip, port) => SocketAddr::new(Ipv4Addr::from(ip).into(), port),
+            Address::V6(ip, port) => SocketAddr::new(Ipv6Addr::from(ip).into(), port),
+        }
+    }
+}
+
 /// A piece of news about one member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Update {
     pub member: u64,
+    /// Where the member listens; gossiped with it so that whoever hears of a
+    /// member can reach it.
+    pub addr: Address,
     pub incarnation: u32,
     pub status: Status,
 }
@@ -217,9 +249,14 @@ fn check_limits(message: &Message) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    fn addr(n: u8) -> Address {
+        Address::V4([10, 0, 0, n], 7946)
+    }
+
     fn update(incarnation: u32, status: Status) -> Update {
         Update {
             member: 7,
+            addr: addr(7),
             incarnation,
             status,
         }
@@ -265,11 +302,32 @@ mod tests {
         vec![
             Update {
                 member: u64::MAX,
+                addr: Address::V6([0xff; 16], u16::MAX),
                 incarnation: u32::MAX,
                 status: Status::Dead,
             };
             n
         ]
+    }
+
+    #[test]
+    fn an_address_survives_the_wire_both_ways() {
+        use std::net::SocketAddr;
+        for text in ["10.0.0.7:7946", "[2001:db8::1]:65535"] {
+            let socket: SocketAddr = text.parse().unwrap();
+            let address = Address::from(socket);
+            assert_eq!(SocketAddr::from(address), socket);
+
+            let message = Message::Ping {
+                seq: 1,
+                updates: vec![Update {
+                    addr: address,
+                    ..update(0, Status::Alive)
+                }],
+                demand: Vec::new(),
+            };
+            assert_eq!(decode(&encode(&message).unwrap()).unwrap(), message);
+        }
     }
 
     #[test]
@@ -290,7 +348,7 @@ mod tests {
                 seq: 3,
                 target: 9,
                 updates,
-                demand: vec![report(Vec::new()), report(vec![key(13, 40.0)])],
+                demand: vec![report(vec![key(13, 40.0)])],
             },
         ] {
             let bytes = encode(&message).unwrap();
@@ -307,7 +365,8 @@ mod tests {
             demand: Vec::new(),
         };
         let len = encode(&message).unwrap().len();
-        assert!(len <= 300, "{len} bytes");
+        // Twelve IPv6 records leave room for a full report.
+        assert!(len <= 460, "{len} bytes");
     }
 
     #[test]
@@ -463,8 +522,13 @@ mod tests {
         use proptest::prelude::*;
 
         fn update() -> impl Strategy<Value = Update> {
+            let address = prop_oneof![
+                (any::<[u8; 4]>(), any::<u16>()).prop_map(|(ip, port)| Address::V4(ip, port)),
+                (any::<[u8; 16]>(), any::<u16>()).prop_map(|(ip, port)| Address::V6(ip, port)),
+            ];
             (
                 any::<u64>(),
+                address,
                 any::<u32>(),
                 prop_oneof![
                     Just(Status::Alive),
@@ -472,8 +536,9 @@ mod tests {
                     Just(Status::Dead)
                 ],
             )
-                .prop_map(|(member, incarnation, status)| Update {
+                .prop_map(|(member, addr, incarnation, status)| Update {
                     member,
+                    addr,
                     incarnation,
                     status,
                 })

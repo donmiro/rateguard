@@ -34,7 +34,7 @@ use crate::{
     limiter::{Config, Limiter},
     member::{Applied, MemberTable},
     membership::{Change, Membership},
-    peer_demand::PeerDemand,
+    peer_demand::{self, PeerDemand},
     rng::Rng,
 };
 
@@ -280,6 +280,9 @@ impl Node {
         self.limiter.tick(now, self.members.cluster_size());
         self.report_demand();
         self.follow_changes();
+        let stale = peer_demand::stale_after_rounds(self.members.cluster_size());
+        self.peer_demand
+            .expire(now, stale * self.swim.protocol_period);
 
         // Reconnect: once in a while the probe goes to someone we have lost
         // instead. Nobody probes the dead, so after a mutual burial nothing
@@ -381,12 +384,14 @@ impl Node {
     // probed this round, so it is probed within the round it joined.
     fn follow_changes(&mut self) {
         for change in self.members.drain_changes() {
-            if let Change::Joined(peer) = change
-                && !self.order[self.next..].contains(&peer)
-            {
-                let remaining = (self.order.len() - self.next) as u64;
-                let at = self.next + self.rng.up_to(remaining) as usize;
-                self.order.insert(at, peer);
+            match change {
+                Change::Joined(peer) if !self.order[self.next..].contains(&peer) => {
+                    let remaining = (self.order.len() - self.next) as u64;
+                    let at = self.next + self.rng.up_to(remaining) as usize;
+                    self.order.insert(at, peer);
+                }
+                Change::Joined(_) => {}
+                Change::Left(peer) => self.peer_demand.forget(peer),
             }
         }
     }
@@ -421,8 +426,15 @@ impl Node {
         for &update in message.updates() {
             self.learn(update, now);
         }
-        for report in message.demand() {
-            self.peer_demand.apply(from, report, now);
+        // Demand comes first hand and whole: a message from a peer without
+        // its own report says it has no hot key.
+        match message
+            .demand()
+            .iter()
+            .find(|report| report.origin == from.get())
+        {
+            Some(report) => self.peer_demand.apply(from, report, now),
+            None => self.peer_demand.forget(from),
         }
         match message {
             Message::Ping { seq, .. } => self.ack(from, seq),
@@ -594,6 +606,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer_demand::stale_after_rounds;
     use Status::{Alive, Dead, Suspect};
     use proto::{DemandReport, KeyDemand};
     use std::collections::BTreeSet;
@@ -1503,6 +1516,72 @@ mod tests {
         n.check(KEY, 0);
         let out = sent(n.handle(Event::Tick, 0));
         assert!(out[0].1.demand().is_empty(), "{out:?}");
+    }
+
+    fn reporting(from: u64, round: u16) -> Message {
+        Message::Ping {
+            seq: 7,
+            updates: Vec::new(),
+            demand: vec![DemandReport {
+                origin: from,
+                round,
+                keys: vec![KeyDemand {
+                    key_hash: KEY,
+                    demand: 75.0,
+                    primary: true,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_message_without_a_report_means_the_sender_has_no_hot_key() {
+        let mut n = node_with([1]);
+        deliver(&mut n, 1, reporting(1, 3), 0);
+        assert!(!n.peer_demand().is_empty());
+
+        let silent = Message::Ping {
+            seq: 8,
+            updates: Vec::new(),
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 1, silent, 1);
+        assert!(n.peer_demand().is_empty());
+    }
+
+    #[test]
+    fn a_peer_that_leaves_the_cluster_is_forgotten() {
+        let mut n = node_with([1]);
+        deliver(&mut n, 1, reporting(1, 3), 0);
+        // Peer 1 never answers: suspected after a round, dead once the
+        // suspicion times out, well before its demand would go stale.
+        let mut now = 0;
+        while n.members().status(PeerId::new(1)) != Some(Dead) {
+            now += TICK;
+            n.handle(Event::Tick, now);
+        }
+        assert!(now < stale_after_rounds(2) * PERIOD, "{now}");
+        assert!(n.peer_demand().is_empty());
+    }
+
+    #[test]
+    fn a_peer_not_heard_from_for_too_long_goes_stale() {
+        let patient = SwimConfig {
+            suspicion_timeout: 1000 * PERIOD,
+            tombstone_ttl: 1000 * PERIOD,
+            ..SWIM
+        };
+        let mut n = Node::new(config(), patient, LOCAL, 1);
+        n.introduce(PeerId::new(1));
+        deliver(&mut n, 1, reporting(1, 3), 0);
+
+        let stale = stale_after_rounds(2);
+        for k in 0..stale {
+            n.handle(Event::Tick, k * PERIOD);
+        }
+        assert!(!n.peer_demand().is_empty(), "still within the threshold");
+        n.handle(Event::Tick, stale * PERIOD);
+        assert!(n.peer_demand().is_empty());
     }
 
     #[test]

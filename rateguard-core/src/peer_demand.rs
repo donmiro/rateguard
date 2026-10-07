@@ -1,10 +1,16 @@
-//! What the peers told us about their demand: one entry per peer and key.
+//! What the peers told us about their demand: the latest snapshot of each.
 //!
-//! Reports carry absolute values, so applying one is idempotent and the
-//! latest round of each peer wins: a lost report costs a round of accuracy,
-//! a duplicated or reordered one costs nothing. Only direct reports are
-//! kept, a peer speaking for itself; see spec §10.8 for why demand is not
-//! relayed.
+//! A peer reports first hand, on every message it sends, the complete list
+//! of its hot keys; see spec §10.8 for why demand is not relayed. Each
+//! report is therefore a snapshot of absolute values: a newer one replaces
+//! the older one whole, so a key that cooled at the peer is gone as soon as
+//! the next report arrives, and a message with no report at all means the
+//! peer has no hot key left. A lost report costs a round of accuracy, a
+//! duplicated or reordered one costs nothing.
+//!
+//! Memory is bounded by the peers times the keys one report can carry: a
+//! peer that leaves the cluster is forgotten, and so is one not heard from
+//! for [`stale_after_rounds`].
 
 use std::collections::HashMap;
 
@@ -32,9 +38,28 @@ pub fn round_is_newer(a: u16, b: u16) -> bool {
     a != b && a.wrapping_sub(b) < 0x8000
 }
 
+/// How many protocol periods a peer's snapshot outlives the last message
+/// from it: max(10, 3·N).
+///
+/// Two nodes talk directly only when one probes the other, so the gaps grow
+/// with the cluster. Measured in the simulator over 5 seeds and 300 s:
+/// without loss the longest gap is 1.84·N rounds at N = 50; at 30% loss it
+/// is 3.18·N, and a gap passed 3·N once in 1.3 million. The floor covers
+/// small clusters, where loss weighs more than N.
+pub fn stale_after_rounds(cluster_size: usize) -> u64 {
+    (3 * cluster_size as u64).max(10)
+}
+
+#[derive(Debug, Clone)]
+struct Snapshot {
+    round: u16,
+    heard_at: Nanos,
+    keys: HashMap<u64, (f32, bool)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerDemand {
-    entries: HashMap<(PeerId, u64), Heard>,
+    peers: HashMap<PeerId, Snapshot>,
     reorder_window: Nanos,
 }
 impl PeerDemand {
@@ -44,7 +69,7 @@ impl PeerDemand {
     /// and counted from 0 again.
     pub fn new(reorder_window: Nanos) -> Self {
         Self {
-            entries: HashMap::new(),
+            peers: HashMap::new(),
             reorder_window,
         }
     }
@@ -55,34 +80,56 @@ impl PeerDemand {
         if report.origin != from.get() {
             return;
         }
-        for key in &report.keys {
-            let heard = Heard {
-                demand: key.demand,
-                primary: key.primary,
+        if let Some(old) = self.peers.get(&from)
+            && !round_is_newer(report.round, old.round)
+            && now < old.heard_at + self.reorder_window
+        {
+            return;
+        }
+        let keys = report
+            .keys
+            .iter()
+            .map(|key| (key.key_hash, (key.demand, key.primary)))
+            .collect();
+        self.peers.insert(
+            from,
+            Snapshot {
                 round: report.round,
                 heard_at: now,
-            };
-            match self.entries.get_mut(&(from, key.key_hash)) {
-                Some(old)
-                    if round_is_newer(report.round, old.round)
-                        || now >= old.heard_at + self.reorder_window =>
-                {
-                    *old = heard;
-                }
-                Some(_) => {}
-                None => {
-                    self.entries.insert((from, key.key_hash), heard);
-                }
-            }
-        }
+                keys,
+            },
+        );
     }
 
-    pub fn get(&self, peer: PeerId, key: u64) -> Option<&Heard> {
-        self.entries.get(&(peer, key))
+    /// Drops everything heard from `peer`: it left the cluster, or it sent
+    /// a message with no report, which means it has no hot key.
+    pub fn forget(&mut self, peer: PeerId) {
+        self.peers.remove(&peer);
     }
 
+    /// Drops the snapshots last heard `max_age` ago or earlier.
+    pub fn expire(&mut self, now: Nanos, max_age: Nanos) {
+        self.peers
+            .retain(|_, snapshot| now < snapshot.heard_at + max_age);
+    }
+
+    pub fn get(&self, peer: PeerId, key: u64) -> Option<Heard> {
+        let snapshot = self.peers.get(&peer)?;
+        let &(demand, primary) = snapshot.keys.get(&key)?;
+        Some(Heard {
+            demand,
+            primary,
+            round: snapshot.round,
+            heard_at: snapshot.heard_at,
+        })
+    }
+
+    /// How many keys are known over all peers.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.peers
+            .values()
+            .map(|snapshot| snapshot.keys.len())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -99,16 +146,23 @@ mod tests {
     const PEER: PeerId = PeerId::new(1);
     const KEY: u64 = 42;
 
-    fn report(round: u16, demand: f32) -> DemandReport {
+    fn report_of(round: u16, keys: &[(u64, f32)]) -> DemandReport {
         DemandReport {
             origin: PEER.get(),
             round,
-            keys: vec![KeyDemand {
-                key_hash: KEY,
-                demand,
-                primary: true,
-            }],
+            keys: keys
+                .iter()
+                .map(|&(key_hash, demand)| KeyDemand {
+                    key_hash,
+                    demand,
+                    primary: true,
+                })
+                .collect(),
         }
+    }
+
+    fn report(round: u16, demand: f32) -> DemandReport {
+        report_of(round, &[(KEY, demand)])
     }
 
     fn demand(table: &PeerDemand) -> Option<f32> {
@@ -126,12 +180,20 @@ mod tests {
     }
 
     #[test]
+    fn the_staleness_threshold_grows_with_the_cluster() {
+        assert_eq!(stale_after_rounds(1), 10);
+        assert_eq!(stale_after_rounds(3), 10);
+        assert_eq!(stale_after_rounds(4), 12);
+        assert_eq!(stale_after_rounds(50), 150);
+    }
+
+    #[test]
     fn a_report_is_remembered_per_peer_and_key() {
         let mut t = PeerDemand::new(PERIOD);
         t.apply(PEER, &report(3, 120.0), 0);
         assert_eq!(
             t.get(PEER, KEY),
-            Some(&Heard {
+            Some(Heard {
                 demand: 120.0,
                 primary: true,
                 round: 3,
@@ -148,6 +210,16 @@ mod tests {
         t.apply(PEER, &report(3, 120.0), 0);
         t.apply(PEER, &report(4, 80.0), 1);
         assert_eq!(demand(&t), Some(80.0));
+    }
+
+    #[test]
+    fn a_key_missing_from_a_newer_report_has_cooled() {
+        let mut t = PeerDemand::new(PERIOD);
+        t.apply(PEER, &report_of(3, &[(KEY, 120.0), (KEY + 1, 90.0)]), 0);
+        t.apply(PEER, &report_of(4, &[(KEY + 1, 95.0)]), 1);
+        assert_eq!(demand(&t), None);
+        assert_eq!(t.get(PEER, KEY + 1).map(|heard| heard.demand), Some(95.0));
+        assert_eq!(t.len(), 1);
     }
 
     #[test]
@@ -185,6 +257,34 @@ mod tests {
     fn a_report_about_someone_else_is_ignored() {
         let mut t = PeerDemand::new(PERIOD);
         t.apply(PeerId::new(2), &report(3, 120.0), 0);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_peer_is_gone_and_others_stay() {
+        let mut t = PeerDemand::new(PERIOD);
+        let other = PeerId::new(2);
+        t.apply(PEER, &report(3, 120.0), 0);
+        t.apply(
+            other,
+            &DemandReport {
+                origin: other.get(),
+                ..report(3, 60.0)
+            },
+            0,
+        );
+        t.forget(PEER);
+        assert_eq!(demand(&t), None);
+        assert_eq!(t.get(other, KEY).map(|heard| heard.demand), Some(60.0));
+    }
+
+    #[test]
+    fn a_snapshot_expires_once_it_is_max_age_old() {
+        let mut t = PeerDemand::new(PERIOD);
+        t.apply(PEER, &report(3, 120.0), PERIOD);
+        t.expire(PERIOD + 10 * PERIOD - 1, 10 * PERIOD);
+        assert_eq!(demand(&t), Some(120.0));
+        t.expire(PERIOD + 10 * PERIOD, 10 * PERIOD);
         assert!(t.is_empty());
     }
 }

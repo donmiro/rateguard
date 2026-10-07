@@ -3,6 +3,7 @@
 
 use rateguard_core::gcra::Nanos;
 use rateguard_core::limiter::Config;
+use rateguard_core::peer_demand::stale_after_rounds;
 use rateguard_sim::link::{Link, NetConfig, PerfectLink, SeededLink};
 use rateguard_sim::sim::{Sim, peer_of};
 
@@ -79,4 +80,55 @@ fn a_quiet_cluster_exchanges_no_demand() {
     for node in 0..NODES {
         assert!(s.node(node).peer_demand().is_empty(), "node {node}");
     }
+}
+
+#[test]
+fn a_node_that_goes_quiet_drops_out_of_its_peers_tables() {
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    s.schedule_request_stream(0, KEY, RATE, 0, 10 * ONE_SEC);
+    s.run_until(10 * ONE_SEC);
+    assert!(!s.node(1).peer_demand().is_empty());
+
+    // The EWMA falls under the hot threshold in ~2 s, then the key stays
+    // hot for the 5 s cooldown.
+    while s.node(0).limiter().is_hot(KEY) {
+        s.run_for(PERIOD);
+    }
+    let cooled = s.now();
+
+    // From then on node 0 sends no report, and its next message to each
+    // peer says it has no hot key. That must beat the staleness threshold,
+    // which would clear the tables anyway.
+    let peers_forgot =
+        |s: &Sim<PerfectLink>| (1..NODES).all(|node| s.node(node).peer_demand().is_empty());
+    while !peers_forgot(&s) {
+        s.run_for(PERIOD);
+    }
+    let rounds = (s.now() - cooled) / PERIOD;
+    assert!(
+        rounds < stale_after_rounds(NODES) * 2 / 3,
+        "{rounds} rounds after the key cooled"
+    );
+}
+
+#[test]
+fn peer_tables_stay_bounded_while_hot_keys_come_and_go() {
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    let keys = 20;
+    for k in 0..keys {
+        let start = k * 10 * ONE_SEC;
+        s.schedule_request_stream(0, KEY + k, RATE, start, start + 10 * ONE_SEC);
+    }
+
+    let mut largest = 0;
+    while s.now() < keys * 10 * ONE_SEC {
+        s.run_for(PERIOD);
+        largest = (1..NODES)
+            .map(|node| s.node(node).peer_demand().len())
+            .chain([largest])
+            .max()
+            .unwrap();
+    }
+    // A key is hot for its 10 s and the cooldown after, so two overlap.
+    assert!(largest <= 2, "{largest} keys of node 0 known at once");
 }

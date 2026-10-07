@@ -52,7 +52,7 @@ fn split_under(policy: PartitionPolicy) -> Sim<Split> {
     s
 }
 
-fn rate(s: &Sim<Split>, from: Nanos, until: Nanos, nodes: &[NodeIndex]) -> f64 {
+fn rate(s: &Sim<impl Link>, from: Nanos, until: Nanos, nodes: &[NodeIndex]) -> f64 {
     let admitted: usize = nodes
         .iter()
         .map(|&node| {
@@ -158,4 +158,35 @@ fn quorum_keeps_the_limit_and_starves_the_minority() {
     );
     assert_between("minority", rate(&s, settled, HEAL, &[3, 4]), 35.0, 45.0);
     assert_healthy_before_and_after(&s);
+}
+
+// Node 4 cannot reach anyone for its first 5 s.
+struct LateJoiner;
+impl Link for LateJoiner {
+    fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, _len: usize) -> Fate {
+        if now < 5 * ONE_SEC && (from == 4 || to == 4) {
+            Fate::Lost
+        } else {
+            Fate::Delivered(now + LATENCY)
+        }
+    }
+}
+
+// A node that has seeds but has not joined yet does not know N. Taking
+// itself for the whole cluster, it would admit as if alone on top of what
+// the others share.
+#[test]
+fn a_node_that_has_not_joined_yet_does_not_take_the_limit() {
+    let mut s = Sim::with_seeds(NODES, config(), LateJoiner, &[0, 1, 2, 3]);
+    for node in 0..NODES {
+        s.schedule_request_stream(node, KEY, 400, 0, 20 * ONE_SEC);
+    }
+    s.run_until(20 * ONE_SEC);
+
+    assert_between(
+        "joined",
+        rate(&s, 15 * ONE_SEC, 20 * ONE_SEC, &ALL),
+        950.0,
+        1000.0,
+    );
 }

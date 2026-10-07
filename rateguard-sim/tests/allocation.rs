@@ -225,3 +225,23 @@ fn a_node_restarted_under_load_does_not_overshoot() {
     }
     assert!(worst <= 1050.0, "{worst:.0} admitted in a second");
 }
+
+// A key nobody had seen turns hot on three nodes at once, well after they
+// have all learned each other. Each knows nothing yet of the others'
+// demand for it; taking its demand for the whole of it, each would take all
+// but the others' floors, close to 3 × R between them (spec §10.5).
+#[test]
+fn a_key_that_turns_hot_on_several_nodes_at_once_stays_within_the_limit() {
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    let (start, run) = (10 * ONE_SEC, 25 * ONE_SEC);
+    for node in [0, 2, 4] {
+        s.schedule_request_stream(node, KEY, 700, start, run);
+    }
+    s.run_until(run);
+
+    let rate = admitted_per_sec(&s, start + 10 * ONE_SEC, run);
+    assert!(
+        (950.0..=1000.0).contains(&rate),
+        "admitted {rate:.1} a second"
+    );
+}

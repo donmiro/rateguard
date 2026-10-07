@@ -29,6 +29,7 @@ struct HotEntry {
     cooling_since: Option<Nanos>,
     demand: f64,
     primary: bool,
+    since: Nanos,
 }
 
 /// The hot keys of one node, bounded in size.
@@ -65,7 +66,7 @@ impl HotSet {
         hot_elsewhere: bool,
     ) -> bool {
         if demand_rate > threshold {
-            return self.promote(key, demand_rate, true);
+            return self.promote(key, demand_rate, true, now);
         }
         if !self.cool(key, demand_rate, now) {
             return false;
@@ -77,12 +78,17 @@ impl HotSet {
                 self.hot.remove(&key);
                 false
             }
-            None => hot_elsewhere && self.promote(key, demand_rate, false),
+            None => hot_elsewhere && self.promote(key, demand_rate, false, now),
         }
     }
 
     pub fn is_hot(&self, key: u64) -> bool {
         self.hot.contains_key(&key)
+    }
+
+    /// Since when the key has been hot without a break, if it is.
+    pub fn hot_since(&self, key: u64) -> Option<Nanos> {
+        self.hot.get(&key).map(|entry| entry.since)
     }
 
     /// Whether the key is hot by its own demand here, cooldown included.
@@ -98,7 +104,7 @@ impl HotSet {
         self.hot.is_empty()
     }
 
-    fn promote(&mut self, key: u64, demand_rate: f64, primary: bool) -> bool {
+    fn promote(&mut self, key: u64, demand_rate: f64, primary: bool, now: Nanos) -> bool {
         if let Some(entry) = self.hot.get_mut(&key) {
             entry.demand = demand_rate;
             entry.cooling_since = None;
@@ -107,14 +113,14 @@ impl HotSet {
         }
 
         if self.hot.len() < self.max_size {
-            self.insert(key, demand_rate, primary);
+            self.insert(key, demand_rate, primary, now);
             return true;
         }
 
         let (weakest_key, weakest_demand) = self.weakest();
         if demand_rate > weakest_demand * EVICTION_MARGIN {
             self.hot.remove(&weakest_key);
-            self.insert(key, demand_rate, primary);
+            self.insert(key, demand_rate, primary, now);
             true
         } else {
             false
@@ -148,13 +154,14 @@ impl HotSet {
         true
     }
 
-    fn insert(&mut self, key: u64, demand_rate: f64, primary: bool) {
+    fn insert(&mut self, key: u64, demand_rate: f64, primary: bool, now: Nanos) {
         self.hot.insert(
             key,
             HotEntry {
                 cooling_since: None,
                 demand: demand_rate,
                 primary,
+                since: now,
             },
         );
     }
@@ -402,5 +409,23 @@ mod tests {
             "full, and not 10% over the weakest"
         );
         assert_eq!(hs.len(), 2);
+    }
+
+    #[test]
+    fn a_hot_key_remembers_since_when() {
+        let mut hs = hot_set(4);
+        assert_eq!(hs.hot_since(1), None);
+        hs.update(1, 500.0, THRESHOLD, ONE_SEC);
+        hs.update(1, 600.0, THRESHOLD, 2 * ONE_SEC);
+        assert_eq!(hs.hot_since(1), Some(ONE_SEC));
+
+        // Primary to secondary is no break: still hot all along.
+        hs.update_with(1, 10.0, THRESHOLD, 3 * ONE_SEC, true);
+        hs.update_with(1, 10.0, THRESHOLD, 3 * ONE_SEC + COOLDOWN, true);
+        assert_eq!(hs.hot_since(1), Some(ONE_SEC));
+
+        hs.update(1, 10.0, THRESHOLD, 3 * ONE_SEC + COOLDOWN + 1);
+        hs.update(1, 500.0, THRESHOLD, 20 * ONE_SEC);
+        assert_eq!(hs.hot_since(1), Some(20 * ONE_SEC), "hot again, anew");
     }
 }

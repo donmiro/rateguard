@@ -598,18 +598,20 @@ mod tests {
 
     #[test]
     fn the_cluster_size_comes_from_the_number_of_nodes() {
-        let window = 200 * ONE_MS;
+        // Measured once the nodes have heard each other: until then a node
+        // learns, at the floor.
+        let (from, until) = (ONE_SEC, ONE_SEC + 200 * ONE_MS);
 
         let mut alone = sim(1);
-        alone.schedule_request_stream(0, KEY, 2000, 0, window);
-        alone.run_until(window);
+        alone.schedule_request_stream(0, KEY, 2000, from, until);
+        alone.run_until(until);
 
         let mut crowded = sim(2);
-        crowded.schedule_request_stream(0, KEY, 2000, 0, window);
-        crowded.run_until(window);
+        crowded.schedule_request_stream(0, KEY, 2000, from, until);
+        crowded.run_until(until);
 
-        let one = alone.admitted_between(0, window);
-        let two = crowded.admitted_between(0, window);
+        let one = alone.admitted_between(from, until);
+        let two = crowded.admitted_between(from, until);
 
         assert!(
             (100..=125).contains(&one),

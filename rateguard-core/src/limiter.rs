@@ -187,6 +187,11 @@ impl Limiter {
         &self.config
     }
 
+    /// Since when the key has been hot without a break, if it is.
+    pub fn hot_since(&self, key: u64) -> Option<Nanos> {
+        self.hot_set.hot_since(key)
+    }
+
     pub fn is_hot(&self, key: u64) -> bool {
         self.hot_set.is_hot(key)
     }

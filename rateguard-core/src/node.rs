@@ -25,7 +25,7 @@
 //!   would never speak again.
 
 use rateguard_proto::{self as proto, DemandReport, KeyDemand, Message, Status, Update};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     allocation::{self, View},
@@ -41,6 +41,13 @@ use crate::{
 };
 
 const ONE_MS: Nanos = 1_000_000;
+
+// How many rounds a share has to stay up before it is applied. A peer
+// recomputes its shares once a round, so up to a round after it has heard
+// this node's demand; until then it still holds the share it had. Were this
+// node to take more at once, the two would overlap: falling at once and
+// rising two rounds late, the peers give up first.
+const RISE_DELAY_ROUNDS: usize = 2;
 
 /// The parameters of the membership protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,12 +120,15 @@ pub struct Node {
     actions: Vec<Action>,
     peer_demand: PeerDemand,
     round_number: u16,
-    rounds_run: u64,
     own_demand: Vec<KeyDemand>,
     policy: PartitionPolicy,
     sizes: SizeHistory,
     held_size: usize,
     floored_until: Nanos,
+    joined_at: Option<Nanos>,
+    last_heard: BTreeMap<PeerId, Nanos>,
+    reported: VecDeque<(Nanos, Vec<KeyDemand>)>,
+    recent_shares: BTreeMap<u64, [f64; RISE_DELAY_ROUNDS]>,
 }
 impl Node {
     /// A node alone in its cluster. `seed` drives its random choices, so the
@@ -165,12 +175,15 @@ impl Node {
             actions: Vec::new(),
             peer_demand: PeerDemand::new(swim.protocol_period),
             round_number: 0,
-            rounds_run: 0,
             own_demand: Vec::new(),
             policy: PartitionPolicy::default(),
             sizes: SizeHistory::new(hold_of(PartitionPolicy::default())),
             held_size: 0,
             floored_until: 0,
+            joined_at: None,
+            last_heard: BTreeMap::new(),
+            reported: VecDeque::new(),
+            recent_shares: BTreeMap::new(),
         }
     }
 
@@ -203,6 +216,7 @@ impl Node {
         if !self.seeds.contains(&seed) {
             self.seeds.push(seed);
         }
+        self.refresh_cap(self.last_now);
     }
 
     pub fn cluster_size(&self) -> usize {
@@ -214,6 +228,7 @@ impl Node {
         self.policy = policy;
         self.sizes = SizeHistory::new(hold_of(policy));
         self.held_size = 0;
+        self.refresh_cap(self.last_now);
     }
 
     pub fn partition_policy(&self) -> PartitionPolicy {
@@ -306,10 +321,9 @@ impl Node {
         {
             self.gossip.push(suspicion);
         }
-        self.rounds_run = self.rounds_run.saturating_add(1);
         self.apply_policy(now);
         self.apply_shares(now);
-        self.report_demand();
+        self.report_demand(now);
         self.follow_changes(now);
         let stale = peer_demand::stale_after_rounds(self.allocation_size());
         self.peer_demand.expire(
@@ -456,6 +470,7 @@ impl Node {
         let Ok(message) = proto::decode(bytes) else {
             return;
         };
+        self.last_heard.insert(from, now);
         for &update in message.updates() {
             self.learn(update, now);
         }
@@ -606,54 +621,157 @@ impl Node {
     fn apply_policy(&mut self, now: Nanos) {
         let size = self.members.cluster_size();
         self.held_size = self.sizes.record(now, size);
+        if size > 1 && self.joined_at.is_none() {
+            self.joined_at = Some(now);
+        }
 
-        if self.policy != PartitionPolicy::Quorum {
-            self.limiter.set_cap(None);
-            return;
+        if self.policy == PartitionPolicy::Quorum {
+            let alive = 1 + self
+                .members
+                .peers()
+                .iter()
+                .filter(|&&peer| self.members.status(peer) == Some(Status::Alive))
+                .count();
+            let known = size + self.members.dead().count();
+            if !partition::has_quorum(alive, known) {
+                let heard_within =
+                    peer_demand::stale_after_rounds(known) * self.swim.protocol_period;
+                self.floored_until = now + heard_within;
+            }
         }
-        let alive = 1 + self
-            .members
-            .peers()
-            .iter()
-            .filter(|&&peer| self.members.status(peer) == Some(Status::Alive))
-            .count();
-        let known = size + self.members.dead().count();
-        if !partition::has_quorum(alive, known) {
-            let heard_within = peer_demand::stale_after_rounds(known) * self.swim.protocol_period;
-            self.floored_until = now + heard_within;
-        }
-        let config = self.limiter.config();
-        let floor = config.limit_per_sec as f64 * config.floor_factor / known as f64;
-        self.limiter
-            .set_cap((now < self.floored_until).then_some(floor));
+        self.refresh_cap(now);
     }
 
+    // The cap every key is held to, if any: the floor `R·β/N`, the one part
+    // of the limit the rest of the cluster keeps for this node whatever it
+    // knows of it.
+    //
+    // - Learning (spec §10.5): the peers have not heard this node's demand
+    //   yet, so they hand all but its floor out among themselves.
+    // - Waiting to join: a node with seeds and no peer yet does not even
+    //   know N. Taking itself for a cluster of one, it would hand out up to
+    //   R on top of what the cluster it is about to join already shares.
+    //   N is taken as itself and its seeds. Optimistic serves anyway, by
+    //   definition.
+    // - Quorum without a majority, see apply_policy.
+    fn refresh_cap(&mut self, now: Nanos) {
+        let config = self.limiter.config();
+        let floor = |known: usize| config.limit_per_sec as f64 * config.floor_factor / known as f64;
+
+        let waiting = self.joined_at.is_none() && !self.seeds.is_empty();
+        let mut caps = Vec::with_capacity(3);
+        if waiting && self.policy != PartitionPolicy::Optimistic {
+            caps.push(floor(1 + self.seeds.len()));
+        }
+        if !waiting && !self.informed_since(self.joined_at.unwrap_or(0), now) {
+            caps.push(floor(self.allocation_size()));
+        }
+        if self.policy == PartitionPolicy::Quorum && now < self.floored_until {
+            caps.push(floor(
+                self.members.cluster_size() + self.members.dead().count(),
+            ));
+        }
+        self.limiter.set_cap(caps.into_iter().reduce(f64::min));
+    }
+
+    // Learning (spec §10.5): whether every live peer has been heard since
+    // `since`, and so, a message going each way, has most likely heard this
+    // node's latest demand too. After stale_after_rounds it is taken as
+    // done in any case, lest a peer that never gets through keep the node
+    // learning forever.
+    fn informed_since(&self, since: Nanos, now: Nanos) -> bool {
+        let stale = peer_demand::stale_after_rounds(self.allocation_size());
+        now >= since + stale * self.swim.protocol_period
+            || self
+                .members
+                .peers()
+                .iter()
+                .all(|peer| self.last_heard.get(peer).is_some_and(|&at| at > since))
+    }
+
+    // A key that has just turned hot here learns too: the peers have not
+    // heard its demand here, and if it turned hot there at the same time,
+    // this node has not heard theirs. Until every peer has been heard since
+    // it turned hot, it gets the floor; a key that turns hot in this very
+    // tick is not in the list yet and gets the floor as well, unless there
+    // is nobody to wait for.
     fn apply_shares(&mut self, now: Nanos) {
         let cluster_size = self.allocation_size();
         let config = *self.limiter.config();
-        let learning = self.rounds_run <= peer_demand::stale_after_rounds(cluster_size);
+        let joined_at = self.joined_at.unwrap_or(0);
+        let informed: BTreeSet<u64> = self
+            .limiter
+            .hot_demand()
+            .into_iter()
+            .map(|(key, ..)| key)
+            .filter(|&key| {
+                let since = self.limiter.hot_since(key).unwrap_or(now).max(joined_at);
+                self.informed_since(since, now)
+            })
+            .collect();
+        let alone = self.informed_since(now, now);
+        let as_of = self.as_of();
+        let reported = &self.reported;
         let peers = &self.peer_demand;
+        let floor = config.limit_per_sec as f64 * config.floor_factor / cluster_size as f64;
+        let previous = std::mem::take(&mut self.recent_shares);
+        let mut recent = BTreeMap::new();
         self.limiter.tick_with_shares(
             now,
             cluster_size,
             |key| peers.hot_elsewhere(key),
             |key, own| {
-                allocation::share(View {
-                    limit: config.limit_per_sec as f64,
-                    cluster_size,
-                    floor_factor: config.floor_factor,
-                    own,
-                    others: peers.total(key),
-                    learning,
-                })
+                let share = if !alone && !informed.contains(&key) {
+                    floor
+                } else {
+                    let then = as_of.and_then(|at| reported_demand(reported, key, at));
+                    allocation::share(View {
+                        limit: config.limit_per_sec as f64,
+                        cluster_size,
+                        floor_factor: config.floor_factor,
+                        own: then.map_or(own, |then| own.min(then)),
+                        others: peers.total(key),
+                    })
+                };
+                // A share falls at once and rises only once it has been
+                // computed as high for RISE_DELAY_ROUNDS more rounds.
+                let past = previous
+                    .get(&key)
+                    .copied()
+                    .unwrap_or([share; RISE_DELAY_ROUNDS]);
+                let applied = past.iter().copied().fold(share, f64::min);
+                let mut kept = [share; RISE_DELAY_ROUNDS];
+                kept[1..].copy_from_slice(&past[..RISE_DELAY_ROUNDS - 1]);
+                recent.insert(key, kept);
+                applied
             },
         );
+        self.recent_shares = recent;
+    }
+
+    // What the peers' demand dates from: the last message from the peer
+    // heard from longest ago. None with no peer, or one never heard at all.
+    //
+    // A share compares this node's demand with the peers'. Theirs is as old
+    // as the last message from each; this node's is fresh. While demand
+    // climbs everywhere, fresh against stale makes every node overrate its
+    // part, and the shares add up to more than R. So the node takes its own
+    // demand as it was then, or as it is now if that is less.
+    fn as_of(&self) -> Option<Nanos> {
+        self.members
+            .peers()
+            .iter()
+            .map(|peer| self.last_heard.get(peer).copied())
+            .collect::<Option<Vec<Nanos>>>()?
+            .into_iter()
+            .min()
     }
 
     // Once a round, right after the limiter has decided which keys are hot.
     // The whole hot set fits one report: hot_set_size is capped at
-    // MAX_DEMAND_KEYS.
-    fn report_demand(&mut self) {
+    // MAX_DEMAND_KEYS. Past reports are kept as far back as a peer's
+    // demand may date from, for as_of.
+    fn report_demand(&mut self, now: Nanos) {
         self.round_number = self.round_number.wrapping_add(1);
         self.own_demand = self
             .limiter
@@ -665,6 +783,17 @@ impl Node {
                 primary,
             })
             .collect();
+
+        let kept =
+            peer_demand::stale_after_rounds(self.allocation_size()) * self.swim.protocol_period;
+        self.reported.push_back((now, self.own_demand.clone()));
+        while self
+            .reported
+            .front()
+            .is_some_and(|&(at, _)| at + kept < now)
+        {
+            self.reported.pop_front();
+        }
     }
 
     // Every message carries our own demand, and only ours: demand is
@@ -694,6 +823,19 @@ impl Node {
         );
         self.last_now = now;
     }
+}
+
+// This node's demand for `key` in its last report made at or before `at`,
+// if the key was in it.
+fn reported_demand(
+    reported: &VecDeque<(Nanos, Vec<KeyDemand>)>,
+    key: u64,
+    at: Nanos,
+) -> Option<f64> {
+    let (_, keys) = reported.iter().rev().find(|&&(made, _)| made <= at)?;
+    keys.iter()
+        .find(|entry| entry.key_hash == key)
+        .map(|entry| entry.demand as f64)
 }
 
 // How long HoldDown holds; nothing for the other policies.
@@ -792,8 +934,9 @@ mod tests {
         }
     }
 
-    // 500 attempts in the first second: twice the hot threshold of a
-    // two-node cluster. Returns the time of the round that promotes the key.
+    // 500 attempts at once: the key is hot from the next round on, the EWMA
+    // well over the hot threshold of a two-node cluster, 250. Returns a time
+    // safely past that.
     fn heat(node: &mut Node) -> Nanos {
         node.handle(Event::Tick, 0);
         for _ in 0..500 {
@@ -1745,20 +1888,59 @@ mod tests {
     }
 
     #[test]
-    fn a_new_node_takes_no_more_than_an_even_split_while_it_learns() {
+    fn a_new_node_stays_at_the_floor_until_it_has_heard_its_peers() {
         let mut n = hot_pair();
         rounds_with_peer(&mut n, 1, 6, None);
         assert!(n.limiter().is_hot(KEY));
-        assert_eq!(rate_of(&mut n, 6 * PERIOD + 1), 500.0, "R / N");
+        // Its peers have not heard its demand either: they keep for it no
+        // more than the floor, R × β / 2.
+        assert_eq!(rate_of(&mut n, 6 * PERIOD + 1), 50.0);
+    }
+
+    #[test]
+    fn hearing_every_peer_ends_the_learning() {
+        let mut n = hot_pair();
+        rounds_with_peer(&mut n, 1, 2, Some(100.0));
+        // Learned well before stale_after_rounds: a cold key gets α × R / 2.
+        assert_eq!(cold_rate_after_round(&mut n, 2 * PERIOD + 1), 250.0);
+    }
+
+    #[test]
+    fn a_key_that_turns_hot_stays_at_the_floor_until_every_peer_is_heard_again() {
+        let mut n = hot_pair();
+        // The key turns hot in round 1, after that round's report.
+        rounds_with_peer(&mut n, 1, 1, Some(100.0));
+        assert_eq!(n.limiter().hot_since(KEY), Some(PERIOD));
+        assert_eq!(
+            rate_of(&mut n, PERIOD + 1),
+            50.0,
+            "the peer may not know yet"
+        );
+
+        // Heard since in round 2; the higher share is applied after
+        // RISE_DELAY_ROUNDS more.
+        let up = 2 + RISE_DELAY_ROUNDS as u64;
+        rounds_with_peer(&mut n, 2, up - 1, Some(100.0));
+        assert_eq!(rate_of(&mut n, (up - 1) * PERIOD + 1), 50.0, "not yet");
+        rounds_with_peer(&mut n, up, up, Some(100.0));
+        assert!(rate_of(&mut n, up * PERIOD + 1) > 100.0, "heard since");
+    }
+
+    #[test]
+    fn a_peer_never_heard_from_does_not_keep_a_node_learning_forever() {
+        let mut n = hot_pair();
+        let up = stale_after_rounds(2) + 1 + RISE_DELAY_ROUNDS as u64;
+        rounds_with_peer(&mut n, 1, up, None);
+        assert!(rate_of(&mut n, up * PERIOD + 1) > 100.0);
     }
 
     #[test]
     fn alone_with_demand_a_node_takes_all_but_its_peers_floor() {
         let mut n = hot_pair();
-        let learned = stale_after_rounds(2);
-        rounds_with_peer(&mut n, 1, learned + 1, None);
+        let up = stale_after_rounds(2) + 1 + RISE_DELAY_ROUNDS as u64;
+        rounds_with_peer(&mut n, 1, up, None);
         // 1000 × 0.1 / 2 = 50 left as the peer's floor.
-        let rate = rate_of(&mut n, (learned + 1) * PERIOD + 1);
+        let rate = rate_of(&mut n, up * PERIOD + 1);
         assert!((rate - 950.0).abs() < 1.0, "{rate}");
     }
 
@@ -1862,6 +2044,58 @@ mod tests {
         }
         assert_eq!(n.cluster_size(), 5);
         assert_eq!(cold_rate_after_round(&mut n, now + 1), 100.0, "α × R / 5");
+    }
+
+    fn waiting_for(policy: PartitionPolicy) -> Node {
+        let mut n = node();
+        n.set_partition_policy(policy);
+        n.add_seed(PeerId::new(1));
+        n
+    }
+
+    #[test]
+    fn a_node_that_has_not_joined_yet_keeps_every_key_at_the_floor() {
+        let mut n = waiting_for(PartitionPolicy::default());
+        // R × β over itself and its one seed, not α × R alone.
+        assert_eq!(rate_of(&mut n, 0), 50.0, "before any round");
+        assert_eq!(cold_rate_after_round(&mut n, 3 * PERIOD), 50.0);
+    }
+
+    #[test]
+    fn an_optimistic_node_serves_before_it_joins() {
+        let mut n = waiting_for(PartitionPolicy::Optimistic);
+        assert_eq!(cold_rate_after_round(&mut n, 0), 500.0, "α × R alone");
+    }
+
+    #[test]
+    fn joining_lifts_the_floor() {
+        let mut n = waiting_for(PartitionPolicy::default());
+        n.handle(Event::Tick, 0);
+        let hello = Message::Ack {
+            seq: 1,
+            updates: vec![news(1, 0, Alive)],
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 1, hello, 1);
+        assert_eq!(n.cluster_size(), 2);
+        assert_eq!(
+            cold_rate_after_round(&mut n, 1),
+            50.0,
+            "joined, but the peer not heard since: R × β / 2"
+        );
+
+        deliver(&mut n, 1, ack(9), PERIOD + 1);
+        assert_eq!(
+            cold_rate_after_round(&mut n, PERIOD + 1),
+            250.0,
+            "α × R / 2"
+        );
+    }
+
+    #[test]
+    fn a_node_alone_without_seeds_is_a_cluster_of_one() {
+        let mut n = node();
+        assert_eq!(cold_rate_after_round(&mut n, 0), 500.0);
     }
 
     #[test]

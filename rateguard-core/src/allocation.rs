@@ -10,7 +10,9 @@
 //!
 //! The floor is carved out of `R` rather than added on top, so with one
 //! consistent view the shares of all N nodes add up to exactly `R`, and yet
-//! a node with no demand yet can admit its first requests (spec §4.3).
+//! a node with no demand yet can admit its first requests (spec §4.3). A
+//! node still learning its peers' demand is held to the floor elsewhere,
+//! by the node (see [`node`](crate::node)).
 
 /// What a node knows when it sizes its share of one hot key.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,9 +27,6 @@ pub struct View {
     pub own: f64,
     /// The sum of the demand its peers reported for the key.
     pub others: f64,
-    /// The node has not been up long enough to have heard every peer: what
-    /// it does not know of may be demand, so it takes no more than `R/N`.
-    pub learning: bool,
 }
 
 /// The node's share of the key's limit, in requests per second.
@@ -35,16 +34,11 @@ pub fn share(view: View) -> f64 {
     let n = view.cluster_size as f64;
     let even = view.limit / n;
     let total = view.own + view.others;
-    let share = if total > 0.0 {
+    if total > 0.0 {
         view.limit * view.floor_factor / n
             + view.limit * (1.0 - view.floor_factor) * (view.own / total)
     } else {
         even
-    };
-    if view.learning {
-        share.min(even)
-    } else {
-        share
     }
 }
 
@@ -61,7 +55,6 @@ mod tests {
             floor_factor: 0.1,
             own,
             others,
-            learning: false,
         }
     }
 
@@ -86,21 +79,6 @@ mod tests {
         assert_eq!(share(view(0.0, 0.0)), 200.0);
     }
 
-    #[test]
-    fn a_learning_node_takes_no_more_than_an_even_split() {
-        let learning = View {
-            learning: true,
-            ..view(300.0, 0.0)
-        };
-        assert_eq!(share(learning), 200.0);
-
-        let modest = View {
-            learning: true,
-            ..view(0.0, 900.0)
-        };
-        assert_eq!(share(modest), 20.0, "learning caps, it does not raise");
-    }
-
     mod properties {
         use super::super::*;
         use proptest::prelude::*;
@@ -117,7 +95,6 @@ mod tests {
                         floor_factor,
                         own,
                         others: total - own,
-                        learning: false,
                     })
                 })
                 .collect()

@@ -68,10 +68,14 @@ fn rate(s: &Sim<impl Link>, from: Nanos, until: Nanos, nodes: &[NodeIndex]) -> f
 
 const ALL: [NodeIndex; NODES] = [0, 1, 2, 3, 4];
 
+// R, plus one burst per node over the shortest window measured (5 s): the
+// bound of spec §5.4 allows each node its burst on top of its share.
+const LIMIT_WITH_BURSTS: f64 = 1000.0 + (NODES * 10) as f64 / 5.0;
+
 fn assert_between(what: &str, rate: f64, low: f64, high: f64) {
     assert!(
         (low..=high).contains(&rate),
-        "{what}: {rate:.0} a second, expected {low}..={high}"
+        "{what}: {rate:.3} a second, expected {low}..={high}"
     );
 }
 
@@ -80,13 +84,13 @@ fn assert_healthy_before_and_after(s: &Sim<Split>) {
         "before the split",
         rate(s, 5 * ONE_SEC, CUT, &ALL),
         950.0,
-        1000.0,
+        LIMIT_WITH_BURSTS,
     );
     assert_between(
         "after the heal",
         rate(s, HEAL + 10 * ONE_SEC, END, &ALL),
         950.0,
-        1000.0,
+        LIMIT_WITH_BURSTS,
     );
 }
 
@@ -115,7 +119,7 @@ fn a_hold_longer_than_the_split_keeps_the_limit() {
     let mut s = split_under(PartitionPolicy::HoldDown(60 * ONE_SEC));
     s.run_until(END);
 
-    assert_between("split", rate(&s, CUT, HEAL, &ALL), 950.0, 1000.0);
+    assert_between("split", rate(&s, CUT, HEAL, &ALL), 950.0, LIMIT_WITH_BURSTS);
     assert_healthy_before_and_after(&s);
 }
 
@@ -131,7 +135,7 @@ fn a_short_hold_keeps_the_limit_then_lets_go() {
         "held",
         rate(&s, CUT, CUT + 5 * ONE_SEC, &ALL),
         950.0,
-        1000.0,
+        LIMIT_WITH_BURSTS,
     );
     assert_between(
         "let go",
@@ -154,7 +158,7 @@ fn quorum_keeps_the_limit_and_starves_the_minority() {
         "majority",
         rate(&s, settled, HEAL, &[0, 1, 2]),
         950.0,
-        1000.0,
+        LIMIT_WITH_BURSTS,
     );
     assert_between("minority", rate(&s, settled, HEAL, &[3, 4]), 35.0, 45.0);
     assert_healthy_before_and_after(&s);
@@ -187,6 +191,6 @@ fn a_node_that_has_not_joined_yet_does_not_take_the_limit() {
         "joined",
         rate(&s, 15 * ONE_SEC, 20 * ONE_SEC, &ALL),
         950.0,
-        1000.0,
+        LIMIT_WITH_BURSTS,
     );
 }

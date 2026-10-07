@@ -245,3 +245,25 @@ fn a_key_that_turns_hot_on_several_nodes_at_once_stays_within_the_limit() {
         "admitted {rate:.1} a second"
     );
 }
+
+// Ten a second over twenty nodes: every share is well under one a second.
+// Rounded up to 1, as the quota once was, the fleet admitted twice its
+// limit, about 20 a second.
+#[test]
+fn a_small_limit_over_a_big_fleet_is_not_multiplied() {
+    let nodes = 20;
+    let config = Config {
+        limit_per_sec: 10,
+        burst: 1,
+        ..config()
+    };
+    let mut s = Sim::new(nodes, config, PerfectLink::new(ONE_MS));
+    let run = 60 * ONE_SEC;
+    for node in 0..nodes {
+        s.schedule_request_stream(node, KEY, 5, 0, run);
+    }
+    s.run_until(run);
+
+    let rate = admitted_per_sec(&s, 20 * ONE_SEC, run);
+    assert!((9.0..=10.5).contains(&rate), "admitted {rate:.2} a second");
+}

@@ -49,6 +49,11 @@ impl Config {
         assert!(self.limit_per_sec > 0, "limit_per_sec must be > 0");
         assert!(self.burst > 0, "burst must be > 0");
         assert!(
+            self.burst <= crate::gcra::MAX_BURST,
+            "burst must be <= {}: a quota holds no more",
+            crate::gcra::MAX_BURST
+        );
+        assert!(
             self.alpha > 0.0 && self.alpha <= 1.0,
             "alpha bust be in (0, 1]"
         );
@@ -262,7 +267,7 @@ impl Limiter {
 }
 
 fn quota_for(rate_per_sec: f64, burst: u32) -> Quota {
-    Quota::new(rate_per_sec.round().max(1.0) as u32, burst)
+    Quota::per_second(rate_per_sec, burst)
 }
 
 #[cfg(test)]
@@ -305,6 +310,15 @@ mod tests {
         Limiter::new(Config {
             hot_set_size: rateguard_proto::MAX_DEMAND_KEYS + 1,
             max_tracked_keys: 1000,
+            ..config()
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "burst must be <=")]
+    fn a_burst_a_quota_cannot_hold_is_refused() {
+        Limiter::new(Config {
+            burst: crate::gcra::MAX_BURST + 1,
             ..config()
         });
     }
@@ -482,6 +496,18 @@ mod tests {
         l.set_cap(Some(20.0));
         assert_eq!(l.new_key_quota(N), Quota::new(20, config().burst));
         assert_eq!(l.quota(KEY), None, "not tracked");
+    }
+
+    // Ten a second over twenty nodes: a cold share of 0.25 a second. Rounded
+    // up to 1, as it once was, the fleet admitted twice its limit.
+    #[test]
+    fn a_share_under_one_per_second_is_kept_not_rounded_up() {
+        let l = Limiter::new(Config {
+            limit_per_sec: 10,
+            burst: 1,
+            ..config()
+        });
+        assert_eq!(l.new_key_quota(20), Quota::per_second(0.25, 1));
     }
 
     #[test]

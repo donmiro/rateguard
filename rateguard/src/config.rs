@@ -4,6 +4,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use rateguard_core::gcra::MAX_BURST;
 use rateguard_core::limiter::Config;
 use rateguard_core::node::SwimConfig;
 use rateguard_core::partition;
@@ -173,6 +174,11 @@ impl Builder {
         if limit == 0 {
             return Err(Error::ZeroLimit);
         }
+        let burst = match self.burst {
+            Some(burst) if burst > MAX_BURST => return Err(Error::TooLargeBurst(burst)),
+            Some(burst) => burst.max(1),
+            None => (limit / 20).clamp(1, MAX_BURST),
+        };
         let hot_keys = self.hot_keys.unwrap_or(rateguard_proto::MAX_DEMAND_KEYS);
         if hot_keys == 0 || hot_keys > rateguard_proto::MAX_DEMAND_KEYS {
             return Err(Error::TooManyHotKeys(hot_keys));
@@ -188,7 +194,7 @@ impl Builder {
 
         let core = Config {
             limit_per_sec: limit,
-            burst: self.burst.unwrap_or(limit / 20).max(1),
+            burst,
             alpha: ALPHA,
             floor_factor: BETA,
             cooldown: 5 * ONE_SEC,
@@ -303,6 +309,8 @@ pub enum Error {
     /// A seed is not an `ip:port`; DNS names are not supported yet.
     BadSeed(String),
     TooManyHotKeys(usize),
+    /// A burst over the 16,777,215 a quota holds.
+    TooLargeBurst(u32),
     TooFewTrackedKeys,
     /// Not called from within a tokio runtime.
     NoRuntime,
@@ -333,6 +341,9 @@ impl fmt::Display for Error {
                 rateguard_proto::MAX_DEMAND_KEYS
             ),
             Error::TooFewTrackedKeys => write!(f, "fewer tracked keys than hot keys"),
+            Error::TooLargeBurst(burst) => {
+                write!(f, "a burst of {burst}, at most {MAX_BURST} fit")
+            }
             Error::NoRuntime => write!(f, "not within a tokio runtime"),
             Error::NoTimer => write!(f, "the tokio runtime has no timers enabled"),
             Error::Bind(error) => write!(f, "cannot bind: {error}"),
@@ -370,6 +381,16 @@ mod tests {
         assert_eq!((s.core.alpha, s.core.floor_factor), (0.5, 0.05));
         assert_eq!(s.swim.protocol_period, 200_000_000);
         assert_eq!(s.policy, partition::PartitionPolicy::HoldDown(10 * ONE_SEC));
+    }
+
+    #[test]
+    fn a_huge_limit_gets_the_largest_burst_a_quota_holds() {
+        let s = Builder::new()
+            .bind("10.0.0.1:1")
+            .limit(u32::MAX)
+            .settings()
+            .unwrap();
+        assert_eq!(s.core.burst, rateguard_core::gcra::MAX_BURST);
     }
 
     #[test]
@@ -424,6 +445,7 @@ mod tests {
             (valid().seeds(["node-a:7946"]), |e| matches!(e, BadSeed(_))),
             (valid().hot_keys(65), |e| matches!(e, TooManyHotKeys(65))),
             (valid().tracked_keys(10), |e| matches!(e, TooFewTrackedKeys)),
+            (valid().burst(u32::MAX), |e| matches!(e, TooLargeBurst(_))),
         ];
         for (builder, expected) in cases {
             let error = builder.settings().unwrap_err();

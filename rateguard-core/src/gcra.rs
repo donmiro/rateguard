@@ -14,44 +14,80 @@ use std::time::Duration;
 /// matter, so any monotonic clock will do, and so will a simulated one.
 pub type Nanos = u64;
 
-/// A rate, and how many requests may arrive back to back.
+const ONE_SEC: Nanos = 1_000_000_000;
+const INTERVAL_BITS: u32 = 40;
+const BURST_BITS: u32 = 64 - INTERVAL_BITS;
+/// The longest emission interval a quota holds: about 18 minutes. A slower
+/// rate is held at this one, stricter than asked, never looser.
+pub const MAX_INTERVAL: Nanos = (1 << INTERVAL_BITS) - 1;
+/// The largest burst a quota holds: 16,777,215.
+pub const MAX_BURST: u32 = (1 << BURST_BITS) - 1;
+
+/// A rate, kept as the emission interval between requests, and how many
+/// requests may arrive back to back. An interval rather than a whole number
+/// of requests per second: a node's share of a small limit over a big fleet
+/// is well under one a second, and rounding it up multiplies the limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quota {
-    rate_per_sec: u32,
+    interval: Nanos,
     burst: u32,
 }
 impl Quota {
+    /// A whole number of requests per second.
+    ///
     /// # Panics
     ///
-    /// If either number is zero.
+    /// If either number is zero, or the burst is over [`MAX_BURST`].
     pub fn new(rate_per_sec: u32, burst: u32) -> Self {
         assert!(rate_per_sec > 0, "rate_per_sec must be > 0");
+        Self::with_interval(ONE_SEC.div_ceil(rate_per_sec as u64), burst)
+    }
+
+    /// Any rate, fractions of a request per second included. A rate too
+    /// slow to hold, zero or not a number, is held at [`MAX_INTERVAL`].
+    ///
+    /// # Panics
+    ///
+    /// If the burst is zero or over [`MAX_BURST`].
+    pub fn per_second(rate: f64, burst: u32) -> Self {
+        let interval = (ONE_SEC as f64 / rate).ceil();
+        let interval = if interval.is_finite() && interval >= 1.0 {
+            (interval as Nanos).min(MAX_INTERVAL)
+        } else if interval.is_finite() && interval > 0.0 {
+            1
+        } else {
+            MAX_INTERVAL
+        };
+        Self::with_interval(interval, burst)
+    }
+
+    fn with_interval(interval: Nanos, burst: u32) -> Self {
         assert!(burst > 0, "burst must be > 0");
+        assert!(burst <= MAX_BURST, "burst must be <= {MAX_BURST}");
         Self {
-            rate_per_sec,
+            interval: interval.clamp(1, MAX_INTERVAL),
             burst,
         }
     }
 
     /// The quota as one word, for an `AtomicU64`.
     pub fn pack(self) -> u64 {
-        ((self.rate_per_sec as u64) << 32) | self.burst as u64
+        (self.interval << BURST_BITS) | self.burst as u64
     }
 
     /// # Panics
     ///
     /// If the word does not hold a quota made by [`pack`](Quota::pack).
     pub fn unpack(packed: u64) -> Self {
-        Self::new((packed >> 32) as u32, packed as u32)
+        Self::with_interval(packed >> BURST_BITS, (packed & MAX_BURST as u64) as u32)
     }
 
     fn t_nanos(&self) -> Nanos {
-        let one_sec = 1_000_000_000u64;
-        one_sec.div_ceil(self.rate_per_sec as u64)
+        self.interval
     }
 
     fn tau_nanos(&self) -> Nanos {
-        self.t_nanos() * (self.burst as u64 - 1)
+        self.interval.saturating_mul(self.burst as u64 - 1)
     }
 }
 
@@ -286,8 +322,42 @@ mod tests {
 
     #[test]
     fn a_quota_packs_into_one_word() {
-        let q = Quota::new(1234, 56);
-        assert_eq!(Quota::unpack(q.pack()), q);
+        for q in [
+            Quota::new(1234, 56),
+            Quota::per_second(0.25, 1),
+            Quota::per_second(0.0, MAX_BURST),
+        ] {
+            assert_eq!(Quota::unpack(q.pack()), q);
+        }
+    }
+
+    #[test]
+    fn a_rate_under_one_per_second_spaces_requests_seconds_apart() {
+        let mut g = Gcra::new(Quota::per_second(0.25, 1));
+        assert_eq!(g.check(0), Decision::Allow);
+        assert_eq!(
+            g.check(1),
+            Decision::Deny {
+                retry_at: 4 * ONE_SEC
+            }
+        );
+        assert_eq!(g.check(4 * ONE_SEC), Decision::Allow);
+    }
+
+    #[test]
+    fn a_rate_too_slow_to_express_is_held_at_the_slowest_not_wrapped() {
+        let slowest = Quota::per_second(0.0, 1);
+        assert_eq!(Quota::per_second(1e-12, 1), slowest);
+        assert_eq!(Quota::per_second(f64::NAN, 1), slowest);
+        let mut g = Gcra::new(slowest);
+        assert_eq!(g.check(0), Decision::Allow);
+        assert!(matches!(g.check(1_000 * ONE_SEC), Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn a_whole_rate_is_the_same_quota_either_way() {
+        assert_eq!(Quota::per_second(100.0, 10), Quota::new(100, 10));
+        assert_eq!(Quota::per_second(1000.0, 1), Quota::new(1000, 1));
     }
 
     mod atomic_equivalence {

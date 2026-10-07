@@ -24,7 +24,7 @@
 //!   unknown seed instead. Without it, two sides that buried each other
 //!   would never speak again.
 
-use rateguard_proto::{self as proto, Message, Status, Update};
+use rateguard_proto::{self as proto, DemandReport, KeyDemand, Message, Status, Update};
 use std::collections::BTreeMap;
 
 use crate::{
@@ -34,6 +34,7 @@ use crate::{
     limiter::{Config, Limiter},
     member::{Applied, MemberTable},
     membership::{Change, Membership},
+    peer_demand::PeerDemand,
     rng::Rng,
 };
 
@@ -108,6 +109,9 @@ pub struct Node {
     last_round: Option<Nanos>,
     last_now: Nanos,
     actions: Vec<Action>,
+    peer_demand: PeerDemand,
+    round_number: u16,
+    own_demand: Vec<KeyDemand>,
 }
 impl Node {
     /// A node alone in its cluster. `seed` drives its random choices, so the
@@ -152,6 +156,9 @@ impl Node {
             last_round: None,
             last_now: 0,
             actions: Vec::new(),
+            peer_demand: PeerDemand::new(swim.protocol_period),
+            round_number: 0,
+            own_demand: Vec::new(),
         }
     }
 
@@ -206,6 +213,11 @@ impl Node {
 
     pub fn limiter(&self) -> &Limiter {
         &self.limiter
+    }
+
+    /// What the peers told this node about their demand.
+    pub fn peer_demand(&self) -> &PeerDemand {
+        &self.peer_demand
     }
 
     /// The hot path: admits or denies a request for `key`. No I/O, no
@@ -266,6 +278,7 @@ impl Node {
             self.gossip.push(suspicion);
         }
         self.limiter.tick(now, self.members.cluster_size());
+        self.report_demand();
         self.follow_changes();
 
         // Reconnect: once in a while the probe goes to someone we have lost
@@ -314,7 +327,15 @@ impl Node {
             helpers: None,
         });
         let updates = self.outgoing(target);
-        self.send(target, &Message::Ping { seq, updates });
+        let demand = self.outgoing_demand();
+        self.send(
+            target,
+            &Message::Ping {
+                seq,
+                updates,
+                demand,
+            },
+        );
     }
 
     // SWIM's indirect probe: a target that did not answer us may still answer
@@ -340,12 +361,14 @@ impl Node {
 
         for &helper in &helpers {
             let updates = self.outgoing(helper);
+            let demand = self.outgoing_demand();
             self.send(
                 helper,
                 &Message::PingReq {
                     seq,
                     target: target.get(),
                     updates,
+                    demand,
                 },
             );
         }
@@ -398,6 +421,9 @@ impl Node {
         for &update in message.updates() {
             self.learn(update, now);
         }
+        for report in message.demand() {
+            self.peer_demand.apply(from, report, now);
+        }
         match message {
             Message::Ping { seq, .. } => self.ack(from, seq),
             Message::Ack { seq, .. } => self.acknowledged(from, seq),
@@ -443,12 +469,28 @@ impl Node {
             },
         );
         let updates = self.outgoing(target);
-        self.send(target, &Message::Ping { seq: own, updates });
+        let demand = self.outgoing_demand();
+        self.send(
+            target,
+            &Message::Ping {
+                seq: own,
+                updates,
+                demand,
+            },
+        );
     }
 
     fn ack(&mut self, to: PeerId, seq: u32) {
         let updates = self.outgoing(to);
-        self.send(to, &Message::Ack { seq, updates });
+        let demand = self.outgoing_demand();
+        self.send(
+            to,
+            &Message::Ack {
+                seq,
+                updates,
+                demand,
+            },
+        );
     }
 
     fn next_seq(&mut self) -> u32 {
@@ -502,8 +544,40 @@ impl Node {
         updates
     }
 
+    // Once a round, right after the limiter has decided which keys are hot.
+    // Only the busiest MAX_DEMAND_KEYS fit a message; a hot set larger than
+    // that leaves the rest unreported.
+    fn report_demand(&mut self) {
+        self.round_number = self.round_number.wrapping_add(1);
+        self.own_demand = self
+            .limiter
+            .hot_demand()
+            .into_iter()
+            .take(proto::MAX_DEMAND_KEYS)
+            .map(|(key_hash, rate)| KeyDemand {
+                key_hash,
+                demand: rate as f32,
+                primary: true,
+            })
+            .collect();
+    }
+
+    // Every message carries our own demand, and only ours: demand is
+    // exchanged first hand (spec §10.8). Nothing to report, nothing sent.
+    fn outgoing_demand(&self) -> Vec<DemandReport> {
+        if self.own_demand.is_empty() {
+            return Vec::new();
+        }
+        vec![DemandReport {
+            origin: self.members.local().get(),
+            round: self.round_number,
+            keys: self.own_demand.clone(),
+        }]
+    }
+
     fn send(&mut self, peer: PeerId, message: &Message) {
-        let bytes = proto::encode(message).expect("MAX_UPDATES updates always fit a datagram");
+        let bytes = proto::encode(message)
+            .expect("a message within the proto limits always fits a datagram");
         self.actions.push(Action::SendTo { peer, bytes });
     }
 
@@ -521,6 +595,7 @@ impl Node {
 mod tests {
     use super::*;
     use Status::{Alive, Dead, Suspect};
+    use proto::{DemandReport, KeyDemand};
     use std::collections::BTreeSet;
 
     const ONE_SEC: Nanos = 1_000_000_000;
@@ -593,6 +668,24 @@ mod tests {
         Message::Ack {
             seq,
             updates: Vec::new(),
+            demand: Vec::new(),
+        }
+    }
+
+    // 500 attempts in the first second: twice the hot threshold of a
+    // two-node cluster. Returns the time of the round that promotes the key.
+    fn heat(node: &mut Node) -> Nanos {
+        node.handle(Event::Tick, 0);
+        for _ in 0..500 {
+            node.check(KEY, 0);
+        }
+        5 * PERIOD
+    }
+
+    fn own_report(message: &Message) -> &DemandReport {
+        match message.demand() {
+            [report] if report.origin == LOCAL.get() => report,
+            other => panic!("expected the node's own report alone, got {other:?}"),
         }
     }
 
@@ -604,7 +697,7 @@ mod tests {
 
     fn round_with_news(node: &mut Node, k: u64) -> (PeerId, u32, Vec<Update>) {
         match sent(node.handle(Event::Tick, k * PERIOD)).as_slice() {
-            [(peer, Message::Ping { seq, updates })] => (*peer, *seq, updates.clone()),
+            [(peer, Message::Ping { seq, updates, .. })] => (*peer, *seq, updates.clone()),
             other => panic!("a round must send exactly one PING, sent {other:?}"),
         }
     }
@@ -750,6 +843,7 @@ mod tests {
         let ping = Message::Ping {
             seq: 77,
             updates: Vec::new(),
+            demand: Vec::new(),
         };
         assert_eq!(
             deliver(&mut n, 5, ping, 0),
@@ -757,7 +851,8 @@ mod tests {
                 PeerId::new(5),
                 Message::Ack {
                     seq: 77,
-                    updates: vec![news(0, 0, Alive)]
+                    updates: vec![news(0, 0, Alive)],
+                    demand: Vec::new(),
                 }
             )],
             "liveness is answered even to a stranger"
@@ -913,6 +1008,7 @@ mod tests {
         let obituary = Message::Ack {
             seq: 999,
             updates: vec![news(1, 0, Dead)],
+            demand: Vec::new(),
         };
         deliver(&mut n, 5, obituary, 0);
         assert_eq!(n.cluster_size(), 1);
@@ -924,6 +1020,7 @@ mod tests {
         let refuting = Message::Ack {
             seq,
             updates: vec![news(1, 1, Alive)],
+            demand: Vec::new(),
         };
         deliver(&mut n, 1, refuting, ONE_MS);
         assert_eq!(n.members().status(PeerId::new(1)), Some(Alive));
@@ -936,6 +1033,7 @@ mod tests {
         let obituary = Message::Ack {
             seq: 999,
             updates: vec![news(1, 0, Dead)],
+            demand: Vec::new(),
         };
         deliver(&mut n, 2, obituary, 0);
 
@@ -969,6 +1067,7 @@ mod tests {
         let ping = Message::Ping {
             seq: 5,
             updates: vec![news(0, 0, Suspect)],
+            demand: Vec::new(),
         };
         assert_eq!(
             deliver(&mut n, 3, ping, 0),
@@ -976,7 +1075,8 @@ mod tests {
                 PeerId::new(3),
                 Message::Ack {
                     seq: 5,
-                    updates: vec![news(0, 1, Alive)]
+                    updates: vec![news(0, 1, Alive)],
+                    demand: Vec::new(),
                 }
             )]
         );
@@ -993,6 +1093,7 @@ mod tests {
         let refuting = Message::Ack {
             seq,
             updates: vec![news(1, 1, Alive)],
+            demand: Vec::new(),
         };
         deliver(&mut n, 1, refuting, PERIOD + ONE_MS);
         assert_eq!(n.members().status(PeerId::new(1)), Some(Alive));
@@ -1011,6 +1112,7 @@ mod tests {
         let stray = Message::Ack {
             seq: 999,
             updates: vec![news(7, 0, Alive)],
+            demand: Vec::new(),
         };
         deliver(&mut n, 1, stray, 0);
         assert_eq!(n.cluster_size(), 3, "a peer learned by gossip joins");
@@ -1029,7 +1131,11 @@ mod tests {
         let mut n = Node::new(config(), quiet, LOCAL, 1);
         n.introduce(PeerId::new(1));
         let death = news(7, 0, Dead);
-        let carrying = |updates: Vec<Update>| Message::Ack { seq: 999, updates };
+        let carrying = |updates: Vec<Update>| Message::Ack {
+            seq: 999,
+            updates,
+            demand: Vec::new(),
+        };
         deliver(&mut n, 1, carrying(vec![death]), 0);
         deliver(&mut n, 1, carrying(vec![death]), 0);
 
@@ -1069,6 +1175,7 @@ mod tests {
             seq,
             target,
             updates: Vec::new(),
+            demand: Vec::new(),
         }
     }
 
@@ -1123,6 +1230,7 @@ mod tests {
         let rumor = Message::Ack {
             seq: 999,
             updates: vec![news(2, 0, Suspect)],
+            demand: Vec::new(),
         };
         deliver(&mut n, 3, rumor, 0);
 
@@ -1222,6 +1330,7 @@ mod tests {
         let hello = Message::Ping {
             seq: 1,
             updates: vec![news(8, 2, Alive)],
+            demand: Vec::new(),
         };
         deliver(&mut n, 8, hello, 0);
         assert_eq!(
@@ -1250,6 +1359,7 @@ mod tests {
         let answer = Message::Ack {
             seq,
             updates: vec![news(5, 3, Alive)],
+            demand: Vec::new(),
         };
         deliver(&mut n, 5, answer, ONE_MS);
         assert_eq!(
@@ -1338,5 +1448,89 @@ mod tests {
         let mut n = node();
         n.handle(Event::Tick, ONE_SEC);
         n.check(KEY, 0);
+    }
+
+    #[test]
+    fn a_round_reports_the_demand_of_hot_keys() {
+        let mut n = node_with([1]);
+        let now = heat(&mut n);
+        let out = sent(n.handle(Event::Tick, now));
+        let [(_, ping @ Message::Ping { .. })] = out.as_slice() else {
+            panic!("a round must send exactly one PING, sent {out:?}");
+        };
+        let [key] = own_report(ping).keys.as_slice() else {
+            panic!("one hot key, one entry");
+        };
+        assert_eq!(key.key_hash, KEY);
+        assert!(key.primary, "hot by its own demand");
+        assert!(
+            (250.0..=500.0).contains(&key.demand),
+            "the EWMA of 500 attempts a second, a second in: {}",
+            key.demand
+        );
+    }
+
+    #[test]
+    fn each_round_reports_under_a_new_round_number() {
+        let mut n = node_with([1]);
+        let now = heat(&mut n);
+        let first = own_report(&sent(n.handle(Event::Tick, now))[0].1).round;
+        let second = own_report(&sent(n.handle(Event::Tick, now + PERIOD))[0].1).round;
+        assert_eq!(second, first.wrapping_add(1));
+    }
+
+    #[test]
+    fn answers_and_relayed_probes_carry_the_report_too() {
+        let mut n = node_with([1, 2]);
+        let now = heat(&mut n);
+        n.handle(Event::Tick, now);
+
+        let ping = Message::Ping {
+            seq: 7,
+            updates: Vec::new(),
+            demand: Vec::new(),
+        };
+        let [(_, answer)] = deliver(&mut n, 1, ping, now).try_into().unwrap();
+        own_report(&answer);
+
+        let [(_, relayed)] = deliver(&mut n, 1, ping_req(8, 2), now).try_into().unwrap();
+        own_report(&relayed);
+    }
+
+    #[test]
+    fn without_hot_keys_no_demand_is_sent() {
+        let mut n = node_with([1]);
+        n.check(KEY, 0);
+        let out = sent(n.handle(Event::Tick, 0));
+        assert!(out[0].1.demand().is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn a_peer_reporting_its_own_demand_is_heard() {
+        let mut n = node_with([1]);
+        let report = |origin: u64| DemandReport {
+            origin,
+            round: 3,
+            keys: vec![KeyDemand {
+                key_hash: KEY,
+                demand: 75.0,
+                primary: true,
+            }],
+        };
+        let ping = |origin| Message::Ping {
+            seq: 7,
+            updates: Vec::new(),
+            demand: vec![report(origin)],
+        };
+        deliver(&mut n, 1, ping(1), 0);
+        let heard = n.peer_demand().get(PeerId::new(1), KEY).unwrap();
+        assert_eq!((heard.demand, heard.round), (75.0, 3));
+
+        deliver(&mut n, 1, ping(2), 0);
+        assert_eq!(
+            n.peer_demand().get(PeerId::new(2), KEY),
+            None,
+            "demand is taken first hand only"
+        );
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! Every message fits one UDP datagram of [`MAX_DATAGRAM`] bytes. The
 //! membership part is capped at [`MAX_UPDATES`] updates, under 300 bytes in
-//! the worst case, which leaves the rest of the datagram to the demand
-//! entries of the allocation layer.
+//! the worst case; the rest is left to the demand of the allocation layer,
+//! capped at [`MAX_REPORTS`] reports and [`MAX_DEMAND_KEYS`] keys in all.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -13,6 +13,10 @@ use std::fmt;
 pub const MAX_DATAGRAM: usize = 1400;
 /// The most membership updates one message may carry.
 pub const MAX_UPDATES: usize = 16;
+/// The most demand reports one message may carry.
+pub const MAX_REPORTS: usize = 16;
+/// The most keys one message may carry demand for, over all its reports.
+pub const MAX_DEMAND_KEYS: usize = 64;
 
 /// A member's state. The declaration order is the order of precedence
 /// within one incarnation, and it is relied on: do not reorder.
@@ -47,20 +51,54 @@ impl Update {
     }
 }
 
-/// A SWIM message. Every one carries membership news. The variant order is
-/// the wire format: do not reorder.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The demand for one key, as one node observed it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct KeyDemand {
+    /// The key, hashed: the string never leaves the node that saw it.
+    /// Fixed width, because a uniform hash would take 9 or 10 bytes as a
+    /// varint.
+    #[serde(with = "postcard::fixint::le")]
+    pub key_hash: u64,
+    /// Attempts per second, admitted or not. Finite and non-negative.
+    pub demand: f32,
+    /// The key is hot at `origin` by its own demand. Only such news makes
+    /// the key hot elsewhere; without the flag two nodes would keep it hot
+    /// for each other forever.
+    pub primary: bool,
+}
+
+/// What one node, `origin`, observed in one of its rounds. Absolute values,
+/// never deltas: a newer round of the same origin replaces the older one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DemandReport {
+    pub origin: u64,
+    pub round: u16,
+    pub keys: Vec<KeyDemand>,
+}
+
+/// A SWIM message. Every one carries membership news and demand. The
+/// variant order is the wire format: do not reorder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     /// Are you alive? The answer is an `Ack` with the same `seq`.
-    Ping { seq: u32, updates: Vec<Update> },
+    Ping {
+        seq: u32,
+        updates: Vec<Update>,
+        demand: Vec<DemandReport>,
+    },
     /// The answer to a `Ping`, or to a `PingReq` relayed by a helper.
-    Ack { seq: u32, updates: Vec<Update> },
+    Ack {
+        seq: u32,
+        updates: Vec<Update>,
+        demand: Vec<DemandReport>,
+    },
     /// Probe `target` for me: I could not reach it myself. If it answers,
     /// the helper sends me an `Ack` with this `seq`.
     PingReq {
         seq: u32,
         target: u64,
         updates: Vec<Update>,
+        demand: Vec<DemandReport>,
     },
 }
 impl Message {
@@ -79,6 +117,14 @@ impl Message {
             | Message::PingReq { updates, .. } => updates,
         }
     }
+
+    pub fn demand(&self) -> &[DemandReport] {
+        match self {
+            Message::Ping { demand, .. }
+            | Message::Ack { demand, .. }
+            | Message::PingReq { demand, .. } => demand,
+        }
+    }
 }
 
 /// Why a message could not be encoded or decoded.
@@ -86,6 +132,12 @@ impl Message {
 pub enum Error {
     /// More than [`MAX_UPDATES`] updates.
     TooManyUpdates(usize),
+    /// More than [`MAX_REPORTS`] demand reports.
+    TooManyReports(usize),
+    /// More than [`MAX_DEMAND_KEYS`] keys over all demand reports.
+    TooManyDemandKeys(usize),
+    /// A demand that is negative, infinite or NaN.
+    InvalidDemand,
     /// Larger than [`MAX_DATAGRAM`] bytes.
     TooLarge(usize),
     /// Not a rateguard message.
@@ -97,6 +149,13 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::TooManyUpdates(n) => write!(f, "{n} updates, at most {MAX_UPDATES} fit"),
+            Error::TooManyReports(n) => {
+                write!(f, "{n} demand reports, at most {MAX_REPORTS} fit")
+            }
+            Error::TooManyDemandKeys(n) => {
+                write!(f, "demand for {n} keys, at most {MAX_DEMAND_KEYS} fit")
+            }
+            Error::InvalidDemand => write!(f, "a demand is negative, infinite or NaN"),
             Error::TooLarge(n) => write!(f, "{n} bytes, the datagram limit is {MAX_DATAGRAM}"),
             Error::Malformed => write!(f, "not a rateguard message"),
             Error::TrailingBytes(n) => write!(f, "{n} bytes left after the message"),
@@ -107,7 +166,7 @@ impl std::error::Error for Error {}
 
 /// Encodes a message into one datagram.
 pub fn encode(message: &Message) -> Result<Vec<u8>, Error> {
-    check_updates(message)?;
+    check_limits(message)?;
     let bytes = postcard::to_allocvec(message).expect("a Message always serialized");
     if bytes.len() > MAX_DATAGRAM {
         return Err(Error::TooLarge(bytes.len()));
@@ -126,14 +185,30 @@ pub fn decode(bytes: &[u8]) -> Result<Message, Error> {
     if !rest.is_empty() {
         return Err(Error::TrailingBytes(rest.len()));
     }
-    check_updates(&message)?;
+    check_limits(&message)?;
     Ok(message)
 }
 
-fn check_updates(message: &Message) -> Result<(), Error> {
+fn check_limits(message: &Message) -> Result<(), Error> {
     let n = message.updates().len();
     if n > MAX_UPDATES {
         return Err(Error::TooManyUpdates(n));
+    }
+    let reports = message.demand();
+    if reports.len() > MAX_REPORTS {
+        return Err(Error::TooManyReports(reports.len()));
+    }
+    let keys: usize = reports.iter().map(|r| r.keys.len()).sum();
+    if keys > MAX_DEMAND_KEYS {
+        return Err(Error::TooManyDemandKeys(keys));
+    }
+    let is_rate = |d: f32| d.is_finite() && d >= 0.0;
+    if !reports
+        .iter()
+        .flat_map(|r| &r.keys)
+        .all(|k| is_rate(k.demand))
+    {
+        return Err(Error::InvalidDemand);
     }
     Ok(())
 }
@@ -147,6 +222,42 @@ mod tests {
             member: 7,
             incarnation,
             status,
+        }
+    }
+
+    fn key(key_hash: u64, demand: f32) -> KeyDemand {
+        KeyDemand {
+            key_hash,
+            demand,
+            primary: true,
+        }
+    }
+
+    fn report(keys: Vec<KeyDemand>) -> DemandReport {
+        DemandReport {
+            origin: 3,
+            round: 17,
+            keys,
+        }
+    }
+
+    // The most demand one message may carry, every field at its widest.
+    fn worst_demand() -> Vec<DemandReport> {
+        let per_report = MAX_DEMAND_KEYS / MAX_REPORTS;
+        (0..MAX_REPORTS)
+            .map(|_| DemandReport {
+                origin: u64::MAX,
+                round: u16::MAX,
+                keys: vec![key(u64::MAX, f32::MAX); per_report],
+            })
+            .collect()
+    }
+
+    fn ping_with_demand(demand: Vec<DemandReport>) -> Message {
+        Message::Ping {
+            seq: 0,
+            updates: Vec::new(),
+            demand,
         }
     }
 
@@ -168,15 +279,18 @@ mod tests {
             Message::Ping {
                 seq: 1,
                 updates: updates.clone(),
+                demand: vec![report(vec![key(11, 2.5), key(12, 0.0)])],
             },
             Message::Ack {
                 seq: 2,
                 updates: Vec::new(),
+                demand: Vec::new(),
             },
             Message::PingReq {
                 seq: 3,
                 target: 9,
                 updates,
+                demand: vec![report(Vec::new()), report(vec![key(13, 40.0)])],
             },
         ] {
             let bytes = encode(&message).unwrap();
@@ -185,18 +299,82 @@ mod tests {
     }
 
     #[test]
+    fn membership_leaves_most_of_the_datagram_to_demand() {
+        let message = Message::PingReq {
+            seq: u32::MAX,
+            target: u64::MAX,
+            updates: worst_updates(MAX_UPDATES),
+            demand: Vec::new(),
+        };
+        let len = encode(&message).unwrap().len();
+        assert!(len <= 300, "{len} bytes");
+    }
+
+    #[test]
     fn the_worst_case_datagram_fits_the_mtu() {
         let message = Message::PingReq {
             seq: u32::MAX,
             target: u64::MAX,
             updates: worst_updates(MAX_UPDATES),
+            demand: worst_demand(),
         };
         let len = encode(&message).unwrap().len();
         assert!(len <= MAX_DATAGRAM, "{len} bytes");
-        assert!(
-            len <= 300,
-            "membership must leave the datagram to demand[]: {len} bytes"
+    }
+
+    #[test]
+    fn a_key_hash_takes_eight_bytes_whatever_its_value() {
+        // Hashes are uniform, so a varint would take 9 or 10 bytes for
+        // almost every key: fixed width is the smaller encoding here.
+        let len = |key_hash| {
+            encode(&ping_with_demand(vec![report(vec![key(key_hash, 1.0)])]))
+                .unwrap()
+                .len()
+        };
+        assert_eq!(len(u64::MAX), len(1));
+        assert_eq!(
+            len(1)
+                - encode(&ping_with_demand(vec![report(Vec::new())]))
+                    .unwrap()
+                    .len(),
+            8 + 4 + 1,
+            "key_hash, demand and primary"
         );
+    }
+
+    #[test]
+    fn one_demand_key_too_many_is_refused_both_ways() {
+        let mut demand = worst_demand();
+        demand[0].keys.push(key(1, 1.0));
+        let message = ping_with_demand(demand);
+        let n = MAX_DEMAND_KEYS + 1;
+        assert_eq!(encode(&message), Err(Error::TooManyDemandKeys(n)));
+
+        let smuggled = postcard::to_allocvec(&message).unwrap();
+        assert_eq!(decode(&smuggled), Err(Error::TooManyDemandKeys(n)));
+    }
+
+    #[test]
+    fn one_report_too_many_is_refused_both_ways() {
+        let message = ping_with_demand(vec![report(Vec::new()); MAX_REPORTS + 1]);
+        let n = MAX_REPORTS + 1;
+        assert_eq!(encode(&message), Err(Error::TooManyReports(n)));
+
+        let smuggled = postcard::to_allocvec(&message).unwrap();
+        assert_eq!(decode(&smuggled), Err(Error::TooManyReports(n)));
+    }
+
+    #[test]
+    fn a_demand_that_is_not_a_rate_is_refused_both_ways() {
+        // One NaN or infinity in a sum of demands poisons every share
+        // computed from it, so it is stopped at the wire.
+        for bad in [f32::NAN, f32::INFINITY, -1.0] {
+            let message = ping_with_demand(vec![report(vec![key(1, 1.0), key(2, bad)])]);
+            assert_eq!(encode(&message), Err(Error::InvalidDemand), "{bad}");
+
+            let smuggled = postcard::to_allocvec(&message).unwrap();
+            assert_eq!(decode(&smuggled), Err(Error::InvalidDemand), "{bad}");
+        }
     }
 
     #[test]
@@ -204,6 +382,7 @@ mod tests {
         let message = Message::Ping {
             seq: 0,
             updates: worst_updates(MAX_UPDATES + 1),
+            demand: Vec::new(),
         };
         assert_eq!(
             encode(&message),
@@ -222,15 +401,16 @@ mod tests {
         let ping = Message::Ping {
             seq: 1,
             updates: Vec::new(),
+            demand: Vec::new(),
         };
-        assert_eq!(encode(&ping).unwrap(), [0, 1, 0]);
+        assert_eq!(encode(&ping).unwrap(), [0, 1, 0, 0]);
     }
 
     #[test]
     fn garbage_is_rejected_not_guessed() {
         assert_eq!(decode(&[]), Err(Error::Malformed));
         assert_eq!(decode(&[0xde, 0xad, 0xbe, 0xef]), Err(Error::Malformed));
-        assert_eq!(decode(&[0, 1, 0, 0xff]), Err(Error::TrailingBytes(1)));
+        assert_eq!(decode(&[0, 1, 0, 0, 0xff]), Err(Error::TrailingBytes(1)));
         assert_eq!(
             decode(&vec![0; MAX_DATAGRAM + 1]),
             Err(Error::TooLarge(MAX_DATAGRAM + 1))
@@ -239,6 +419,7 @@ mod tests {
         let bytes = encode(&Message::Ack {
             seq: 5,
             updates: vec![update(1, Status::Alive)],
+            demand: Vec::new(),
         })
         .unwrap();
         assert_eq!(decode(&bytes[..bytes.len() - 1]), Err(Error::Malformed));
@@ -298,18 +479,48 @@ mod tests {
                 })
         }
 
+        fn report() -> impl Strategy<Value = DemandReport> {
+            let key = (any::<u64>(), 0.0..=f32::MAX, any::<bool>()).prop_map(
+                |(key_hash, demand, primary)| KeyDemand {
+                    key_hash,
+                    demand,
+                    primary,
+                },
+            );
+            let keys = prop::collection::vec(key, 0..=MAX_DEMAND_KEYS / MAX_REPORTS);
+            (any::<u64>(), any::<u16>(), keys).prop_map(|(origin, round, keys)| DemandReport {
+                origin,
+                round,
+                keys,
+            })
+        }
+
         fn message() -> impl Strategy<Value = Message> {
             let updates = || prop::collection::vec(update(), 0..=MAX_UPDATES);
+            let demand = || prop::collection::vec(report(), 0..=MAX_REPORTS);
             prop_oneof![
-                (any::<u32>(), updates()).prop_map(|(seq, updates)| Message::Ping { seq, updates }),
-                (any::<u32>(), updates()).prop_map(|(seq, updates)| Message::Ack { seq, updates }),
-                (any::<u32>(), any::<u64>(), updates()).prop_map(|(seq, target, updates)| {
-                    Message::PingReq {
+                (any::<u32>(), updates(), demand()).prop_map(|(seq, updates, demand)| {
+                    Message::Ping {
+                        seq,
+                        updates,
+                        demand,
+                    }
+                }),
+                (any::<u32>(), updates(), demand()).prop_map(|(seq, updates, demand)| {
+                    Message::Ack {
+                        seq,
+                        updates,
+                        demand,
+                    }
+                }),
+                (any::<u32>(), any::<u64>(), updates(), demand()).prop_map(
+                    |(seq, target, updates, demand)| Message::PingReq {
                         seq,
                         target,
                         updates,
+                        demand,
                     }
-                }),
+                ),
             ]
         }
 

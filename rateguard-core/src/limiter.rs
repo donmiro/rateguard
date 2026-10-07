@@ -120,6 +120,19 @@ impl Limiter {
         self.enforce_cap();
     }
 
+    /// The hot keys with their demand in attempts per second, busiest
+    /// first: what this node has to tell its peers.
+    pub fn hot_demand(&self) -> Vec<(u64, f64)> {
+        let mut hot: Vec<(u64, f64)> = self
+            .keys
+            .iter()
+            .filter(|&(&key, _)| self.hot_set.is_hot(key))
+            .map(|(&key, state)| (key, state.demand.rate()))
+            .collect();
+        hot.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        hot
+    }
+
     pub fn is_hot(&self, key: u64) -> bool {
         self.hot_set.is_hot(key)
     }
@@ -246,6 +259,26 @@ mod tests {
         assert!(
             l.is_hot(KEY),
             "490 of those 500 attempts were denied; counting only admissions would never promote"
+        );
+    }
+
+    #[test]
+    fn hot_demand_lists_the_hot_keys_busiest_first() {
+        let mut l = limiter();
+        l.tick(0, N);
+        for (key, attempts) in [(1, 600), (2, 900), (3, 10)] {
+            for _ in 0..attempts {
+                l.check(key, 0, N);
+            }
+        }
+        l.tick(ONE_SEC, N);
+
+        let listed: Vec<u64> = l.hot_demand().into_iter().map(|(key, _)| key).collect();
+        assert_eq!(listed, [2, 1], "key 3 is cold");
+        let (_, busiest) = l.hot_demand()[0];
+        assert!(
+            (busiest - 900.0 * (1.0 - (-1.0f64).exp())).abs() < 1.0,
+            "{busiest}"
         );
     }
 

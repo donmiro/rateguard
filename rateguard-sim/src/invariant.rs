@@ -366,6 +366,7 @@ mod tests {
                 incarnation: 0,
                 status: rateguard_proto::Status::Suspect,
             }],
+            demand: Vec::new(),
         })
         .unwrap();
         node.handle(

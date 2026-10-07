@@ -124,6 +124,15 @@ impl PeerDemand {
         })
     }
 
+    /// The demand all peers reported for `key`, summed.
+    pub fn total(&self, key: u64) -> f64 {
+        self.peers
+            .values()
+            .filter_map(|snapshot| snapshot.keys.get(&key))
+            .map(|&(demand, _)| demand as f64)
+            .sum()
+    }
+
     /// How many keys are known over all peers.
     pub fn len(&self) -> usize {
         self.peers
@@ -276,6 +285,24 @@ mod tests {
         t.forget(PEER);
         assert_eq!(demand(&t), None);
         assert_eq!(t.get(other, KEY).map(|heard| heard.demand), Some(60.0));
+    }
+
+    #[test]
+    fn the_total_adds_up_what_every_peer_reported() {
+        let mut t = PeerDemand::new(PERIOD);
+        let other = PeerId::new(2);
+        t.apply(PEER, &report_of(3, &[(KEY, 120.0), (KEY + 1, 5.0)]), 0);
+        t.apply(
+            other,
+            &DemandReport {
+                origin: other.get(),
+                ..report(9, 60.0)
+            },
+            0,
+        );
+        assert_eq!(t.total(KEY), 180.0);
+        assert_eq!(t.total(KEY + 1), 5.0);
+        assert_eq!(t.total(KEY + 2), 0.0);
     }
 
     #[test]

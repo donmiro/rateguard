@@ -1,10 +1,10 @@
 //! Enforcement on one node: a GCRA per key, on a share of the limit.
 //!
-//! A cold key gets `R/N × α` and a hot key `R/N`; from Phase 4 a hot key
-//! gets a share proportional to its demand instead. [`Limiter::check`] is the
-//! hot path: one map lookup and one GCRA step, no I/O, and no allocation for
-//! a key it already knows. [`Limiter::tick`] does everything else once per
-//! protocol period.
+//! A cold key gets `R/N × α`; a hot key gets the share it is given by
+//! [`Limiter::tick_with_shares`], or `R/N` by [`Limiter::tick`].
+//! [`Limiter::check`] is the hot path: one map lookup and one GCRA step, no
+//! I/O, and no allocation for a key it already knows. The tick does
+//! everything else once per protocol period.
 //!
 //! Memory is bounded by the config, not by how many keys there are: a key
 //! with no debt and no demand is dropped without loss, and under pressure
@@ -27,9 +27,16 @@ pub struct Config {
     /// α, in (0, 1]: the part of the per-node rate a cold key gets, and the
     /// threshold at which it turns hot.
     pub alpha: f64,
+    /// β, in [0, 1]: the part of a hot key's limit split evenly among the
+    /// nodes as a floor, so that a node with no demand yet can admit its
+    /// first requests. The rest follows demand.
+    pub floor_factor: f64,
     /// How long a hot key stays hot after its demand drops below the
     /// threshold.
     pub cooldown: Nanos,
+    /// At most [`MAX_DEMAND_KEYS`](rateguard_proto::MAX_DEMAND_KEYS): one
+    /// message must carry the whole hot set, or the peers would take the
+    /// keys left out for keys with no demand here.
     pub hot_set_size: usize,
     /// Cap on the keys this node keeps any state for. Separate from
     /// `hot_set_size` and at least as big: hot keys are never reclaimed.
@@ -45,7 +52,16 @@ impl Config {
             self.alpha > 0.0 && self.alpha <= 1.0,
             "alpha bust be in (0, 1]"
         );
+        assert!(
+            (0.0..=1.0).contains(&self.floor_factor),
+            "floor_factor must be in [0, 1]"
+        );
         assert!(self.hot_set_size > 0, "hot_set_size  must be > 0");
+        assert!(
+            self.hot_set_size <= rateguard_proto::MAX_DEMAND_KEYS,
+            "hot_set_size must be <= {}: a report carries no more keys",
+            rateguard_proto::MAX_DEMAND_KEYS
+        );
         assert!(
             self.max_tracked_keys >= self.hot_set_size,
             "max_tracked_keys must be >= hot_set_size: hot keys are never reclaimed"
@@ -95,12 +111,25 @@ impl Limiter {
 
     /// Updates demand, moves keys between cold and hot, applies their new
     /// quotas and enforces `max_tracked_keys`. Once per protocol period.
+    /// A hot key gets an even split, `R/N`: for a share that follows
+    /// demand, see [`tick_with_shares`](Limiter::tick_with_shares).
     pub fn tick(&mut self, now: Nanos, cluster_size: usize) {
+        let even = self.per_node_rate(cluster_size);
+        self.tick_with_shares(now, cluster_size, |_, _| even);
+    }
+
+    /// Like [`tick`](Limiter::tick), but a hot key gets the rate
+    /// `share(key, own_demand)` returns, in requests per second.
+    pub fn tick_with_shares(
+        &mut self,
+        now: Nanos,
+        cluster_size: usize,
+        mut share: impl FnMut(u64, f64) -> f64,
+    ) {
         let threshold = self.per_node_rate(cluster_size) * self.config.alpha;
         let cold = self.cold_quota(cluster_size);
-        let hot = self.hot_quota(cluster_size);
+        let (burst, keys, hot_set) = (self.config.burst, &mut self.keys, &mut self.hot_set);
 
-        let Self { keys, hot_set, .. } = self;
         keys.retain(|&key, state| {
             state.demand.tick(now);
             let is_hot = hot_set.update(key, state.demand.rate(), threshold, now);
@@ -109,7 +138,11 @@ impl Limiter {
                 return false;
             }
 
-            let wanted = if is_hot { hot } else { cold };
+            let wanted = if is_hot {
+                quota_for(share(key, state.demand.rate()), burst)
+            } else {
+                cold
+            };
             if state.applied != wanted {
                 state.gcra.set_quota(wanted, now);
                 state.applied = wanted;
@@ -131,6 +164,10 @@ impl Limiter {
             .collect();
         hot.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         hot
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     pub fn is_hot(&self, key: u64) -> bool {
@@ -175,16 +212,15 @@ impl Limiter {
     }
 
     fn cold_quota(&self, cluster_size: usize) -> Quota {
-        self.quota_for(self.per_node_rate(cluster_size) * self.config.alpha)
+        quota_for(
+            self.per_node_rate(cluster_size) * self.config.alpha,
+            self.config.burst,
+        )
     }
+}
 
-    fn hot_quota(&self, cluster_size: usize) -> Quota {
-        self.quota_for(self.per_node_rate(cluster_size))
-    }
-
-    fn quota_for(&self, rate_per_sec: f64) -> Quota {
-        Quota::new(rate_per_sec.round().max(1.0) as u32, self.config.burst)
-    }
+fn quota_for(rate_per_sec: f64, burst: u32) -> Quota {
+    Quota::new(rate_per_sec.round().max(1.0) as u32, burst)
 }
 
 #[cfg(test)]
@@ -200,6 +236,7 @@ mod tests {
             limit_per_sec: 1000,
             burst: 10,
             alpha: 0.5,
+            floor_factor: 0.1,
             cooldown: 5 * ONE_SEC,
             hot_set_size: 4,
             max_tracked_keys: 8,
@@ -218,6 +255,25 @@ mod tests {
         }
         l.tick(ONE_SEC, N);
         assert!(l.is_hot(KEY));
+    }
+
+    #[test]
+    #[should_panic(expected = "hot_set_size must be <= 64")]
+    fn a_hot_set_peers_cannot_hear_whole_is_refused() {
+        Limiter::new(Config {
+            hot_set_size: rateguard_proto::MAX_DEMAND_KEYS + 1,
+            max_tracked_keys: 1000,
+            ..config()
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "floor_factor must be in [0, 1]")]
+    fn a_floor_over_the_whole_limit_is_refused() {
+        Limiter::new(Config {
+            floor_factor: 1.5,
+            ..config()
+        });
     }
 
     #[test]
@@ -280,6 +336,30 @@ mod tests {
             (busiest - 900.0 * (1.0 - (-1.0f64).exp())).abs() < 1.0,
             "{busiest}"
         );
+    }
+
+    #[test]
+    fn a_hot_key_takes_the_share_it_is_given() {
+        let mut l = limiter();
+        drive_until_hot(&mut l);
+
+        let mut asked = Vec::new();
+        l.tick_with_shares(2 * ONE_SEC, N, |key, own| {
+            asked.push((key, own));
+            250.0
+        });
+        assert_eq!(asked.len(), 1, "asked for hot keys only");
+        assert_eq!(asked[0].0, KEY);
+        assert!(asked[0].1 > 100.0, "with its own demand: {}", asked[0].1);
+
+        let t = 3 * ONE_SEC;
+        for _ in 0..config().burst {
+            assert_eq!(l.check(KEY, t, N), Decision::Allow);
+        }
+        let Decision::Deny { retry_at } = l.check(KEY, t, N) else {
+            panic!("burst must be exhausted");
+        };
+        assert_eq!(retry_at - t, 4_000_000, "250 per second");
     }
 
     #[test]

@@ -7,11 +7,11 @@
 whole fleet, with no Redis, no central service, and no network call on the
 request path.**
 
-> **Status: not released yet.** The sans-I/O core (`rateguard-core`) is done:
-> enforcement and SWIM membership, tested in a deterministic simulator. Still
-> missing: demand-based allocation (until then a hot key gets an even `R/N`)
-> and the `rateguard` runtime crate with its UDP transport and the `Guard`
-> API shown below. Nothing is published on crates.io yet.
+> **Status: not released yet.** The sans-I/O core (`rateguard-core`) is
+> mostly done: enforcement, SWIM membership and demand-based shares, tested
+> in a deterministic simulator. Still missing: the partition policies, and
+> the `rateguard` runtime crate with its UDP transport and the `Guard` API
+> shown below. Nothing is published on crates.io yet.
 
 ```rust
 use rateguard::Guard;
@@ -137,7 +137,7 @@ async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Res
 | `seeds([..])` | `[]` | Peers to join through; any live member is enough |
 | `partition_policy(p)` | `HoldDown(10s)` | Behaviour when the cluster splits |
 | `protocol_period(d)` | `200 ms` | How often nodes exchange membership and demand |
-| `hot_keys(n)` | `512` | How many keys may be coordinated at once |
+| `hot_keys(n)` | `64` | How many keys may be coordinated at once, at most 64 |
 | `tracked_keys(n)` | `4096` | Ceiling on the per-key table |
 
 ### Without the network
@@ -161,8 +161,9 @@ let mut node = Node::new(
         limit_per_sec: 1_000,
         burst: 10,
         alpha: 0.5,
+        floor_factor: 0.1,
         cooldown: 5 * ONE_SEC,
-        hot_set_size: 512,
+        hot_set_size: 64,
         max_tracked_keys: 4_096,
         demand_time_constant: ONE_SEC,
     },

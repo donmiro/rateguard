@@ -28,6 +28,7 @@ use rateguard_proto::{self as proto, DemandReport, KeyDemand, Message, Status, U
 use std::collections::BTreeMap;
 
 use crate::{
+    allocation::{self, View},
     boundary::{Action, Event, PeerId},
     gcra::{Decision, Nanos},
     gossip::{self, Gossip},
@@ -111,6 +112,7 @@ pub struct Node {
     actions: Vec<Action>,
     peer_demand: PeerDemand,
     round_number: u16,
+    rounds_run: u64,
     own_demand: Vec<KeyDemand>,
 }
 impl Node {
@@ -158,6 +160,7 @@ impl Node {
             actions: Vec::new(),
             peer_demand: PeerDemand::new(swim.protocol_period),
             round_number: 0,
+            rounds_run: 0,
             own_demand: Vec::new(),
         }
     }
@@ -277,7 +280,8 @@ impl Node {
         {
             self.gossip.push(suspicion);
         }
-        self.limiter.tick(now, self.members.cluster_size());
+        self.rounds_run = self.rounds_run.saturating_add(1);
+        self.apply_shares(now);
         self.report_demand();
         self.follow_changes();
         let stale = peer_demand::stale_after_rounds(self.members.cluster_size());
@@ -556,6 +560,28 @@ impl Node {
         updates
     }
 
+    // Every hot key gets its share of the limit from the demand the peers
+    // reported (spec §4.3). Until the node has been up long enough to hear
+    // from every peer, what it has not heard may be demand: it learns, and
+    // takes no more than an even split.
+    fn apply_shares(&mut self, now: Nanos) {
+        let cluster_size = self.members.cluster_size();
+        let config = *self.limiter.config();
+        let learning = self.rounds_run <= peer_demand::stale_after_rounds(cluster_size);
+        let peers = &self.peer_demand;
+        self.limiter
+            .tick_with_shares(now, cluster_size, |key, own| {
+                allocation::share(View {
+                    limit: config.limit_per_sec as f64,
+                    cluster_size,
+                    floor_factor: config.floor_factor,
+                    own,
+                    others: peers.total(key),
+                    learning,
+                })
+            });
+    }
+
     // Once a round, right after the limiter has decided which keys are hot.
     // Only the busiest MAX_DEMAND_KEYS fit a message; a hot set larger than
     // that leaves the rest unreported.
@@ -630,6 +656,7 @@ mod tests {
             limit_per_sec: 1000,
             burst: 10,
             alpha: 0.5,
+            floor_factor: 0.1,
             cooldown: 5 * ONE_SEC,
             hot_set_size: 4,
             max_tracked_keys: 8,
@@ -1582,6 +1609,66 @@ mod tests {
         assert!(!n.peer_demand().is_empty(), "still within the threshold");
         n.handle(Event::Tick, stale * PERIOD);
         assert!(n.peer_demand().is_empty());
+    }
+
+    // A two-node cluster where peer 1 stays alive however silent it is,
+    // and KEY is hot here from round 5 on.
+    fn hot_pair() -> Node {
+        let patient = SwimConfig {
+            suspicion_timeout: 1000 * PERIOD,
+            tombstone_ttl: 1000 * PERIOD,
+            ..SWIM
+        };
+        let mut n = Node::new(config(), patient, LOCAL, 1);
+        n.introduce(PeerId::new(1));
+        heat(&mut n);
+        n
+    }
+
+    // Runs rounds `from..=to`, peer 1 reporting `demand` for KEY before
+    // each, or nothing at all.
+    fn rounds_with_peer(n: &mut Node, from: u64, to: u64, demand: Option<f32>) {
+        for k in from..=to {
+            if let Some(demand) = demand {
+                let mut report = reporting(1, k as u16);
+                if let Message::Ping { demand: d, .. } = &mut report {
+                    d[0].keys[0].demand = demand;
+                }
+                deliver(n, 1, report, k * PERIOD);
+            }
+            n.handle(Event::Tick, k * PERIOD);
+        }
+    }
+
+    fn rate_of(n: &mut Node, now: Nanos) -> f64 {
+        ONE_SEC as f64 / measured_interval(n, now) as f64
+    }
+
+    #[test]
+    fn a_new_node_takes_no_more_than_an_even_split_while_it_learns() {
+        let mut n = hot_pair();
+        rounds_with_peer(&mut n, 1, 6, None);
+        assert!(n.limiter().is_hot(KEY));
+        assert_eq!(rate_of(&mut n, 6 * PERIOD + 1), 500.0, "R / N");
+    }
+
+    #[test]
+    fn alone_with_demand_a_node_takes_all_but_its_peers_floor() {
+        let mut n = hot_pair();
+        let learned = stale_after_rounds(2);
+        rounds_with_peer(&mut n, 1, learned + 1, None);
+        // 1000 × 0.1 / 2 = 50 left as the peer's floor.
+        let rate = rate_of(&mut n, (learned + 1) * PERIOD + 1);
+        assert!((rate - 950.0).abs() < 1.0, "{rate}");
+    }
+
+    #[test]
+    fn a_busy_peer_leaves_a_node_little_more_than_its_floor() {
+        let mut n = hot_pair();
+        let learned = stale_after_rounds(2);
+        rounds_with_peer(&mut n, 1, learned + 1, Some(1e6));
+        let rate = rate_of(&mut n, (learned + 1) * PERIOD + 1);
+        assert!((rate - 50.0).abs() < 1.0, "{rate}");
     }
 
     #[test]

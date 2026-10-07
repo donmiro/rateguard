@@ -19,6 +19,7 @@ fn config() -> Config {
         limit_per_sec: 1000,
         burst: 10,
         alpha: 0.5,
+        floor_factor: 0.1,
         cooldown: 5 * ONE_SEC,
         hot_set_size: 4,
         max_tracked_keys: 8,
@@ -131,4 +132,25 @@ fn peer_tables_stay_bounded_while_hot_keys_come_and_go() {
     }
     // A key is hot for its 10 s and the cooldown after, so two overlap.
     assert!(largest <= 2, "{largest} keys of node 0 known at once");
+}
+
+// Guarantee 2 of spec §5.4. Every node is over the hot threshold (100 a
+// second at N = 5), node 0 far over the rest: an even split would admit
+// 200 + 4 × 150 = 800 a second, shares that follow demand close to R.
+#[test]
+fn a_skewed_cluster_admits_close_to_the_limit() {
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    let run = 40 * ONE_SEC;
+    s.schedule_request_stream(0, KEY, 1200, 0, run);
+    for node in 1..NODES {
+        s.schedule_request_stream(node, KEY, 150, 0, run);
+    }
+    s.run_until(run);
+
+    let settled = 20 * ONE_SEC;
+    let rate = s.admitted_between(settled, run) as f64 / ((run - settled) / ONE_SEC) as f64;
+    assert!(
+        (950.0..=1000.0).contains(&rate),
+        "admitted {rate:.1} a second"
+    );
 }

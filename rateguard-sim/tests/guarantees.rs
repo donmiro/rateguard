@@ -16,6 +16,7 @@ fn config() -> Config {
         limit_per_sec: 1000,
         burst: 10,
         alpha: 0.5,
+        floor_factor: 0.1,
         cooldown: 5 * ONE_SEC,
         hot_set_size: 4,
         max_tracked_keys: 8,

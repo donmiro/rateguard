@@ -14,6 +14,7 @@
 //!   [`Membership`](membership::Membership) trait;
 //! - [`node`]: one cluster member, driving both through events.
 
+pub mod allocation;
 pub mod boundary;
 pub mod demand;
 pub mod gcra;

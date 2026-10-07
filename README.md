@@ -7,6 +7,12 @@
 whole fleet, with no Redis, no central service, and no network call on the
 request path.**
 
+> **Status: not released yet.** The sans-I/O core (`rateguard-core`) is done:
+> enforcement and SWIM membership, tested in a deterministic simulator. Still
+> missing: demand-based allocation (until then a hot key gets an even `R/N`)
+> and the `rateguard` runtime crate with its UDP transport and the `Guard`
+> API shown below. Nothing is published on crates.io yet.
+
 ```rust
 use rateguard::Guard;
 
@@ -46,7 +52,8 @@ if guard.check("api:tenant-42").is_allowed() {
   for each policy, rather than undefined behaviour.
 - **Synchronous API.** `check()` is a plain function. No `async`, no executor
   required, callable from any thread.
-- **No `unsafe`**, and a pure sans-I/O core with zero runtime dependencies.
+- **No `unsafe`**, and a pure sans-I/O core: no async runtime, no clock, no
+  sockets.
 
 ## Installation
 
@@ -128,37 +135,54 @@ async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Res
 | `burst(n)` | `limit / 20` | How much of the limit may be spent instantaneously |
 | `bind(addr)` | required | UDP address for gossip |
 | `seeds([..])` | `[]` | Peers to join through; any live member is enough |
-| `partition_policy(p)` | `HoldDown(30s)` | Behaviour when the cluster splits |
+| `partition_policy(p)` | `HoldDown(10s)` | Behaviour when the cluster splits |
 | `protocol_period(d)` | `200 ms` | How often nodes exchange membership and demand |
 | `hot_keys(n)` | `512` | How many keys may be coordinated at once |
 | `tracked_keys(n)` | `4096` | Ceiling on the per-key table |
 
 ### Without the network
 
-`rateguard-core` is the enforcement layer on its own: no I/O, no tokio, time
-passed in as a parameter. Use it directly if you already have your own
-clustering and only want the limiter.
+`rateguard-core` is the whole protocol without the I/O: enforcement and
+membership, no sockets, no tokio, time passed in as a parameter. Bring your
+own UDP socket and timer, feed it events, and send the datagrams it returns.
 
 ```rust
-use rateguard_core::{boundary::Event, gcra::Decision, limiter::Config, node::Node};
+use rateguard_core::{
+    boundary::{Action, Event, PeerId},
+    gcra::Decision,
+    limiter::Config,
+    node::{Node, SwimConfig},
+};
 
-let mut node = Node::new(Config {
-    limit_per_sec: 1_000,
-    burst: 10,
-    alpha: 0.5,
-    cooldown: 5 * ONE_SEC,
-    hot_set_size: 512,
-    max_tracked_keys: 4_096,
-    demand_time_constant: ONE_SEC,
-});
-node.set_cluster_size(5);
+const ONE_SEC: u64 = 1_000_000_000;
 
-match node.check(key, now_nanos) {
+let mut node = Node::new(
+    Config {
+        limit_per_sec: 1_000,
+        burst: 10,
+        alpha: 0.5,
+        cooldown: 5 * ONE_SEC,
+        hot_set_size: 512,
+        max_tracked_keys: 4_096,
+        demand_time_constant: ONE_SEC,
+    },
+    SwimConfig::default(),
+    PeerId::new(1), // this node
+    rng_seed,       // drives its random choices: same seed, same run
+);
+node.add_seed(PeerId::new(0)); // the cluster size N comes from membership
+
+// Keys are 64-bit hashes; the original string never leaves your process.
+match node.check(key_hash, now_nanos) {
     Decision::Allow => serve(),
     Decision::Deny { retry_at } => reject(retry_at),
 }
 
-node.handle(Event::Tick, now_nanos);   // driven by your own timer
+// From your own timer (several times per protocol period) and socket.
+for Action::SendTo { peer, bytes } in node.handle(Event::Tick, now_nanos) {
+    send(*peer, bytes);
+}
+node.handle(Event::MessageReceived { from, bytes: &datagram }, now_nanos);
 ```
 
 ## How it works

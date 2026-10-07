@@ -115,15 +115,18 @@ impl Limiter {
     /// demand, see [`tick_with_shares`](Limiter::tick_with_shares).
     pub fn tick(&mut self, now: Nanos, cluster_size: usize) {
         let even = self.per_node_rate(cluster_size);
-        self.tick_with_shares(now, cluster_size, |_, _| even);
+        self.tick_with_shares(now, cluster_size, |_| false, |_, _| even);
     }
 
     /// Like [`tick`](Limiter::tick), but a hot key gets the rate
-    /// `share(key, own_demand)` returns, in requests per second.
+    /// `share(key, own_demand)` returns, in requests per second, and a key
+    /// for which `hot_elsewhere` is true is hot here too while it has any
+    /// demand at all (see [`hot_set`](crate::hot_set)).
     pub fn tick_with_shares(
         &mut self,
         now: Nanos,
         cluster_size: usize,
+        hot_elsewhere: impl Fn(u64) -> bool,
         mut share: impl FnMut(u64, f64) -> f64,
     ) {
         let threshold = self.per_node_rate(cluster_size) * self.config.alpha;
@@ -132,7 +135,9 @@ impl Limiter {
 
         keys.retain(|&key, state| {
             state.demand.tick(now);
-            let is_hot = hot_set.update(key, state.demand.rate(), threshold, now);
+            let rate = state.demand.rate();
+            let elsewhere = rate >= SILENT_DEMAND && hot_elsewhere(key);
+            let is_hot = hot_set.update_with(key, rate, threshold, now, elsewhere);
 
             if !is_hot && !state.gcra.has_debt(now) && state.demand.rate() < SILENT_DEMAND {
                 return false;
@@ -153,14 +158,15 @@ impl Limiter {
         self.enforce_cap();
     }
 
-    /// The hot keys with their demand in attempts per second, busiest
-    /// first: what this node has to tell its peers.
-    pub fn hot_demand(&self) -> Vec<(u64, f64)> {
-        let mut hot: Vec<(u64, f64)> = self
+    /// The hot keys with their demand in attempts per second and whether
+    /// they are hot by that demand (primary), busiest first: what this node
+    /// has to tell its peers.
+    pub fn hot_demand(&self) -> Vec<(u64, f64, bool)> {
+        let mut hot: Vec<(u64, f64, bool)> = self
             .keys
             .iter()
             .filter(|&(&key, _)| self.hot_set.is_hot(key))
-            .map(|(&key, state)| (key, state.demand.rate()))
+            .map(|(&key, state)| (key, state.demand.rate(), self.hot_set.is_primary(key)))
             .collect();
         hot.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         hot
@@ -329,13 +335,50 @@ mod tests {
         }
         l.tick(ONE_SEC, N);
 
-        let listed: Vec<u64> = l.hot_demand().into_iter().map(|(key, _)| key).collect();
+        let listed: Vec<u64> = l.hot_demand().into_iter().map(|(key, ..)| key).collect();
         assert_eq!(listed, [2, 1], "key 3 is cold");
-        let (_, busiest) = l.hot_demand()[0];
+        let (_, busiest, primary) = l.hot_demand()[0];
+        assert!(primary, "hot by its own demand");
         assert!(
             (busiest - 900.0 * (1.0 - (-1.0f64).exp())).abs() < 1.0,
             "{busiest}"
         );
+    }
+
+    #[test]
+    fn a_key_hot_elsewhere_gets_a_share_here_too() {
+        let mut l = limiter();
+        l.tick(0, N);
+        for _ in 0..50 {
+            l.check(KEY, 0, N);
+        }
+        // 50 a second is under the hot threshold of 100: cold by itself.
+        l.tick_with_shares(ONE_SEC, N, |key| key == KEY, |_, _| 250.0);
+        assert!(l.is_hot(KEY));
+        assert_eq!(l.hot_demand().len(), 1);
+        let (_, _, primary) = l.hot_demand()[0];
+        assert!(!primary, "hot only because a peer holds it so");
+
+        let t = 2 * ONE_SEC;
+        for _ in 0..config().burst {
+            assert_eq!(l.check(KEY, t, N), Decision::Allow);
+        }
+        let Decision::Deny { retry_at } = l.check(KEY, t, N) else {
+            panic!("burst must be exhausted");
+        };
+        assert_eq!(retry_at - t, 4_000_000, "the share, not the cold 100");
+    }
+
+    #[test]
+    fn a_silent_key_is_not_kept_hot_by_peers() {
+        let mut l = limiter();
+        l.tick(0, N);
+        l.check(KEY, 0, N);
+        l.tick_with_shares(ONE_SEC, N, |_| true, |_, _| 250.0);
+        assert!(l.is_hot(KEY), "a request a second ago is demand");
+        l.tick_with_shares(60 * ONE_SEC, N, |_| true, |_, _| 250.0);
+        assert!(!l.is_hot(KEY));
+        assert_eq!(l.tracked_keys(), 0, "reclaimed as before");
     }
 
     #[test]
@@ -344,10 +387,15 @@ mod tests {
         drive_until_hot(&mut l);
 
         let mut asked = Vec::new();
-        l.tick_with_shares(2 * ONE_SEC, N, |key, own| {
-            asked.push((key, own));
-            250.0
-        });
+        l.tick_with_shares(
+            2 * ONE_SEC,
+            N,
+            |_| false,
+            |key, own| {
+                asked.push((key, own));
+                250.0
+            },
+        );
         assert_eq!(asked.len(), 1, "asked for hot keys only");
         assert_eq!(asked[0].0, KEY);
         assert!(asked[0].1 > 100.0, "with its own demand: {}", asked[0].1);

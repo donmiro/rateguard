@@ -133,6 +133,14 @@ impl PeerDemand {
             .sum()
     }
 
+    /// Whether some peer holds `key` hot by its own demand. Only such news
+    /// makes the key hot here (see [`hot_set`](crate::hot_set)).
+    pub fn hot_elsewhere(&self, key: u64) -> bool {
+        self.peers
+            .values()
+            .any(|snapshot| snapshot.keys.get(&key).is_some_and(|&(_, primary)| primary))
+    }
+
     /// How many keys are known over all peers.
     pub fn len(&self) -> usize {
         self.peers
@@ -303,6 +311,19 @@ mod tests {
         assert_eq!(t.total(KEY), 180.0);
         assert_eq!(t.total(KEY + 1), 5.0);
         assert_eq!(t.total(KEY + 2), 0.0);
+    }
+
+    #[test]
+    fn a_key_is_hot_elsewhere_only_if_a_peer_holds_it_primary() {
+        let mut t = PeerDemand::new(PERIOD);
+        let mut secondary = report(3, 120.0);
+        secondary.keys[0].primary = false;
+        t.apply(PEER, &secondary, 0);
+        assert!(!t.hot_elsewhere(KEY), "secondary news is no news");
+
+        t.apply(PEER, &report(4, 120.0), 1);
+        assert!(t.hot_elsewhere(KEY));
+        assert!(!t.hot_elsewhere(KEY + 1));
     }
 
     #[test]

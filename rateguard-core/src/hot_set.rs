@@ -9,6 +9,14 @@
 //! is demoted, so a key near the line does not flap. When the set is full a
 //! newcomer evicts the weakest key, but only if it beats it by 10%, for the
 //! same reason.
+//!
+//! A key hot by its own demand here, cooldown included, is *primary*. A key
+//! a peer reports primary is hot here too, as *secondary*, whatever the
+//! demand here: otherwise a key hot on one node and cold on the others
+//! would overshoot, the hot node taking all of `R` and the cold ones their
+//! local share on top (spec §4.1). A secondary key leaves as soon as no
+//! peer holds it primary, and only primary news makes a key hot elsewhere,
+//! so two nodes cannot keep a key hot for each other forever.
 
 use std::collections::HashMap;
 
@@ -20,6 +28,7 @@ const EVICTION_MARGIN: f64 = 1.1;
 struct HotEntry {
     cooling_since: Option<Nanos>,
     demand: f64,
+    primary: bool,
 }
 
 /// The hot keys of one node, bounded in size.
@@ -42,15 +51,43 @@ impl HotSet {
     /// Feeds a key's current demand and returns whether the key is hot
     /// afterwards.
     pub fn update(&mut self, key: u64, demand_rate: f64, threshold: f64, now: Nanos) -> bool {
+        self.update_with(key, demand_rate, threshold, now, false)
+    }
+
+    /// Like [`update`](HotSet::update), knowing whether a peer holds the
+    /// key primary.
+    pub fn update_with(
+        &mut self,
+        key: u64,
+        demand_rate: f64,
+        threshold: f64,
+        now: Nanos,
+        hot_elsewhere: bool,
+    ) -> bool {
         if demand_rate > threshold {
-            self.promote(key, demand_rate)
-        } else {
-            self.cool(key, demand_rate, now)
+            return self.promote(key, demand_rate, true);
+        }
+        if !self.cool(key, demand_rate, now) {
+            return false;
+        }
+        match self.hot.get(&key) {
+            Some(entry) if entry.primary => true,
+            Some(_) if hot_elsewhere => true,
+            Some(_) => {
+                self.hot.remove(&key);
+                false
+            }
+            None => hot_elsewhere && self.promote(key, demand_rate, false),
         }
     }
 
     pub fn is_hot(&self, key: u64) -> bool {
         self.hot.contains_key(&key)
+    }
+
+    /// Whether the key is hot by its own demand here, cooldown included.
+    pub fn is_primary(&self, key: u64) -> bool {
+        self.hot.get(&key).is_some_and(|entry| entry.primary)
     }
 
     pub fn len(&self) -> usize {
@@ -61,33 +98,41 @@ impl HotSet {
         self.hot.is_empty()
     }
 
-    fn promote(&mut self, key: u64, demand_rate: f64) -> bool {
+    fn promote(&mut self, key: u64, demand_rate: f64, primary: bool) -> bool {
         if let Some(entry) = self.hot.get_mut(&key) {
             entry.demand = demand_rate;
             entry.cooling_since = None;
+            entry.primary = primary;
             return true;
         }
 
         if self.hot.len() < self.max_size {
-            self.insert(key, demand_rate);
+            self.insert(key, demand_rate, primary);
             return true;
         }
 
         let (weakest_key, weakest_demand) = self.weakest();
         if demand_rate > weakest_demand * EVICTION_MARGIN {
             self.hot.remove(&weakest_key);
-            self.insert(key, demand_rate);
+            self.insert(key, demand_rate, primary);
             true
         } else {
             false
         }
     }
 
+    // Below the threshold. A primary key counts down its cooldown and then
+    // stops being primary; whether it stays as secondary is the caller's
+    // call. Returns false only for a key that is not in the set at all and
+    // so has nothing to cool: the caller may still promote it.
     fn cool(&mut self, key: u64, demand_rate: f64, now: Nanos) -> bool {
         let Some(entry) = self.hot.get_mut(&key) else {
-            return false;
+            return true;
         };
         entry.demand = demand_rate;
+        if !entry.primary {
+            return true;
+        }
 
         let expired = match entry.cooling_since {
             None => {
@@ -96,19 +141,20 @@ impl HotSet {
             }
             Some(since) => now.saturating_sub(since) >= self.cooldown,
         };
-
         if expired {
-            self.hot.remove(&key);
+            entry.primary = false;
+            entry.cooling_since = None;
         }
-        !expired
+        true
     }
 
-    fn insert(&mut self, key: u64, demand_rate: f64) {
+    fn insert(&mut self, key: u64, demand_rate: f64, primary: bool) {
         self.hot.insert(
             key,
             HotEntry {
                 cooling_since: None,
                 demand: demand_rate,
+                primary,
             },
         );
     }
@@ -300,5 +346,61 @@ mod tests {
                 "given equal demand, the least significant key is displaced"
             );
         }
+    }
+
+    #[test]
+    fn a_key_hot_elsewhere_is_hot_here_but_not_primary() {
+        let mut hs = hot_set(4);
+        assert!(hs.update_with(1, 10.0, THRESHOLD, 0, true));
+        assert!(hs.is_hot(1));
+        assert!(!hs.is_primary(1));
+    }
+
+    #[test]
+    fn a_secondary_key_leaves_as_soon_as_no_peer_holds_it_hot() {
+        let mut hs = hot_set(4);
+        hs.update_with(1, 10.0, THRESHOLD, 0, true);
+        assert!(!hs.update_with(1, 10.0, THRESHOLD, 1, false));
+        assert!(hs.is_empty());
+    }
+
+    #[test]
+    fn a_cooling_key_is_still_primary() {
+        let mut hs = hot_set(4);
+        hs.update(1, 500.0, THRESHOLD, 0);
+        hs.update_with(1, 10.0, THRESHOLD, ONE_SEC, true);
+        assert!(hs.is_primary(1), "within its own cooldown");
+    }
+
+    #[test]
+    fn a_cooled_key_stays_on_as_secondary_while_hot_elsewhere() {
+        let mut hs = hot_set(4);
+        hs.update(1, 500.0, THRESHOLD, 0);
+        hs.update_with(1, 10.0, THRESHOLD, ONE_SEC, true);
+        assert!(hs.update_with(1, 10.0, THRESHOLD, ONE_SEC + COOLDOWN, true));
+        assert!(!hs.is_primary(1));
+
+        assert!(!hs.update_with(1, 10.0, THRESHOLD, ONE_SEC + COOLDOWN + 1, false));
+        assert!(hs.is_empty());
+    }
+
+    #[test]
+    fn own_demand_makes_a_secondary_key_primary() {
+        let mut hs = hot_set(4);
+        hs.update_with(1, 10.0, THRESHOLD, 0, true);
+        hs.update_with(1, 500.0, THRESHOLD, ONE_SEC, true);
+        assert!(hs.is_primary(1));
+    }
+
+    #[test]
+    fn secondary_keys_count_against_the_size() {
+        let mut hs = hot_set(2);
+        hs.update(1, 900.0, THRESHOLD, 0);
+        hs.update_with(2, 50.0, THRESHOLD, 0, true);
+        assert!(
+            !hs.update_with(3, 40.0, THRESHOLD, 0, true),
+            "full, and not 10% over the weakest"
+        );
+        assert_eq!(hs.len(), 2);
     }
 }

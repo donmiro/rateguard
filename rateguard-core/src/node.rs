@@ -560,8 +560,9 @@ impl Node {
         updates
     }
 
-    // Every hot key gets its share of the limit from the demand the peers
-    // reported (spec §4.3). Until the node has been up long enough to hear
+    // A key some peer holds hot by its own demand is hot here too (spec
+    // §4.1), and every hot key gets its share of the limit from the demand
+    // the peers reported (spec §4.3). Until the node has been up long enough to hear
     // from every peer, what it has not heard may be demand: it learns, and
     // takes no more than an even split.
     fn apply_shares(&mut self, now: Nanos) {
@@ -569,8 +570,11 @@ impl Node {
         let config = *self.limiter.config();
         let learning = self.rounds_run <= peer_demand::stale_after_rounds(cluster_size);
         let peers = &self.peer_demand;
-        self.limiter
-            .tick_with_shares(now, cluster_size, |key, own| {
+        self.limiter.tick_with_shares(
+            now,
+            cluster_size,
+            |key| peers.hot_elsewhere(key),
+            |key, own| {
                 allocation::share(View {
                     limit: config.limit_per_sec as f64,
                     cluster_size,
@@ -579,23 +583,23 @@ impl Node {
                     others: peers.total(key),
                     learning,
                 })
-            });
+            },
+        );
     }
 
     // Once a round, right after the limiter has decided which keys are hot.
-    // Only the busiest MAX_DEMAND_KEYS fit a message; a hot set larger than
-    // that leaves the rest unreported.
+    // The whole hot set fits one report: hot_set_size is capped at
+    // MAX_DEMAND_KEYS.
     fn report_demand(&mut self) {
         self.round_number = self.round_number.wrapping_add(1);
         self.own_demand = self
             .limiter
             .hot_demand()
             .into_iter()
-            .take(proto::MAX_DEMAND_KEYS)
-            .map(|(key_hash, rate)| KeyDemand {
+            .map(|(key_hash, rate, primary)| KeyDemand {
                 key_hash,
                 demand: rate as f32,
-                primary: true,
+                primary,
             })
             .collect();
     }
@@ -1669,6 +1673,43 @@ mod tests {
         rounds_with_peer(&mut n, 1, learned + 1, Some(1e6));
         let rate = rate_of(&mut n, (learned + 1) * PERIOD + 1);
         assert!((rate - 50.0).abs() < 1.0, "{rate}");
+    }
+
+    // Peer 1 holds KEY primary, or only secondary; this node sees 50
+    // attempts a second, under its hot threshold of 250.
+    fn lukewarm_with_peer(primary: bool) -> Node {
+        let mut n = node_with([1]);
+        n.handle(Event::Tick, 0);
+        for k in 1..=5u64 {
+            for _ in 0..10 {
+                n.check(KEY, k * PERIOD - 1);
+            }
+            let mut report = reporting(1, k as u16);
+            if let Message::Ping { demand, .. } = &mut report {
+                demand[0].keys[0].primary = primary;
+            }
+            deliver(&mut n, 1, report, k * PERIOD - 1);
+            n.handle(Event::Tick, k * PERIOD);
+        }
+        n
+    }
+
+    #[test]
+    fn a_key_a_peer_holds_hot_is_hot_here_and_reported_secondary() {
+        let mut n = lukewarm_with_peer(true);
+        assert!(n.limiter().is_hot(KEY));
+        let out = sent(n.handle(Event::Tick, 6 * PERIOD));
+        let [key] = own_report(&out[0].1).keys.as_slice() else {
+            panic!("one hot key, one entry");
+        };
+        assert_eq!(key.key_hash, KEY);
+        assert!(!key.primary, "hot here only because of the peer");
+    }
+
+    #[test]
+    fn a_key_a_peer_holds_only_secondary_stays_cold_here() {
+        let n = lukewarm_with_peer(false);
+        assert!(!n.limiter().is_hot(KEY));
     }
 
     #[test]

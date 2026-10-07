@@ -154,3 +154,74 @@ fn a_skewed_cluster_admits_close_to_the_limit() {
         "admitted {rate:.1} a second"
     );
 }
+
+// A key hot at node 0 and lukewarm everywhere else: 50 a second is under
+// the hot threshold of 100. Were the others left cold, node 0 would take
+// all but their floors, 920, and they their 50 each on top: 1120 a second
+// (spec §4.1). Hot by node 0's news, they take shares instead.
+fn mixed_key(s: &mut Sim<PerfectLink>, until: Nanos) {
+    s.schedule_request_stream(0, KEY, 1200, 0, until);
+    for node in 1..NODES {
+        s.schedule_request_stream(node, KEY, 50, 0, 60 * ONE_SEC);
+    }
+}
+
+fn admitted_per_sec(s: &Sim<impl Link>, from: Nanos, until: Nanos) -> f64 {
+    s.admitted_between(from, until) as f64 / ((until - from) as f64 / ONE_SEC as f64)
+}
+
+#[test]
+fn a_key_hot_on_one_node_only_stays_within_the_limit() {
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    let run = 40 * ONE_SEC;
+    mixed_key(&mut s, run);
+    s.run_until(run);
+
+    for node in 1..NODES {
+        assert!(s.node(node).limiter().is_hot(KEY), "node {node}");
+    }
+    let rate = admitted_per_sec(&s, 20 * ONE_SEC, run);
+    assert!(
+        (950.0..=1000.0).contains(&rate),
+        "admitted {rate:.1} a second"
+    );
+}
+
+#[test]
+fn once_the_busy_node_cools_nobody_keeps_the_key_hot() {
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    mixed_key(&mut s, 20 * ONE_SEC);
+    s.run_until(20 * ONE_SEC);
+    assert!(s.node(1).limiter().is_hot(KEY));
+
+    // Node 0's demand decays under the threshold in ~2.5 s, its cooldown
+    // takes 5 more, then its next message to each peer drops the key.
+    s.run_until(35 * ONE_SEC);
+    for node in 0..NODES {
+        assert!(!s.node(node).limiter().is_hot(KEY), "node {node}");
+    }
+}
+
+// A restarted node knows nobody's demand yet. Without learning mode it
+// would take all but the others' floors, 920, on top of what the others
+// admit.
+#[test]
+fn a_node_restarted_under_load_does_not_overshoot() {
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    let run = 40 * ONE_SEC;
+    s.schedule_request_stream(0, KEY, 1200, 0, run);
+    for node in 1..NODES {
+        s.schedule_request_stream(node, KEY, 150, 0, run);
+    }
+    let (down, up) = (20 * ONE_SEC, 21 * ONE_SEC);
+    s.schedule_restart(0, down, up);
+    s.run_until(run);
+
+    let mut worst: f64 = 0.0;
+    let mut from = up;
+    while from + ONE_SEC <= run {
+        worst = worst.max(admitted_per_sec(&s, from, from + ONE_SEC));
+        from += PERIOD;
+    }
+    assert!(worst <= 1050.0, "{worst:.0} admitted in a second");
+}

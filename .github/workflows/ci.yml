@@ -41,6 +41,9 @@ jobs:
           LOOM_MAX_PREEMPTIONS: 3
       - name: Turmoil
         run: cargo test -p rateguard --features turmoil --locked --test turmoil
+      # The README's accuracy table must match what the simulator measures.
+      - name: Accuracy report
+        run: cargo run -p rateguard-sim --release --locked --bin accuracy -- --check
 
   # The oldest Rust the crates promise to build on (rust-version): 1.88,
   # for let chains.

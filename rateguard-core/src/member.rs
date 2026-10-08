@@ -33,7 +33,10 @@ pub enum Applied {
     Ignored,
     /// The news was new and is now in the table; pass it on. `from` is the
     /// member's previous status, `None` for a stranger.
-    Accepted { from: Option<Status> },
+    Accepted {
+        /// The member's previous status; `None` for a stranger.
+        from: Option<Status>,
+    },
     /// The news was about this node and wrong. Spread the update instead:
     /// it is this node's current `Alive`, at a higher incarnation if that
     /// was needed to win.
@@ -69,6 +72,7 @@ pub struct MemberTable {
     changes: Vec<Change>,
 }
 impl MemberTable {
+    /// A table holding only the node itself, `Alive` at incarnation 0, listening at `addr`.
     pub fn new(local: PeerId, addr: Address) -> Self {
         Self {
             local,
@@ -86,6 +90,7 @@ impl MemberTable {
         self.incarnation
     }
 
+    /// The member's status, or `None` for a stranger or a forgotten member.
     pub fn status(&self, peer: PeerId) -> Option<Status> {
         if peer == self.local {
             return Some(Status::Alive);
@@ -103,6 +108,7 @@ impl MemberTable {
         self.members.get(&peer).map(|member| member.addr)
     }
 
+    /// The latest news about the member, as it would be gossiped.
     pub fn update_about(&self, peer: PeerId) -> Option<Update> {
         if peer == self.local {
             return Some(self.own_update());

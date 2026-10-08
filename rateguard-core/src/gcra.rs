@@ -100,14 +100,17 @@ pub struct Gcra {
 /// The answer to a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
+    /// Serve the request.
     Allow,
     /// Denied. `retry_at` is the earliest moment a request could be
     /// admitted, unless other requests take that slot first.
     Deny {
+        /// When a request could next be admitted, in the caller's nanoseconds.
         retry_at: Nanos,
     },
 }
 impl Gcra {
+    /// A limiter that has admitted nothing yet.
     pub fn new(quota: Quota) -> Self {
         Self { quota, tat: None }
     }
@@ -173,6 +176,7 @@ pub struct AtomicGcra {
     tat: AtomicU64,
 }
 impl AtomicGcra {
+    /// A limiter that has admitted nothing yet.
     pub fn new(quota: Quota) -> Self {
         Self {
             quota: AtomicU64::new(quota.pack()),
@@ -180,6 +184,7 @@ impl AtomicGcra {
         }
     }
 
+    /// The quota it enforces now.
     pub fn quota(&self) -> Quota {
         Quota::unpack(self.quota.load(Ordering::Relaxed))
     }

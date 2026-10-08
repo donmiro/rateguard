@@ -10,10 +10,12 @@ pub struct Rng {
     state: u64,
 }
 impl Rng {
+    /// A generator that replays the same numbers for the same `seed`.
     pub fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
+    /// The next number (splitmix64).
     pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.state;

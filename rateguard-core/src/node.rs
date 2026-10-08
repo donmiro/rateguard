@@ -248,6 +248,7 @@ impl Node {
         self.limiter.new_key_quota(self.allocation_size())
     }
 
+    /// Whether the key has state on this node.
     pub fn is_tracked(&self, key: u64) -> bool {
         self.limiter.tracked(key)
     }
@@ -262,6 +263,7 @@ impl Node {
         })
     }
 
+    /// How many members are live, alive or suspect, this node included.
     pub fn cluster_size(&self) -> usize {
         self.members.cluster_size()
     }
@@ -274,6 +276,7 @@ impl Node {
         self.refresh_cap(self.last_now);
     }
 
+    /// The policy set with [`set_partition_policy`](Node::set_partition_policy).
     pub fn partition_policy(&self) -> PartitionPolicy {
         self.policy
     }
@@ -284,6 +287,7 @@ impl Node {
         self.members.cluster_size().max(self.held_size)
     }
 
+    /// The member table, read only.
     pub fn members(&self) -> &MemberTable {
         &self.members
     }
@@ -298,6 +302,7 @@ impl Node {
         self.last_round
     }
 
+    /// The limiter, read only.
     pub fn limiter(&self) -> &Limiter {
         &self.limiter
     }
@@ -543,22 +548,33 @@ impl Node {
         }
         match message {
             Message::Ping { seq, .. } => self.ack(from, seq),
-            Message::Ack { seq, .. } => self.acknowledged(from, seq),
+            Message::Ack {
+                seq, ref demand, ..
+            } => self.acknowledged(from, seq, demand, now),
             Message::PingReq { seq, target, .. } => self.relay(from, seq, PeerId::new(target), now),
         }
     }
 
-    fn acknowledged(&mut self, from: PeerId, seq: u32) {
+    // An ACK relayed by a helper carries the target's report: the one way
+    // its demand reaches a requester that cannot hear it directly, on a
+    // link that fails one way only.
+    fn acknowledged(&mut self, from: PeerId, seq: u32, demand: &[DemandReport], now: Nanos) {
         if let Some(probe) = &self.probe
             && probe.seq == seq
-            && (from == probe.target
-                || probe
-                    .helpers
-                    .as_ref()
-                    .is_some_and(|helpers| helpers.contains(&from)))
         {
-            self.probe = None;
-            return;
+            let target = probe.target;
+            let by_helper = probe
+                .helpers
+                .as_ref()
+                .is_some_and(|helpers| helpers.contains(&from));
+            if from == target || by_helper {
+                if by_helper && let Some(report) = demand.iter().find(|r| r.origin == target.get())
+                {
+                    self.peer_demand.apply(target, report, now);
+                }
+                self.probe = None;
+                return;
+            }
         }
         if self
             .relays
@@ -566,7 +582,23 @@ impl Node {
             .is_some_and(|relay| relay.target == from)
             && let Some(relay) = self.relays.remove(&seq)
         {
-            self.ack(relay.requester, relay.seq);
+            // The target's report in place of ours: two full reports would
+            // not fit one datagram, and a message without ours changes
+            // nothing at the requester.
+            let theirs = demand
+                .iter()
+                .filter(|report| report.origin == from.get())
+                .cloned()
+                .collect();
+            let updates = self.outgoing(relay.requester);
+            self.send(
+                relay.requester,
+                &Message::Ack {
+                    seq: relay.seq,
+                    updates,
+                    demand: theirs,
+                },
+            );
         }
     }
 
@@ -1631,6 +1663,66 @@ mod tests {
         assert!(
             deliver(&mut n, 9, ack(*own), 2 * ONE_MS).is_empty(),
             "a duplicate ACK is relayed once"
+        );
+    }
+
+    // A report of `origin`'s, on an ACK of `seq`.
+    fn ack_reporting(seq: u32, origin: u64) -> Message {
+        let Message::Ping { demand, .. } = reporting(origin, 3) else {
+            unreachable!()
+        };
+        Message::Ack {
+            seq,
+            updates: Vec::new(),
+            demand,
+        }
+    }
+
+    // Demand goes first hand, but a requester that cannot hear the target
+    // directly hears it through the helper: the relayed ACK carries the
+    // target's report, in place of the helper's own.
+    #[test]
+    fn a_helper_relays_the_targets_report() {
+        let mut n = node();
+        let forwarded = deliver(&mut n, 3, ping_req(40, 9), 0);
+        let own = forwarded[0].1.seq();
+        let relayed = deliver(&mut n, 9, ack_reporting(own, 9), ONE_MS);
+        let [(_, answer)] = relayed.as_slice() else {
+            panic!("the target's ACK must be relayed, got {relayed:?}");
+        };
+        let origins: Vec<u64> = answer.demand().iter().map(|r| r.origin).collect();
+        assert_eq!(origins, [9], "the target's report, not the helper's");
+    }
+
+    #[test]
+    fn a_requester_takes_the_targets_report_from_its_helper() {
+        let mut n = node_with([1, 2, 3]);
+        let (target, seq) = round(&mut n, 0);
+        let (helper, _) = tick(&mut n, SWIM.ack_timeout)[0].clone();
+        deliver(
+            &mut n,
+            helper.get(),
+            ack_reporting(seq, target.get()),
+            SWIM.ack_timeout + ONE_MS,
+        );
+        assert!(n.peer_demand().get(target, KEY).is_some());
+    }
+
+    // Anyone else's word about a third node's demand is still ignored.
+    #[test]
+    fn a_report_about_a_third_node_is_ignored_off_the_relay_path() {
+        let mut n = node_with([1, 2, 3]);
+        let (target, seq) = round(&mut n, 0);
+        let other = (1..=3).map(PeerId::new).find(|&p| p != target).unwrap();
+        deliver(
+            &mut n,
+            other.get(),
+            ack_reporting(seq, target.get()),
+            ONE_MS,
+        );
+        assert!(
+            n.peer_demand().get(target, KEY).is_none(),
+            "not a helper yet"
         );
     }
 

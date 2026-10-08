@@ -221,10 +221,10 @@ impl Link for OneWay {
     }
 }
 
-// Fails today, 1061 a second: node 1 forgets node 0's demand once it goes
-// stale and takes the difference for itself. See ROADMAP, Phase 6.
+// Node 1 hears node 0's demand only through the helpers of its probes,
+// on the ACK they relay. Without that it forgot it once stale and took the
+// difference: 1061 a second.
 #[test]
-#[ignore = "known overshoot under a one-way link, 1061 against R = 1000"]
 fn an_asymmetric_partition_under_load_stays_within_the_limit() {
     let mut s = Sim::new(NODES, defaults(), OneWay);
     let run = 40 * ONE_SEC;
@@ -236,7 +236,48 @@ fn an_asymmetric_partition_under_load_stays_within_the_limit() {
     assert_between(
         "one way",
         rate(&s, 20 * ONE_SEC, run, &ALL),
-        900.0,
+        950.0,
         ceiling(20),
+    );
+}
+
+// The same link, failing only from 15 s on, after node 1 has heard node 0
+// directly. Node 1's demand then quadruples. Its share must follow: it
+// weighs its own demand as of when the peers' demand dates from, and node
+// 0's dates from the last relayed report, not from the last direct word.
+struct OneWayLater;
+impl Link for OneWayLater {
+    fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, _len: usize) -> Fate {
+        if (from, to) == (0, 1) && now >= 15 * ONE_SEC {
+            Fate::Lost
+        } else {
+            Fate::Delivered(now + ONE_MS)
+        }
+    }
+}
+
+#[test]
+fn demand_rising_behind_an_asymmetric_partition_gets_its_share() {
+    let mut s = Sim::new(NODES, defaults(), OneWayLater);
+    let run = 60 * ONE_SEC;
+    s.schedule_request_stream(0, KEY, 1200, 0, run);
+    s.schedule_request_stream(1, KEY, 150, 0, 20 * ONE_SEC);
+    s.schedule_request_stream(1, KEY, 600, 20 * ONE_SEC, run);
+    for node in 2..NODES {
+        s.schedule_request_stream(node, KEY, 150, 0, run);
+    }
+    s.run_until(run);
+    assert_between(
+        "node 1 risen",
+        rate(&s, 40 * ONE_SEC, run, &ALL),
+        950.0,
+        ceiling(20),
+    );
+    // Node 1 asks 600 of 2250: about a quarter of R, not the 150 it had.
+    assert_between(
+        "node 1 alone",
+        rate(&s, 40 * ONE_SEC, run, &[1]),
+        230.0,
+        290.0,
     );
 }

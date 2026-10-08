@@ -17,6 +17,7 @@ pub struct Demand {
     time_constant: Nanos,
 }
 impl Demand {
+    /// No attempts yet; `time_constant` is how fast the average follows a change.
     pub fn new(time_constant: Nanos) -> Self {
         Self {
             current_rate: 0.0,
@@ -68,6 +69,7 @@ impl Demand {
         self.last_tick = Some(now);
     }
 
+    /// The average, in attempts per second, as of the last tick.
     pub fn rate(&self) -> f64 {
         self.current_rate
     }

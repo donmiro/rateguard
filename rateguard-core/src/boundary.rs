@@ -11,10 +11,12 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PeerId(u64);
 impl PeerId {
+    /// Wraps a raw ID.
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
 
+    /// The raw ID.
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -28,7 +30,12 @@ pub enum Event<'a> {
     Tick,
     /// A datagram arrived. The bytes are borrowed: the core copies what it
     /// keeps.
-    MessageReceived { from: PeerId, bytes: &'a [u8] },
+    MessageReceived {
+        /// The member the datagram is from, by its first record.
+        from: PeerId,
+        /// The datagram.
+        bytes: &'a [u8],
+    },
 }
 
 /// Something the core asks the caller to do.
@@ -36,7 +43,12 @@ pub enum Event<'a> {
 pub enum Action {
     /// Send the bytes to `peer` as one datagram. Losing it is fine: the
     /// protocol is built for loss.
-    SendTo { peer: PeerId, bytes: Vec<u8> },
+    SendTo {
+        /// The member to send to; its address is the caller's to look up.
+        peer: PeerId,
+        /// The datagram.
+        bytes: Vec<u8>,
+    },
 }
 
 #[cfg(test)]

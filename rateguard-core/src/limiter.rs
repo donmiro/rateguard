@@ -21,6 +21,7 @@ use crate::hot_set::HotSet;
 const SILENT_DEMAND: f64 = 1e-3;
 
 #[derive(Debug, Clone, Copy)]
+/// How one node enforces the limit; see the fields.
 pub struct Config {
     /// R: the cluster-wide limit for each key, in requests per second.
     pub limit_per_sec: u32,
@@ -94,6 +95,11 @@ pub struct Limiter {
     cap: Option<f64>,
 }
 impl Limiter {
+    /// A limiter with no key yet.
+    ///
+    /// # Panics
+    ///
+    /// If the config is out of range; the messages say what.
     pub fn new(config: Config) -> Self {
         config.validate();
         Self {
@@ -219,6 +225,7 @@ impl Limiter {
         hot
     }
 
+    /// The config it was made with.
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -228,18 +235,22 @@ impl Limiter {
         self.hot_set.hot_since(key)
     }
 
+    /// Whether the key is hot here.
     pub fn is_hot(&self, key: u64) -> bool {
         self.hot_set.is_hot(key)
     }
 
+    /// Whether the key has state here, hot or cold.
     pub fn tracked(&self, key: u64) -> bool {
         self.keys.contains_key(&key)
     }
 
+    /// How many keys have state here.
     pub fn tracked_keys(&self) -> usize {
         self.keys.len()
     }
 
+    /// How many keys are hot here.
     pub fn hot_keys(&self) -> usize {
         self.hot_set.len()
     }

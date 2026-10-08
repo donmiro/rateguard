@@ -11,7 +11,9 @@ use std::collections::BTreeSet;
 /// A peer entering or leaving [`peers`](Membership::peers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
+    /// The peer became live.
     Joined(PeerId),
+    /// The peer was declared dead.
     Left(PeerId),
 }
 
@@ -19,6 +21,7 @@ pub enum Change {
 ///
 /// [`check_contract`] lists what every implementation must hold.
 pub trait Membership {
+    /// This node.
     fn local(&self) -> PeerId;
 
     /// The live peers in ascending order, never including the node itself.
@@ -72,6 +75,7 @@ pub struct ManualMembership {
     changes: Vec<Change>,
 }
 impl ManualMembership {
+    /// A static membership: `local` and `peers`, all live.
     pub fn new(local: PeerId, peers: impl IntoIterator<Item = PeerId>) -> Self {
         let peers: Vec<PeerId> = peers
             .into_iter()
@@ -88,10 +92,12 @@ impl ManualMembership {
         }
     }
 
+    /// A static membership with no peer.
     pub fn alone(local: PeerId) -> Self {
         Self::new(local, [])
     }
 
+    /// Adds a live peer; whether it was new.
     pub fn add(&mut self, peer: PeerId) -> bool {
         assert_ne!(peer, self.local, "a node is not its own peer");
         match self.peers.binary_search(&peer) {
@@ -104,6 +110,7 @@ impl ManualMembership {
         }
     }
 
+    /// Removes a peer; whether it was there.
     pub fn remove(&mut self, peer: PeerId) -> bool {
         match self.peers.binary_search(&peer) {
             Ok(at) => {

@@ -29,6 +29,7 @@ pub struct Heard {
     pub primary: bool,
     /// The peer's round the report was made in.
     pub round: u16,
+    /// When this node took the report in.
     pub heard_at: Nanos,
 }
 
@@ -62,10 +63,12 @@ struct Snapshot {
 }
 
 #[derive(Debug, Clone, Default)]
+/// The latest demand snapshot of each peer, bounded in size.
 pub struct PeerDemand {
     peers: HashMap<PeerId, Snapshot>,
 }
 impl PeerDemand {
+    /// No peer heard from yet.
     pub fn new() -> Self {
         Self::default()
     }
@@ -127,6 +130,7 @@ impl PeerDemand {
         });
     }
 
+    /// What `peer` last said about `key`, if anything.
     pub fn get(&self, peer: PeerId, key: u64) -> Option<Heard> {
         let snapshot = self.peers.get(&peer)?;
         let &(demand, primary) = snapshot.keys.get(&key)?;
@@ -163,6 +167,7 @@ impl PeerDemand {
             .sum()
     }
 
+    /// Whether no peer reported any key.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

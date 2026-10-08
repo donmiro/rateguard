@@ -7,8 +7,8 @@
 whole fleet, with no Redis, no central service, and no network call on the
 request path.**
 
-> **Status: not released yet.** The core, the simulator, the `rateguard`
-> runtime and its benchmarks are done and tested; the accuracy report is next.
+> **Status: not released yet.** The core, the simulator and the `rateguard`
+> runtime are done and tested, with benchmarks and an accuracy report below.
 > Nothing is published on crates.io yet.
 
 ```rust
@@ -326,6 +326,45 @@ sends to one instance in practice, but not free.
    4096).
 5. Bandwidth in a healthy cluster is two datagrams per node per protocol
    period: the node's own probe and, on average, one answer to a probe of it.
+
+## Accuracy
+
+Every scenario below runs in the simulator on the settings `rateguard` ships
+with: five instances, a limit of 1000 per second on one key, `β = 0.05`,
+64 hot keys, a burst of 50 on each instance. The table is generated, not
+written: `cargo run -p rateguard-sim --release --bin accuracy -- --write`,
+and CI fails if it falls out of date.
+
+<!-- accuracy: begin -->
+| Scenario | Design bound | Admitted, steady | Peak second | Seconds over 1.01 R | Settles in |
+|---|---|---|---|---|---|
+| Even demand, 5 × 400 | R | 1.00 R | 1.00 R | 0 | 3 s |
+| Skewed demand, 1200 + 4 × 150 | R | 1.00 R | 1.00 R | 0 | 3 s |
+| Demand on 1 of 5 nodes | ≥ R × (1 − 4β/5) = 0.96 R | 0.96 R | 0.96 R | 0 | 2 s |
+| Skewed, 30% packet loss | R | 1.00 R | 1.00 R | 0 | 2 s |
+| Skewed, 20% duplicated, half delayed up to 6 periods | R | 1.00 R | 1.00 R | 0 | 2 s |
+| 3/2 split, Optimistic | up to k × R = 2 R | 1.80 R | 1.80 R | 37 | 4 s |
+| 3/2 split, HoldDown(10 s) | ≈ R for 10 s, then up to 2 R | 1.80 R | 1.80 R | 24 | 18 s |
+| 3/2 split, HoldDown(60 s), longer than the split | ≈ R | 1.00 R | 1.00 R | 0 | 0 s |
+| 3/2 split, Quorum | R + the minority's floors = 1.02 R | 1.02 R | 1.02 R | 33 | 4 s |
+| One-way link, 0 → 1 lost | R | 1.00 R | 1.00 R | 0 | 0 s |
+| GC pause, 5 s on node 4 (the other four) | their shares unchanged | 0.80 R | 0.80 R | 0 | 9 s |
+| Rolling restart, one node every 8 s | ≤ R, no second without service | 1.00 R | 1.00 R | 0 | 2 s |
+| Traffic jumps 100×, cold to hot | R | 1.00 R | 1.00 R | 0 | 3 s |
+| A node joins 10 s late | R | 1.00 R | 1.01 R | 0 | 1 s |
+<!-- accuracy: end -->
+
+*Admitted, steady* is the rate once the scenario has settled, over a window
+after its event; *peak second* the busiest second of the whole run;
+*settles in* the time from the event until every second stays within 5% of
+the steady rate. Bursts let an instance admit a little over its share now and
+then, which is why only seconds above 1.01 R are counted as over.
+
+Two rows deserve a word. Under `Quorum` the minority keeps its floors, which
+is the `ε` of `R + ε`: 2% here. And after a GC pause the paused instance
+works through the requests that queued up meanwhile, its demand estimate
+jumps, and the others give way for a few seconds: the cluster dips *under*
+the limit, never over it.
 
 ## Compared to a shared counter
 

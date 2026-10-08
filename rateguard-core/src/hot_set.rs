@@ -40,6 +40,7 @@ pub struct HotSet {
     hot: HashMap<u64, HotEntry>,
 }
 impl HotSet {
+    /// An empty set of at most `max_size` keys, each kept for `cooldown` once it cools.
     pub fn new(cooldown: Nanos, max_size: usize) -> Self {
         assert!(max_size > 0, "max_size must be > 0");
         Self {
@@ -82,6 +83,7 @@ impl HotSet {
         }
     }
 
+    /// Whether the key is in the set, primary or secondary.
     pub fn is_hot(&self, key: u64) -> bool {
         self.hot.contains_key(&key)
     }
@@ -96,10 +98,12 @@ impl HotSet {
         self.hot.get(&key).is_some_and(|entry| entry.primary)
     }
 
+    /// How many keys are hot.
     pub fn len(&self) -> usize {
         self.hot.len()
     }
 
+    /// Whether no key is hot.
     pub fn is_empty(&self) -> bool {
         self.hot.is_empty()
     }

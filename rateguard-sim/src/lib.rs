@@ -6,6 +6,7 @@
 //! paused and restarted ([`sim::Sim::pause`], [`sim::Sim::schedule_restart`]);
 //! [`invariant`]s are checked after every event.
 
+pub mod accuracy;
 pub mod invariant;
 pub mod link;
 pub mod seed;

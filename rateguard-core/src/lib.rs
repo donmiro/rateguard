@@ -13,6 +13,7 @@
 //! - membership: [`member`], SWIM's member table, behind the
 //!   [`Membership`](membership::Membership) trait;
 //! - [`node`]: one cluster member, driving both through events.
+#![warn(missing_docs)]
 
 pub mod allocation;
 pub mod boundary;

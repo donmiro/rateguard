@@ -5,6 +5,7 @@
 //! the worst case, IPv6 addresses included; the rest is left to the demand
 //! of the allocation layer, capped at [`MAX_REPORTS`] report of at most
 //! [`MAX_DEMAND_KEYS`] keys.
+#![warn(missing_docs)]
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -26,8 +27,11 @@ pub const MAX_DEMAND_KEYS: usize = 64;
 /// within one incarnation, and it is relied on: do not reorder.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Status {
+    /// Answering, as far as anyone knows.
     Alive,
+    /// Missed a probe; dead unless it refutes in time.
     Suspect,
+    /// Declared dead.
     Dead,
 }
 
@@ -36,7 +40,9 @@ pub enum Status {
 /// not. IPv6 flow info and scope are not carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Address {
+    /// An IPv4 address and port.
     V4([u8; 4], u16),
+    /// An IPv6 address and port.
     V6([u8; 16], u16),
 }
 impl From<SocketAddr> for Address {
@@ -59,11 +65,14 @@ impl From<Address> for SocketAddr {
 /// A piece of news about one member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Update {
+    /// The member's ID.
     pub member: u64,
     /// Where the member listens; gossiped with it so that whoever hears of a
     /// member can reach it.
     pub addr: Address,
+    /// Bumped by the member alone, to refute news about itself.
     pub incarnation: u32,
+    /// Its status at that incarnation.
     pub status: Status,
 }
 impl Update {
@@ -103,11 +112,14 @@ pub struct KeyDemand {
 /// never deltas: a newer round of the same origin replaces the older one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DemandReport {
+    /// The node whose demand this is.
     pub origin: u64,
     /// Drawn at random when `origin` starts. Rounds order the reports of one
     /// epoch only: a new epoch is the origin restarted, counting from 0.
     pub epoch: u32,
+    /// The origin's round the report was made in; wraps.
     pub round: u16,
+    /// Its hot keys, the whole set: a key left out has cooled.
     pub keys: Vec<KeyDemand>,
 }
 
@@ -117,26 +129,37 @@ pub struct DemandReport {
 pub enum Message {
     /// Are you alive? The answer is an `Ack` with the same `seq`.
     Ping {
+        /// Echoed in the answer.
         seq: u32,
+        /// Membership news, the sender's own record first.
         updates: Vec<Update>,
+        /// The sender's demand report.
         demand: Vec<DemandReport>,
     },
     /// The answer to a `Ping`, or to a `PingReq` relayed by a helper.
     Ack {
+        /// The `seq` of the `Ping` or `PingReq` answered.
         seq: u32,
+        /// Membership news, the sender's own record first.
         updates: Vec<Update>,
+        /// The sender's demand report; relayed by a helper, the target's.
         demand: Vec<DemandReport>,
     },
     /// Probe `target` for me: I could not reach it myself. If it answers,
     /// the helper sends me an `Ack` with this `seq`.
     PingReq {
+        /// Echoed in the relayed `Ack`.
         seq: u32,
+        /// The member to probe.
         target: u64,
+        /// Membership news, the sender's own record first.
         updates: Vec<Update>,
+        /// The sender's demand report.
         demand: Vec<DemandReport>,
     },
 }
 impl Message {
+    /// The `seq` of any message.
     pub fn seq(&self) -> u32 {
         match self {
             Message::Ping { seq, .. } | Message::Ack { seq, .. } | Message::PingReq { seq, .. } => {
@@ -145,6 +168,7 @@ impl Message {
         }
     }
 
+    /// The membership news of any message.
     pub fn updates(&self) -> &[Update] {
         match self {
             Message::Ping { updates, .. }
@@ -153,6 +177,7 @@ impl Message {
         }
     }
 
+    /// The demand reports of any message.
     pub fn demand(&self) -> &[DemandReport] {
         match self {
             Message::Ping { demand, .. }

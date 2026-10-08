@@ -13,7 +13,7 @@ categories = ["network-programming", "web-programming", "concurrency"]
 [dependencies]
 rateguard-core = { version = "0.1.0", path = "../rateguard-core" }
 rateguard-proto = { version = "0.1.0", path = "../rateguard-proto" }
-tokio = { version = "1", features = ["net", "rt", "time", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 turmoil = { version = "0.7", optional = true }

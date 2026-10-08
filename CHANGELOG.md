@@ -7,6 +7,13 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Seeds given as `host:port`, such as a Kubernetes headless service. A name
+  is looked up when the node starts and again while it runs: every reconnect
+  interval while the node is alone, every 30 s once it has peers.
+- `rateguard-core`: `Node::remove_seed`.
+
 ## [0.1.0] - 2026-10-08
 
 The first release.

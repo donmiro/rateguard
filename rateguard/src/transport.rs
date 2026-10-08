@@ -24,6 +24,17 @@ pub trait Transport: Send + Sync + 'static {
         &self,
         buf: &mut [u8],
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+
+    /// Looks up the addresses of a seed given as `host:port`; the system's
+    /// resolver, through tokio, unless the transport brings its own.
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+        let target = (host.to_owned(), port);
+        async move { Ok(tokio::net::lookup_host(target).await?.collect()) }
+    }
 }
 
 impl Transport for tokio::net::UdpSocket {
@@ -58,5 +69,14 @@ impl Transport for turmoil::net::UdpSocket {
         buf: &mut [u8],
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send {
         turmoil::net::UdpSocket::recv_from(self, buf)
+    }
+
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+        let found = SocketAddr::new(turmoil::lookup(host), port);
+        async move { Ok(vec![found]) }
     }
 }

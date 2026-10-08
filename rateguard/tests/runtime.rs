@@ -189,6 +189,41 @@ async fn two_nodes_on_loopback_find_each_other() {
     assert_eq!((a.cluster_size(), b.cluster_size()), (2, 2));
 }
 
+#[tokio::test]
+async fn a_node_finds_its_seed_by_name() {
+    let (pa, pb) = (free_port(), free_port());
+    let a = Guard::builder()
+        .bind(format!("127.0.0.1:{pa}"))
+        .limit(100)
+        .spawn()
+        .unwrap();
+    let b = Guard::builder()
+        .bind(format!("127.0.0.1:{pb}"))
+        .seeds([format!("localhost:{pa}")])
+        .limit(100)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!((a.cluster_size(), b.cluster_size()), (2, 2));
+}
+
+// The lookups run on a task of their own, which holds the socket too: it
+// must stop with the node, not at its next lookup.
+#[tokio::test]
+async fn a_node_with_a_seed_by_name_still_frees_the_port() {
+    let (port, nobody) = (free_port(), free_port());
+    let guard = Guard::builder()
+        .bind(format!("127.0.0.1:{port}"))
+        .seeds([format!("localhost:{nobody}")])
+        .limit(10)
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(guard);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok());
+}
+
 // Bound to port 0, a node advertises the port the OS picked, not 0:
 // otherwise its peers would answer into the void.
 #[tokio::test]

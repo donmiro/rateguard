@@ -253,6 +253,14 @@ impl Node {
         self.refresh_cap(self.last_now);
     }
 
+    /// Forgets an address to join through, for seeds that come and go, such
+    /// as the addresses a DNS name resolves to. A member that was a seed
+    /// stays a member.
+    pub fn remove_seed(&mut self, seed: PeerId) {
+        self.seeds.retain(|&(known, _)| known != seed);
+        self.refresh_cap(self.last_now);
+    }
+
     /// Counts attempts collected by a runtime that enforces in its own table;
     /// [`quota`](Node::quota) is the way back.
     ///
@@ -2495,6 +2503,35 @@ mod tests {
         n.add_seed(PeerId::new(1), addr(1));
         // R × β over itself and its seed; the test config has β = 0.1.
         assert_eq!(n.new_key_quota(), Quota::new(50, config().burst));
+    }
+
+    #[test]
+    fn a_removed_seed_is_neither_reached_nor_waited_for() {
+        let mut n = node();
+        n.add_seed(PeerId::new(1), addr(1));
+        n.add_seed(PeerId::new(2), addr(2));
+        n.remove_seed(PeerId::new(1));
+        assert_eq!(n.address(PeerId::new(1)), None);
+        // R × β over itself and the seed left.
+        assert_eq!(n.new_key_quota(), Quota::new(50, config().burst));
+        n.remove_seed(PeerId::new(2));
+        assert_eq!(cold_rate_after_round(&mut n, 0), 500.0, "alone again");
+    }
+
+    #[test]
+    fn a_removed_seed_that_answered_stays_a_member() {
+        let mut n = node();
+        n.add_seed(PeerId::new(5), addr(5));
+        let (_, seq) = round(&mut n, 0);
+        let answer = Message::Ack {
+            seq,
+            updates: vec![news(5, 0, Alive)],
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 5, answer, ONE_MS);
+        n.remove_seed(PeerId::new(5));
+        assert_eq!(n.cluster_size(), 2);
+        assert_eq!(n.address(PeerId::new(5)), Some(addr(5)));
     }
 
     // A node can hear itself: a seed list naming it under another address,

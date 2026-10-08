@@ -1,7 +1,9 @@
 //! Enforcement on one node: a GCRA per key, on a share of the limit.
 //!
 //! A cold key gets `R/N × α`; a hot key gets the share it is given by
-//! [`Limiter::tick_with_shares`], or `R/N` by [`Limiter::tick`].
+//! [`Limiter::tick_with_shares`], or `R/N` by [`Limiter::tick`]. A key a
+//! peer holds hot that finds no room in the hot set here gets the floor
+//! `R × β / N`: the peer takes all of the limit but that.
 //! [`Limiter::check`] is the hot path: one map lookup and one GCRA step, no
 //! I/O, and no allocation for a key it already knows. The tick does
 //! everything else once per protocol period.
@@ -166,6 +168,12 @@ impl Limiter {
         let threshold = self.per_node_rate(cluster_size) * self.config.alpha;
         let cold = self.cold_quota(cluster_size);
         let (burst, cap) = (self.config.burst, self.cap.unwrap_or(f64::INFINITY));
+        // A key a peer holds hot, with no room for it here: that peer takes
+        // all of the limit but the floors, so the floor is all there is.
+        let floor =
+            self.config.limit_per_sec as f64 * self.config.floor_factor / cluster_size as f64;
+        let cold_rate = self.per_node_rate(cluster_size) * self.config.alpha;
+        let crowded_out = quota_for(floor.min(cold_rate).min(cap), burst);
         let (keys, hot_set) = (&mut self.keys, &mut self.hot_set);
 
         keys.retain(|&key, state| {
@@ -180,6 +188,8 @@ impl Limiter {
 
             let wanted = if is_hot {
                 quota_for(share(key, state.demand.rate()).min(cap), burst)
+            } else if elsewhere {
+                crowded_out
             } else {
                 cold
             };
@@ -417,6 +427,35 @@ mod tests {
             panic!("burst must be exhausted");
         };
         assert_eq!(retry_at - t, 4_000_000, "the share, not the cold 100");
+    }
+
+    // The hot node takes all of the limit but the peers' floors. A key it
+    // holds hot that finds no room in a full hot set here must stay within
+    // the floor too, not take the cold share on top (spec §4.1).
+    #[test]
+    fn a_key_hot_elsewhere_with_no_room_here_gets_the_floor() {
+        let mut l = limiter();
+        l.tick(0, N);
+        for strong in 1..=4 {
+            for _ in 0..400 {
+                l.check(KEY + strong, 0, N);
+            }
+        }
+        l.tick(ONE_SEC, N);
+        assert_eq!(l.hot_keys(), 4, "the set is full");
+        for _ in 0..50 {
+            l.check(KEY, ONE_SEC, N);
+        }
+        l.tick_with_shares(2 * ONE_SEC, N, |key| key == KEY, |_, _| 250.0);
+        assert!(
+            !l.is_hot(KEY),
+            "no room: KEY does not beat the weakest by 10%"
+        );
+        assert_eq!(
+            interval_at(&mut l, KEY, 3 * ONE_SEC),
+            50_000_000,
+            "R × β / N = 20 a second, not the cold 100"
+        );
     }
 
     #[test]

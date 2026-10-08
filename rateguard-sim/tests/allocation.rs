@@ -300,3 +300,39 @@ fn late_and_duplicated_datagrams_do_not_undo_newer_demand() {
         );
     }
 }
+
+// The mixed key again, but nodes 1-4 have their hot sets full of keys of
+// their own, busier than the mixed key is there: it finds no room, and
+// stays out of their reports. Node 0 takes all but their floors; were the
+// key cold there, they would take their 50 a second each on top, 1120 in
+// all (spec §4.1). The standard invariant checks every second of the run.
+#[test]
+fn a_mixed_key_crowded_out_of_full_hot_sets_stays_within_the_limit() {
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    let run = 40 * ONE_SEC;
+    s.schedule_request_stream(0, KEY, 1200, 0, run);
+    for node in 1..NODES {
+        s.schedule_request_stream(node, KEY, 50, 0, run);
+        for own in 0..config().hot_set_size as u64 {
+            let key = 1000 + 10 * node as u64 + own;
+            s.schedule_request_stream(node, key, 150, 0, run);
+        }
+    }
+    s.run_until(run);
+
+    for node in 1..NODES {
+        assert!(!s.node(node).limiter().is_hot(KEY), "node {node}: no room");
+    }
+    let settled = 20 * ONE_SEC;
+    let admitted = s
+        .admissions()
+        .iter()
+        .filter(|a| a.key == KEY && (settled..run).contains(&a.at))
+        .filter(|a| a.decision == rateguard_core::gcra::Decision::Allow)
+        .count();
+    let rate = admitted as f64 / ((run - settled) / ONE_SEC) as f64;
+    assert!(
+        (950.0..=1000.0).contains(&rate),
+        "admitted {rate:.1} a second"
+    );
+}

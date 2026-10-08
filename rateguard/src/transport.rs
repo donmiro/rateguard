@@ -6,13 +6,20 @@ use std::io;
 use std::net::SocketAddr;
 
 /// A datagram socket. tokio's UDP socket is one.
+///
+/// For tests and simulators, through `Builder::spawn_on`; not part of the
+/// stable API, and free to change in any release.
+#[doc(hidden)]
 pub trait Transport: Send + Sync + 'static {
+    /// Sends one datagram.
     fn send_to(
         &self,
         bytes: &[u8],
         to: SocketAddr,
     ) -> impl Future<Output = io::Result<usize>> + Send;
 
+    /// Receives one datagram. Must be cancel-safe: the node drops a pending
+    /// receive at every tick.
     fn recv_from(
         &self,
         buf: &mut [u8],

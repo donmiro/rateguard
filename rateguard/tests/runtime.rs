@@ -46,6 +46,15 @@ async fn keys_are_limited_apart_the_empty_one_and_a_long_one_included() {
     }
 }
 
+// A guard in a log line must not dump its key table: 8192 slots by
+// default, two million at most.
+#[tokio::test]
+async fn a_guard_debugs_in_a_line() {
+    let guard = alone(100, 5);
+    let debug = format!("{guard:?}");
+    assert!(debug.len() < 200, "{} bytes: {debug:.200}", debug.len());
+}
+
 #[test]
 fn check_works_from_a_thread_outside_the_runtime() {
     let runtime = tokio::runtime::Runtime::new().unwrap();

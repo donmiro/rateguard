@@ -27,6 +27,7 @@ fn nanos(duration: Duration) -> u64 {
 /// What a node does when its cluster shrinks: the CAP trade-off as a
 /// setting. When the network splits into k groups, each sees only itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PartitionPolicy {
     /// Shares follow the surviving cluster at once: up to k times the limit
     /// during a split, nothing ever left unused.
@@ -71,6 +72,7 @@ pub struct Builder {
 }
 
 impl Builder {
+    /// A builder with nothing set; the same as [`Guard::builder`](crate::Guard::builder).
     pub fn new() -> Self {
         Self::default()
     }
@@ -132,6 +134,12 @@ impl Builder {
     }
 
     /// Binds the socket and starts the node in the current tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// If a setting is missing or out of range, if there is no tokio
+    /// runtime or it lacks timers or IO, or if the socket cannot be bound;
+    /// see [`Error`]. Nothing is started then.
     pub fn spawn(self) -> Result<crate::Guard, Error> {
         let mut settings = self.settings()?;
         tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
@@ -313,12 +321,17 @@ pub(crate) struct Settings {
 
 /// Why a node could not start.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
+    /// No address to bind: [`Builder::bind`] was not called.
     MissingBind,
     /// `bind` or `advertise` is not an `ip:port`.
     BadAddress(String),
+    /// No limit: [`Builder::limit`] was not called.
     MissingLimit,
+    /// A limit of 0, which admits nothing.
     ZeroLimit,
+    /// A protocol period too short to tick: under 4 ns.
     ZeroPeriod,
     /// Bound to an unspecified IP with no address to advertise.
     MissingAdvertise,
@@ -326,9 +339,11 @@ pub enum Error {
     UnspecifiedAdvertise,
     /// A seed is not an `ip:port`; DNS names are not supported yet.
     BadSeed(String),
+    /// More hot keys than the 64 one datagram can report.
     TooManyHotKeys(usize),
     /// A burst over the 16,777,215 a quota holds.
     TooLargeBurst(u32),
+    /// Fewer tracked keys than hot keys: a hot key is always tracked.
     TooFewTrackedKeys,
     /// More tracked keys than the 1,048,576 a node keeps.
     TooManyTrackedKeys(usize),
@@ -341,6 +356,7 @@ pub enum Error {
     NoTimer,
     /// The tokio runtime was built without IO (`enable_io`).
     NoIo,
+    /// The socket could not be bound.
     Bind(std::io::Error),
 }
 impl fmt::Display for Error {

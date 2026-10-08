@@ -1,4 +1,4 @@
-// The request path, measured: README promises ~50 ns and spec §6.1 a
+// The request path, measured: README reports ~25 ns and spec §6.1 sets a
 // ceiling of 100 ns, whatever the state of the cluster (guarantee 1).
 //
 //     cargo bench -p rateguard --bench check
@@ -102,7 +102,7 @@ fn contended(c: &mut Criterion) {
                                 barrier.wait();
                                 let start = Instant::now();
                                 for _ in 0..iters {
-                                    black_box(guard.check(&key));
+                                    let _ = black_box(guard.check(&key));
                                 }
                                 start.elapsed()
                             })

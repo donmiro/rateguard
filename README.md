@@ -101,9 +101,9 @@ A key is any string you choose, and the limit applies to each key independently.
 Use whatever dimension you are protecting:
 
 ```rust
-guard.check("tenant:42");                   // per customer
-guard.check("ip:203.0.113.7");              // per client address
-guard.check(&format!("{tenant}:{endpoint}")); // per customer, per endpoint
+let per_customer = guard.check("tenant:42");
+let per_client = guard.check("ip:203.0.113.7");
+let per_endpoint = guard.check(&format!("{tenant}:{endpoint}"));
 ```
 
 Cold keys cost nothing on the network, and memory does not grow with the number

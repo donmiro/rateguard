@@ -31,7 +31,9 @@ pub struct Config {
     pub alpha: f64,
     /// β, in [0, 1]: the part of a hot key's limit split evenly among the
     /// nodes as a floor, so that a node with no demand yet can admit its
-    /// first requests. The rest follows demand.
+    /// first requests. The rest follows demand. A share, however small,
+    /// zero included, still lets `burst` through on every node: that is the
+    /// `R + N × burst` of every bound.
     pub floor_factor: f64,
     /// How long a hot key stays hot after its demand drops below the
     /// threshold.
@@ -176,19 +178,20 @@ impl Limiter {
         let crowded_out = quota_for(floor.min(cold_rate).min(cap), burst);
         let (keys, hot_set) = (&mut self.keys, &mut self.hot_set);
 
+        // Two passes: a key promoted late in the first may evict one seen
+        // earlier, so quotas wait until the hot set is settled.
+        let elsewhere =
+            |key: u64, state: &KeyState| state.demand.rate() >= SILENT_DEMAND && hot_elsewhere(key);
         keys.retain(|&key, state| {
             state.demand.tick(now);
             let rate = state.demand.rate();
-            let elsewhere = rate >= SILENT_DEMAND && hot_elsewhere(key);
-            let is_hot = hot_set.update_with(key, rate, threshold, now, elsewhere);
-
-            if !is_hot && !state.gcra.has_debt(now) && state.demand.rate() < SILENT_DEMAND {
-                return false;
-            }
-
-            let wanted = if is_hot {
+            let is_hot = hot_set.update_with(key, rate, threshold, now, elsewhere(key, state));
+            is_hot || state.gcra.has_debt(now) || rate >= SILENT_DEMAND
+        });
+        for (&key, state) in keys.iter_mut() {
+            let wanted = if hot_set.is_hot(key) {
                 quota_for(share(key, state.demand.rate()).min(cap), burst)
-            } else if elsewhere {
+            } else if elsewhere(key, state) {
                 crowded_out
             } else {
                 cold
@@ -197,8 +200,7 @@ impl Limiter {
                 state.gcra.set_quota(wanted, now);
                 state.applied = wanted;
             }
-            true
-        });
+        }
 
         self.enforce_cap();
     }
@@ -456,6 +458,37 @@ mod tests {
             50_000_000,
             "R × β / N = 20 a second, not the cold 100"
         );
+    }
+
+    // Eviction happens mid-tick: a key that got its hot share earlier in
+    // the same pass and was evicted later must not keep it, the peers no
+    // longer counting its demand.
+    #[test]
+    fn an_evicted_key_drops_its_hot_share_in_the_same_tick() {
+        let mut l = limiter();
+        l.tick(0, N);
+        for old in 1..=4 {
+            for _ in 0..400 {
+                l.check(old, 0, N);
+            }
+        }
+        l.tick(ONE_SEC, N);
+        assert_eq!(l.hot_keys(), 4);
+        for new in 11..=14 {
+            for _ in 0..4000 {
+                l.check(new, ONE_SEC, N);
+            }
+        }
+        l.tick_with_shares(2 * ONE_SEC, N, |_| false, |_, _| 900.0);
+
+        for key in 1..=4 {
+            assert!(!l.is_hot(key), "key {key} evicted");
+            assert_eq!(
+                interval_at(&mut l, key, 3 * ONE_SEC),
+                10_000_000,
+                "key {key}: the cold 100 a second, not the hot 900"
+            );
+        }
     }
 
     #[test]

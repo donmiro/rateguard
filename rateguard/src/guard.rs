@@ -10,16 +10,22 @@ use tokio::time::Instant;
 use crate::key::key_hash;
 use crate::table::KeyTable;
 
-/// The answer to a request.
+/// The answer to a request. Two answers and no more, ever: matching both is
+/// safe across versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a request is only limited if the decision is acted on"]
 pub enum Decision {
+    /// Serve the request.
     Allow,
     /// Denied; a retry is admitted no sooner than `retry_after`.
     Deny {
+        /// How long until a retry may be admitted, unless other requests
+        /// take that slot first.
         retry_after: Duration,
     },
 }
 impl Decision {
+    /// Whether the request is to be served.
     pub fn is_allowed(&self) -> bool {
         matches!(self, Decision::Allow)
     }
@@ -42,11 +48,20 @@ impl Shared {
 
 /// The handle every request goes through: cheap to clone, `Send + Sync`.
 /// The node runs as long as one clone is alive.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Guard {
     pub(crate) shared: Arc<Shared>,
 }
+impl std::fmt::Debug for Guard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guard")
+            .field("cluster_size", &self.cluster_size())
+            .field("key_slots", &self.shared.table.capacity())
+            .finish()
+    }
+}
 impl Guard {
+    /// Starts configuring a node; see [`Builder`](crate::Builder).
     pub fn builder() -> crate::Builder {
         crate::Builder::new()
     }

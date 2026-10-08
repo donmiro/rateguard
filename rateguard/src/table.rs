@@ -32,11 +32,19 @@ impl Slot {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct KeyTable {
     slots: Box<[Slot]>,
     buckets: usize,
     overflow: Slot,
+}
+// Not derived: up to two million slots would go into a log line.
+impl std::fmt::Debug for KeyTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyTable")
+            .field("slots", &self.slots.len())
+            .field("buckets", &self.buckets)
+            .finish_non_exhaustive()
+    }
 }
 impl KeyTable {
     /// Room for twice `tracked_keys`, in whole buckets, a power of two of
@@ -50,7 +58,6 @@ impl KeyTable {
         }
     }
 
-    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }

@@ -7,10 +7,6 @@
 whole fleet, with no Redis, no central service, and no network call on the
 request path.**
 
-> **Status: not released yet.** The core, the simulator and the `rateguard`
-> runtime are done and tested, with benchmarks and an accuracy report below.
-> Nothing is published on crates.io yet.
-
 ```rust
 use rateguard::Guard;
 
@@ -461,8 +457,8 @@ production.
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/donmiro/rateguard/blob/main/LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](https://github.com/donmiro/rateguard/blob/main/LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option.
 

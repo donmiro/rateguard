@@ -84,6 +84,12 @@ impl MemberTable {
         }
     }
 
+    /// The members known, alive, suspect or dead and not yet forgotten,
+    /// this node included.
+    pub fn known(&self) -> usize {
+        self.members.len() + 1
+    }
+
     /// This node's own incarnation. Only it can raise it, and only to
     /// refute news about itself.
     pub fn incarnation(&self) -> u32 {

@@ -45,6 +45,12 @@ pub struct Config {
     pub hot_set_size: usize,
     /// Cap on the keys this node keeps any state for. Separate from
     /// `hot_set_size` and at least as big: hot keys are never reclaimed.
+    ///
+    /// Enforced at every tick: in between, each key not seen before adds
+    /// an entry, so the map holds at most this many plus the new keys of
+    /// one protocol period. The rateguard runtime feeds the limiter only
+    /// keys from its fixed-size table, twice `max_tracked_keys` slots, so
+    /// there it never holds more than three times this.
     pub max_tracked_keys: usize,
     /// How fast the demand average follows a change.
     pub demand_time_constant: Nanos,

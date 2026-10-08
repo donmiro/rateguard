@@ -29,7 +29,6 @@ impl Gossip {
         Self::default()
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.queue.len()
     }

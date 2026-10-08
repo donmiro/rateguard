@@ -132,6 +132,33 @@ pub struct Node {
     reported: VecDeque<(Nanos, Vec<KeyDemand>)>,
     recent_shares: BTreeMap<u64, [f64; RISE_DELAY_ROUNDS]>,
 }
+/// The sizes of a node's collections; see [`Node::footprint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    /// Keys with limiter state, hot or cold.
+    pub tracked_keys: usize,
+    /// Keys in the hot set.
+    pub hot_keys: usize,
+    /// Keys the peers reported, over all peers.
+    pub peer_demand_keys: usize,
+    /// Members known, the dead not yet forgotten and this node included.
+    pub members: usize,
+    /// Peers with a time of last message.
+    pub last_heard: usize,
+    /// Membership news waiting to be spread.
+    pub gossip: usize,
+    /// This node's own past reports, kept to date its demand.
+    pub reported_rounds: usize,
+    /// Keys over those reports.
+    pub reported_keys: usize,
+    /// Keys with recent shares, for the delay on a rising share.
+    pub recent_shares: usize,
+    /// PING-REQs being relayed.
+    pub relays: usize,
+    /// Peers in the probe order.
+    pub probe_order: usize,
+}
+
 impl Node {
     /// A node alone in its cluster. `seed` drives its random choices, so the
     /// same seed replays the same run.
@@ -300,6 +327,24 @@ impl Node {
     /// When the last protocol round ran.
     pub fn last_round(&self) -> Option<Nanos> {
         self.last_round
+    }
+
+    /// How much the node holds, collection by collection: what guarantee 4
+    /// of the spec bounds by the config and the cluster size.
+    pub fn footprint(&self) -> Footprint {
+        Footprint {
+            tracked_keys: self.limiter.tracked_keys(),
+            hot_keys: self.limiter.hot_keys(),
+            peer_demand_keys: self.peer_demand.len(),
+            members: self.members.known(),
+            last_heard: self.last_heard.len(),
+            gossip: self.gossip.len(),
+            reported_rounds: self.reported.len(),
+            reported_keys: self.reported.iter().map(|(_, keys)| keys.len()).sum(),
+            recent_shares: self.recent_shares.len(),
+            relays: self.relays.len(),
+            probe_order: self.order.len(),
+        }
     }
 
     /// The limiter, read only.

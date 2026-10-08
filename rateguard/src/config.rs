@@ -139,7 +139,9 @@ impl Builder {
     ///
     /// If a setting is missing or out of range, if there is no tokio
     /// runtime or it lacks timers or IO, or if the socket cannot be bound;
-    /// see [`Error`]. Nothing is started then.
+    /// see [`Error`]. Nothing is started then. tokio cannot be asked whether
+    /// a runtime has timers and IO, only tried, so a runtime without them
+    /// also shows its panic message on stderr, through the panic hook.
     pub fn spawn(self) -> Result<crate::Guard, Error> {
         let mut settings = self.settings()?;
         tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
@@ -266,7 +268,7 @@ fn start<T: crate::Transport>(
     ticker: tokio::time::Interval,
 ) -> crate::Guard {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use rateguard_core::node::Node;
     use rateguard_proto::Address;
@@ -298,12 +300,18 @@ fn start<T: crate::Transport>(
         table: crate::table::KeyTable::new(settings.core.max_tracked_keys, node.new_key_quota()),
         cluster_size: AtomicUsize::new(node.cluster_size()),
         epoch: tokio::time::Instant::now(),
+        running: AtomicBool::new(true),
     });
-    tokio::spawn(crate::driver::run(
+    let task = tokio::spawn(crate::driver::run(
         node,
         transport,
         Arc::downgrade(&shared),
         ticker,
+    ));
+    tokio::spawn(crate::driver::watch(
+        task,
+        Arc::downgrade(&shared),
+        settings.core,
     ));
     crate::Guard { shared }
 }

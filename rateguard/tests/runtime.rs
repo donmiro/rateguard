@@ -124,6 +124,53 @@ async fn a_hung_network_does_not_touch_the_request_path() {
     assert_eq!(allowed, 4);
 }
 
+// The background task dying, whatever kills it: here the transport
+// panics; a bug in the core would do the same.
+// A deadline, not a sleep: the node drops a pending receive every tick.
+struct Panicking(tokio::time::Instant);
+impl Transport for Panicking {
+    fn send_to(&self, _: &[u8], _: SocketAddr) -> impl Future<Output = io::Result<usize>> + Send {
+        std::future::pending()
+    }
+    async fn recv_from(&self, _: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        tokio::time::sleep_until(self.0).await;
+        panic!("the background task dies");
+    }
+}
+
+// Its peers take a dead node's share for themselves; were it to go on at
+// its last quotas, the cluster would admit that share twice. So it drops
+// to the floor, R × β / N, and says it no longer runs.
+#[tokio::test]
+async fn a_node_whose_background_task_died_falls_back_to_the_floor() {
+    let guard = Guard::builder()
+        .bind("10.0.0.1:7946")
+        .limit(1000)
+        .burst(1)
+        .spawn_on(Panicking(
+            tokio::time::Instant::now() + Duration::from_millis(300),
+        ))
+        .unwrap();
+    assert!(guard.is_running());
+    let retry_after = |guard: &Guard| {
+        let _ = guard.check("k");
+        match guard.check("k") {
+            Decision::Deny { retry_after } => retry_after,
+            Decision::Allow => panic!("a burst of one"),
+        }
+    };
+    assert!(
+        retry_after(&guard) <= Duration::from_millis(3),
+        "a new key, alone: the cold α × R, one every 2 ms"
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!guard.is_running());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // 1000 × 0.05 / 1 = 50 a second: one every 20 ms.
+    assert!(retry_after(&guard) > Duration::from_millis(15));
+}
+
 #[tokio::test]
 async fn two_nodes_on_loopback_find_each_other() {
     let (pa, pb) = (free_port(), free_port());

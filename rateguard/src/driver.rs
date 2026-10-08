@@ -30,8 +30,9 @@ pub(crate) async fn run<T: Transport>(
     mut ticker: tokio::time::Interval,
 ) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // A send is given one tick: a transport that never completes one must
-    // not freeze the node, nor keep it alive once the last Guard is gone.
+    // Sending is given one tick: a transport that never completes a send
+    // must not freeze the node, nor keep it alive once the last Guard is
+    // gone.
     let budget = ticker.period();
     let mut buf = vec![0u8; rateguard_proto::MAX_DATAGRAM];
     loop {
@@ -58,6 +59,36 @@ pub(crate) async fn run<T: Transport>(
         };
         send(&node, &transport, actions, budget).await;
     }
+}
+
+/// Waits for the background task. If it panicked, a bug, the node is gone
+/// from its peers' view, and they hand its share out among themselves:
+/// kept at its last quotas, it would admit that share a second time. It
+/// drops every key to the floor `R × β / N` instead, the part of the limit
+/// a cluster leaves to each member, and says it no longer runs.
+pub(crate) async fn watch(
+    task: tokio::task::JoinHandle<()>,
+    shared: Weak<Shared>,
+    config: rateguard_core::limiter::Config,
+) {
+    let Err(error) = task.await else { return };
+    let Some(shared) = shared.upgrade() else {
+        return;
+    };
+    if error.is_panic() {
+        let n = shared.cluster_size.load(Ordering::Relaxed).max(1);
+        let floor = config.limit_per_sec as f64 * config.floor_factor / n as f64;
+        let quota = rateguard_core::gcra::Quota::per_second(floor, config.burst);
+        let now = shared.now();
+        shared
+            .table
+            .for_each(|_, slot| slot.gcra.set_quota(quota, now));
+        shared
+            .table
+            .for_each_free(|slot| slot.gcra.set_quota(quota, now));
+        shared.table.overflow().gcra.set_quota(quota, now);
+    }
+    shared.running.store(false, Ordering::Relaxed);
 }
 
 // One tick: attempts in, the core's round, quotas out (spec §5.3).
@@ -89,20 +120,69 @@ fn sync(node: &mut Node, shared: &Arc<Shared>) -> Vec<Action> {
     actions
 }
 
+// The whole batch gets the budget, not each datagram: three PING-REQs on a
+// hung transport would hold the node three ticks. A lost datagram, or one
+// that took too long to leave, is the protocol's normal case.
 async fn send<T: Transport>(node: &Node, transport: &T, actions: Vec<Action>, budget: Duration) {
-    for Action::SendTo { peer, bytes } in actions {
-        if let Some(address) = node.address(peer) {
-            // A lost datagram, or one that took too long to leave, is the
-            // protocol's normal case.
-            let _ = tokio::time::timeout(budget, transport.send_to(&bytes, address.into())).await;
+    let batch = async {
+        for Action::SendTo { peer, bytes } in actions {
+            if let Some(address) = node.address(peer) {
+                let _ = transport.send_to(&bytes, address.into()).await;
+            }
         }
-    }
+    };
+    let _ = tokio::time::timeout(budget, batch).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rateguard_proto::{Address, Message, Status, Update, encode};
+
+    struct HungSend;
+    impl Transport for HungSend {
+        async fn send_to(&self, _: &[u8], _: std::net::SocketAddr) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+        async fn recv_from(&self, _: &mut [u8]) -> std::io::Result<(usize, std::net::SocketAddr)> {
+            std::future::pending().await
+        }
+    }
+
+    // A probe gone unanswered sends three PING-REQs in one tick: on a hung
+    // transport they must cost the node one tick, not three.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_transport_costs_one_budget_per_batch() {
+        use rateguard_core::limiter::Config;
+        use rateguard_core::node::SwimConfig;
+
+        let config = Config {
+            limit_per_sec: 100,
+            burst: 5,
+            alpha: 0.5,
+            floor_factor: 0.05,
+            cooldown: 5_000_000_000,
+            hot_set_size: 4,
+            max_tracked_keys: 8,
+            demand_time_constant: 1_000_000_000,
+        };
+        let me = Address::V4([10, 0, 0, 1], 7946);
+        let mut node = Node::new(config, SwimConfig::default(), PeerId::new(1), me, 1);
+        let actions: Vec<Action> = (2..5)
+            .map(|peer| {
+                node.introduce(PeerId::new(peer), Address::V4([10, 0, 0, peer as u8], 7946));
+                Action::SendTo {
+                    peer: PeerId::new(peer),
+                    bytes: vec![1],
+                }
+            })
+            .collect();
+
+        let budget = Duration::from_millis(50);
+        let start = tokio::time::Instant::now();
+        send(&node, &HungSend, actions, budget).await;
+        assert_eq!(start.elapsed(), budget);
+    }
 
     #[test]
     fn the_sender_is_the_first_record_not_the_socket_address() {

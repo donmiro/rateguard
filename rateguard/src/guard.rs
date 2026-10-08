@@ -1,7 +1,7 @@
 //! The request path.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rateguard_core::gcra;
@@ -37,6 +37,8 @@ pub(crate) struct Shared {
     pub table: KeyTable,
     pub cluster_size: AtomicUsize,
     pub epoch: Instant,
+    /// Cleared if the background task dies.
+    pub running: AtomicBool,
 }
 impl Shared {
     /// Nanoseconds since the node started, on tokio's clock: the OS's
@@ -68,6 +70,8 @@ impl Guard {
 
     /// Admits or denies one request for `key`. No I/O, no lock shared with
     /// the network, the same latency whatever the state of the cluster.
+    /// The key is hashed here, at a cost that grows with its length: keep
+    /// keys short, or hash long ones yourself.
     pub fn check(&self, key: &str) -> Decision {
         let shared = &*self.shared;
         let now = shared.now();
@@ -86,5 +90,12 @@ impl Guard {
     /// The nodes this one counts in the cluster, itself included.
     pub fn cluster_size(&self) -> usize {
         self.shared.cluster_size.load(Ordering::Relaxed)
+    }
+
+    /// Whether the background task still runs. If it died, a bug, the node
+    /// is gone from its peers' view and holds every key at a small floor
+    /// rather than at shares nobody counts any more: worth a health check.
+    pub fn is_running(&self) -> bool {
+        self.shared.running.load(Ordering::Relaxed)
     }
 }

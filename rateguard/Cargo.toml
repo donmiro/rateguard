@@ -18,7 +18,7 @@ turmoil = { version = "0.7", optional = true }
 turmoil = ["dep:turmoil"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time", "macros", "test-util"] }
 criterion = "0.8"
 
 [[bench]]

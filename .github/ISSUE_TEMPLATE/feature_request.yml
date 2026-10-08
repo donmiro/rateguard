@@ -1,0 +1,20 @@
+name: Feature request
+description: Something rateguard should do and does not.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to limit, across what kind of fleet, and where rateguard falls short.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you would like
+      description: An API sketch is welcome. Note any guarantee from the README it would touch.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead

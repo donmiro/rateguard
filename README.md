@@ -110,11 +110,17 @@ Cold keys cost nothing on the network, and memory does not grow with the number
 of keys: the per-key table is allocated once, with room for twice
 `tracked_keys`, and a key that has gone quiet frees its place. Many distinct keys
 over time are fine. What the table bounds is how many keys are *active at once*:
-up to one and a half times `tracked_keys` every key gets a place of its own;
-beyond that, the extra ones share a single allowance at the cold rate. That
-errs on the strict side, never the loose one, but it can deny a well-behaved
-key; size `tracked_keys` to at least the number of keys you expect to be busy at
-the same moment.
+up to a quarter again as many as `tracked_keys`, every key gets a place of its
+own; at half again as many, now and then one key does not; beyond that, the
+extra ones share a single allowance at the cold rate. That errs on the strict
+side, never the loose one, but it can deny a well-behaved key; size
+`tracked_keys` to at least the number of keys you expect to be busy at the same
+moment.
+
+If clients choose the keys (an IP address, an API token), the same applies to
+them: a flood of distinct keys beyond that pushes new keys into the shared
+allowance. Picking keys that crowd out one particular key does not work: where
+a key lives in the table depends on a secret random to each instance.
 
 ### With `axum`
 
@@ -282,11 +288,11 @@ steps, the time a dead member takes to be forgotten.
 
 | Case | Per check |
 |---|---|
-| One hot key, one thread | 25 ns |
-| 4096 keys in turn | 30 ns |
+| One hot key, one thread | 26 ns |
+| 4096 keys in turn | 33 ns |
 | One hot key, the network hung (the cluster as good as gone) | 25 ns |
 | 8 threads, a key each | 27 ns |
-| 8 threads on one key, back to back | 1.4–1.9 µs |
+| 8 threads on one key, back to back | 1.4–2.1 µs |
 
 The last line is the one cost to know. An exact limit means every check on a key
 writes the same word, so cores hitting one key at once queue for it: about 6

@@ -104,6 +104,9 @@ pub struct KeyDemand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DemandReport {
     pub origin: u64,
+    /// Drawn at random when `origin` starts. Rounds order the reports of one
+    /// epoch only: a new epoch is the origin restarted, counting from 0.
+    pub epoch: u32,
     pub round: u16,
     pub keys: Vec<KeyDemand>,
 }
@@ -273,6 +276,7 @@ mod tests {
     fn report(keys: Vec<KeyDemand>) -> DemandReport {
         DemandReport {
             origin: 3,
+            epoch: 5,
             round: 17,
             keys,
         }
@@ -284,6 +288,7 @@ mod tests {
         (0..MAX_REPORTS)
             .map(|_| DemandReport {
                 origin: u64::MAX,
+                epoch: u32::MAX,
                 round: u16::MAX,
                 keys: vec![key(u64::MAX, f32::MAX); per_report],
             })
@@ -553,11 +558,14 @@ mod tests {
                 },
             );
             let keys = prop::collection::vec(key, 0..=MAX_DEMAND_KEYS / MAX_REPORTS);
-            (any::<u64>(), any::<u16>(), keys).prop_map(|(origin, round, keys)| DemandReport {
-                origin,
-                round,
-                keys,
-            })
+            (any::<u64>(), any::<u32>(), any::<u16>(), keys).prop_map(
+                |(origin, epoch, round, keys)| DemandReport {
+                    origin,
+                    epoch,
+                    round,
+                    keys,
+                },
+            )
         }
 
         fn message() -> impl Strategy<Value = Message> {

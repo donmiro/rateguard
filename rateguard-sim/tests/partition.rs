@@ -194,3 +194,47 @@ fn a_node_that_has_not_joined_yet_does_not_take_the_limit() {
         LIMIT_WITH_BURSTS,
     );
 }
+
+// Nodes 0-2 and 3-4 cannot reach each other in [CUT, LONG_HEAL): longer
+// than it takes the dead to be forgotten.
+const LONG_HEAL: Nanos = 640 * ONE_SEC;
+const LONG_END: Nanos = LONG_HEAL + 40 * ONE_SEC;
+struct LongSplit;
+impl Link for LongSplit {
+    fn fate(&mut self, from: NodeIndex, to: NodeIndex, now: Nanos, _len: usize) -> Fate {
+        if (CUT..LONG_HEAL).contains(&now) && (from < 3) != (to < 3) {
+            Fate::Lost
+        } else {
+            Fate::Delivered(now + LATENCY)
+        }
+    }
+}
+
+// Ten minutes in, each side has forgotten the other. The minority must not
+// take itself for the whole cluster then; after the heal, through the
+// seed, the cluster is whole again. The standard invariant checks every
+// second of it.
+#[test]
+fn quorum_outlasts_the_tombstones() {
+    let mut s = Sim::with_seeds(NODES, config(), LongSplit, &[0]);
+    s.set_partition_policy(PartitionPolicy::Quorum);
+    for node in 0..NODES {
+        s.schedule_request_stream(node, KEY, 400, 0, LONG_END);
+    }
+    s.run_until(LONG_END);
+
+    let forgotten = LONG_HEAL - 20 * ONE_SEC;
+    assert_eq!(s.node(3).members().dead().count(), 0, "the dead forgotten");
+    assert_between(
+        "minority, the dead forgotten",
+        rate(&s, forgotten, LONG_HEAL, &[3, 4]),
+        35.0,
+        45.0,
+    );
+    assert_between(
+        "after the heal",
+        rate(&s, LONG_HEAL + 20 * ONE_SEC, LONG_END, &ALL),
+        950.0,
+        LIMIT_WITH_BURSTS,
+    );
+}

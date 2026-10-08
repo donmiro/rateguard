@@ -66,9 +66,10 @@ fn bandwidth_does_not_depend_on_traffic() {
     );
 }
 
-// rateguard-proto reserves at most 300 bytes of the datagram for membership
-// and leaves the rest to demand[]. In practice gossip spreads over time even
-// when a lot happens at once, and the real datagrams stay far smaller.
+// rateguard-proto caps membership at under 460 bytes in the worst case and
+// leaves the rest to demand[]. In practice gossip spreads over time even
+// when a lot happens at once, and the real datagrams, an empty demand
+// report included, stay under 300.
 const MEMBERSHIP_BUDGET: usize = 300;
 
 fn assert_within_budget(scenario: &str, s: &Sim<impl Link>) {

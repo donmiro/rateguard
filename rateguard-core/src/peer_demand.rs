@@ -4,9 +4,10 @@
 //! of its hot keys; see spec §10.8 for why demand is not relayed. Each
 //! report is therefore a snapshot of absolute values: a newer one replaces
 //! the older one whole, so a key that cooled at the peer is gone as soon as
-//! the next report arrives, and a message with no report at all means the
-//! peer has no hot key left. A lost report costs a round of accuracy, a
-//! duplicated or reordered one costs nothing.
+//! the next report arrives, and an empty report means the peer has no hot
+//! key left. Rounds order the reports of one epoch, a run of the peer from
+//! start to restart. A lost report costs a round of accuracy, a duplicated
+//! or reordered one costs nothing.
 //!
 //! Memory is bounded by the peers times the keys one report can carry: a
 //! peer that leaves the cluster is forgotten, and so is one not heard from
@@ -52,6 +53,7 @@ pub fn stale_after_rounds(cluster_size: usize) -> u64 {
 
 #[derive(Debug, Clone)]
 struct Snapshot {
+    epoch: u32,
     round: u16,
     heard_at: Nanos,
     keys: HashMap<u64, (f32, bool)>,
@@ -59,32 +61,26 @@ struct Snapshot {
     held_until: Option<Nanos>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PeerDemand {
     peers: HashMap<PeerId, Snapshot>,
-    reorder_window: Nanos,
 }
 impl PeerDemand {
-    /// `reorder_window` is how long round numbers are trusted to order the
-    /// reports of one peer. A report that arrives later than that after the
-    /// last one is taken whatever its round: the peer may have restarted
-    /// and counted from 0 again.
-    pub fn new(reorder_window: Nanos) -> Self {
-        Self {
-            peers: HashMap::new(),
-            reorder_window,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Applies a report `from` a peer. A report the peer made about someone
-    /// else is ignored.
+    /// else is ignored, and so is one no newer than what the peer already
+    /// said in the same epoch, however late it comes. A report of another
+    /// epoch is taken whatever its round: the peer restarted.
     pub fn apply(&mut self, from: PeerId, report: &DemandReport, now: Nanos) {
         if report.origin != from.get() {
             return;
         }
         if let Some(old) = self.peers.get(&from)
+            && old.epoch == report.epoch
             && !round_is_newer(report.round, old.round)
-            && now < old.heard_at.saturating_add(self.reorder_window)
         {
             return;
         }
@@ -96,6 +92,7 @@ impl PeerDemand {
         self.peers.insert(
             from,
             Snapshot {
+                epoch: report.epoch,
                 round: report.round,
                 heard_at: now,
                 keys,
@@ -104,8 +101,7 @@ impl PeerDemand {
         );
     }
 
-    /// Drops everything heard from `peer`: it left the cluster, or it sent
-    /// a message with no report, which means it has no hot key.
+    /// Drops everything heard from `peer`: it left the cluster.
     pub fn forget(&mut self, peer: PeerId) {
         self.peers.remove(&peer);
     }
@@ -180,10 +176,12 @@ mod tests {
     const PERIOD: Nanos = 200_000_000;
     const PEER: PeerId = PeerId::new(1);
     const KEY: u64 = 42;
+    const EPOCH: u32 = 7;
 
     fn report_of(round: u16, keys: &[(u64, f32)]) -> DemandReport {
         DemandReport {
             origin: PEER.get(),
+            epoch: EPOCH,
             round,
             keys: keys
                 .iter()
@@ -224,7 +222,7 @@ mod tests {
 
     #[test]
     fn a_report_is_remembered_per_peer_and_key() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(3, 120.0), 0);
         assert_eq!(
             t.get(PEER, KEY),
@@ -241,7 +239,7 @@ mod tests {
 
     #[test]
     fn a_newer_round_replaces_an_older_one() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(3, 120.0), 0);
         t.apply(PEER, &report(4, 80.0), 1);
         assert_eq!(demand(&t), Some(80.0));
@@ -249,7 +247,7 @@ mod tests {
 
     #[test]
     fn a_key_missing_from_a_newer_report_has_cooled() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report_of(3, &[(KEY, 120.0), (KEY + 1, 90.0)]), 0);
         t.apply(PEER, &report_of(4, &[(KEY + 1, 95.0)]), 1);
         assert_eq!(demand(&t), None);
@@ -259,7 +257,7 @@ mod tests {
 
     #[test]
     fn a_late_report_does_not_undo_a_newer_one() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(4, 80.0), 0);
         t.apply(PEER, &report(3, 120.0), 1);
         assert_eq!(demand(&t), Some(80.0));
@@ -267,7 +265,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_changes_nothing() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(4, 80.0), 0);
         t.apply(PEER, &report(4, 80.0), 10);
         assert_eq!(t.get(PEER, KEY).unwrap().heard_at, 0);
@@ -275,29 +273,35 @@ mod tests {
     }
 
     #[test]
-    fn a_restarted_peer_is_believed_once_the_window_has_passed() {
-        let mut t = PeerDemand::new(PERIOD);
+    fn a_late_report_does_not_undo_a_newer_one_however_late() {
+        let mut t = PeerDemand::new();
+        t.apply(PEER, &report(4, 80.0), 0);
+        t.apply(PEER, &report(3, 120.0), 10 * PERIOD);
+        assert_eq!(demand(&t), Some(80.0));
+    }
+
+    #[test]
+    fn a_restarted_peer_is_believed_at_once() {
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(500, 80.0), 0);
-        t.apply(PEER, &report(0, 30.0), PERIOD - 1);
-        assert_eq!(
-            demand(&t),
-            Some(80.0),
-            "within the window round 0 is late news"
-        );
-        t.apply(PEER, &report(1, 30.0), PERIOD);
-        assert_eq!(demand(&t), Some(30.0), "after it, the peer started over");
+        let restarted = DemandReport {
+            epoch: EPOCH + 1,
+            ..report(0, 30.0)
+        };
+        t.apply(PEER, &restarted, 1);
+        assert_eq!(demand(&t), Some(30.0));
     }
 
     #[test]
     fn a_report_about_someone_else_is_ignored() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PeerId::new(2), &report(3, 120.0), 0);
         assert!(t.is_empty());
     }
 
     #[test]
     fn a_forgotten_peer_is_gone_and_others_stay() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         let other = PeerId::new(2);
         t.apply(PEER, &report(3, 120.0), 0);
         t.apply(
@@ -315,7 +319,7 @@ mod tests {
 
     #[test]
     fn the_total_adds_up_what_every_peer_reported() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         let other = PeerId::new(2);
         t.apply(PEER, &report_of(3, &[(KEY, 120.0), (KEY + 1, 5.0)]), 0);
         t.apply(
@@ -333,7 +337,7 @@ mod tests {
 
     #[test]
     fn a_key_is_hot_elsewhere_only_if_a_peer_holds_it_primary() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         let mut secondary = report(3, 120.0);
         secondary.keys[0].primary = false;
         t.apply(PEER, &secondary, 0);
@@ -346,7 +350,7 @@ mod tests {
 
     #[test]
     fn a_peer_that_leaves_with_no_hold_is_forgotten() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(3, 120.0), 0);
         t.leave(PEER, 1, 0);
         assert!(t.is_empty());
@@ -354,7 +358,7 @@ mod tests {
 
     #[test]
     fn a_held_peer_outlives_staleness_until_the_hold_ends() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(3, 120.0), 0);
         t.leave(PEER, PERIOD, 50 * PERIOD);
 
@@ -366,7 +370,7 @@ mod tests {
 
     #[test]
     fn a_held_peer_that_reports_again_is_back() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(3, 120.0), 0);
         t.leave(PEER, PERIOD, 50 * PERIOD);
         t.apply(PEER, &report(4, 90.0), 2 * PERIOD);
@@ -377,7 +381,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_expires_once_it_is_max_age_old() {
-        let mut t = PeerDemand::new(PERIOD);
+        let mut t = PeerDemand::new();
         t.apply(PEER, &report(3, 120.0), PERIOD);
         t.expire(PERIOD + 10 * PERIOD - 1, 10 * PERIOD);
         assert_eq!(demand(&t), Some(120.0));

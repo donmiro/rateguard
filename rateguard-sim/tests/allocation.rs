@@ -267,3 +267,36 @@ fn a_small_limit_over_a_big_fleet_is_not_multiplied() {
     let rate = admitted_per_sec(&s, 20 * ONE_SEC, run);
     assert!((9.0..=10.5).contains(&rate), "admitted {rate:.2} a second");
 }
+
+// Spec §5.2: duplicated and reordered datagrams are harmless. Held back up
+// to six periods, a datagram arrives after newer ones from the same peer;
+// the nodes turn hot one by one, so some late ones say a key is not hot
+// yet. The standard invariant checks every second of the run. The ordering
+// itself is proven in the unit tests of peer_demand and node: this passed
+// before reports carried an epoch too, the rise delay of the shares
+// absorbing a round or two of forgotten demand.
+#[test]
+fn late_and_duplicated_datagrams_do_not_undo_newer_demand() {
+    let messy = NetConfig {
+        duplicate: 0.2,
+        reorder: 0.5,
+        reorder_window: 6 * PERIOD,
+        ..NetConfig::perfect(ONE_MS)
+    };
+    for seed in [8371, 1, 2, 3, 4] {
+        let mut s = Sim::new(NODES, config(), SeededLink::new(seed, messy));
+        let run = 40 * ONE_SEC;
+        s.schedule_request_stream(0, KEY, 1200, 0, run);
+        for node in 1..NODES {
+            s.schedule_request_stream(node, KEY, 150, node as Nanos * 3 * ONE_SEC, run);
+        }
+        s.run_until(run);
+
+        let settled = 25 * ONE_SEC;
+        let rate = s.admitted_between(settled, run) as f64 / ((run - settled) / ONE_SEC) as f64;
+        assert!(
+            (950.0..=1010.0).contains(&rate),
+            "seed {seed}: admitted {rate:.1} a second"
+        );
+    }
+}

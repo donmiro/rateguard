@@ -269,6 +269,12 @@ cluster. No design can avoid that; `rateguard` makes it an explicit choice.
 pod restart lasting seconds, and holding the limit steady through those is nearly
 always what you want.
 
+Under `Quorum`, a node that cannot tell a split from a death keeps counting
+the members it lost, however long ago. So never remove half the cluster or
+more at once: the nodes left would take it for a split and stay at the floor.
+Scale down by less than half at a time, and let ten minutes pass between
+steps, the time a dead member takes to be forgotten.
+
 ## Performance
 
 `check()`, measured with `criterion` on an Apple M4 Pro

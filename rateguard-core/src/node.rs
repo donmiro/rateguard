@@ -120,10 +120,12 @@ pub struct Node {
     actions: Vec<Action>,
     peer_demand: PeerDemand,
     round_number: u16,
+    epoch: u32,
     own_demand: Vec<KeyDemand>,
     policy: PartitionPolicy,
     sizes: SizeHistory,
     held_size: usize,
+    quorum_size: usize,
     floored_until: Nanos,
     joined_at: Option<Nanos>,
     last_heard: BTreeMap<PeerId, Nanos>,
@@ -173,12 +175,16 @@ impl Node {
             last_round: None,
             last_now: 0,
             actions: Vec::new(),
-            peer_demand: PeerDemand::new(swim.protocol_period),
+            peer_demand: PeerDemand::new(),
             round_number: 0,
+            // Drawn apart from `rng`, so as not to shift the random choices
+            // a seed replays.
+            epoch: Rng::new(!seed).next_u64() as u32,
             own_demand: Vec::new(),
             policy: PartitionPolicy::default(),
             sizes: SizeHistory::new(hold_of(PartitionPolicy::default())),
             held_size: 0,
+            quorum_size: 1,
             floored_until: 0,
             joined_at: None,
             last_heard: BTreeMap::new(),
@@ -517,15 +523,15 @@ impl Node {
         for &update in message.updates() {
             self.learn(update, now);
         }
-        // Demand comes first hand and whole: a message from a peer without
-        // its own report says it has no hot key.
-        match message
+        // Demand comes first hand and whole, in every message; an empty
+        // report says the peer has no hot key. A message with no report
+        // has no round to order it by, and changes nothing.
+        if let Some(report) = message
             .demand()
             .iter()
             .find(|report| report.origin == from.get())
         {
-            Some(report) => self.peer_demand.apply(from, report, now),
-            None => self.peer_demand.forget(from),
+            self.peer_demand.apply(from, report, now);
         }
         match message {
             Message::Ping { seq, .. } => self.ack(from, seq),
@@ -655,7 +661,8 @@ impl Node {
     // Spec §5.1. HoldDown holds the cluster size here, and the demand of
     // the peers that left in follow_changes. Quorum caps every key at the
     // floor while this node sees no majority of the cluster it knows: the
-    // live peers, suspects not counted, against all of them, the dead too.
+    // live peers, suspects not counted, against all of them, the dead too,
+    // and those dead long enough to be forgotten as well.
     //
     // A node that regains its quorum stays at the floor until every peer
     // has had time to hear it: the majority forgot its demand during the
@@ -668,19 +675,23 @@ impl Node {
             self.joined_at = Some(now);
         }
 
-        if self.policy == PartitionPolicy::Quorum {
-            let alive = 1 + self
-                .members
-                .peers()
-                .iter()
-                .filter(|&&peer| self.members.status(peer) == Some(Status::Alive))
-                .count();
-            let known = size + self.members.dead().count();
-            if !partition::has_quorum(alive, known) {
-                let heard_within =
-                    peer_demand::stale_after_rounds(known) * self.swim.protocol_period;
-                self.floored_until = now + heard_within;
-            }
+        // The dead are forgotten after tombstone_ttl, and a minority that
+        // forgot them would take itself for the whole cluster. So the size a
+        // majority is counted against grows at once but shrinks only while
+        // this node has a majority of it.
+        let alive = 1 + self
+            .members
+            .peers()
+            .iter()
+            .filter(|&&peer| self.members.status(peer) == Some(Status::Alive))
+            .count();
+        let known = size + self.members.dead().count();
+        let counted = known.max(self.quorum_size);
+        let quorum = partition::has_quorum(alive, counted);
+        self.quorum_size = if quorum { known } else { counted };
+        if self.policy == PartitionPolicy::Quorum && !quorum {
+            let heard_within = peer_demand::stale_after_rounds(counted) * self.swim.protocol_period;
+            self.floored_until = now + heard_within;
         }
         self.refresh_cap(now);
     }
@@ -710,9 +721,7 @@ impl Node {
             caps.push(floor(self.allocation_size()));
         }
         if self.policy == PartitionPolicy::Quorum && now < self.floored_until {
-            caps.push(floor(
-                self.members.cluster_size() + self.members.dead().count(),
-            ));
+            caps.push(floor(self.quorum_size));
         }
         self.limiter.set_cap(caps.into_iter().reduce(f64::min));
     }
@@ -840,13 +849,12 @@ impl Node {
     }
 
     // Every message carries our own demand, and only ours: demand is
-    // exchanged first hand (spec §10.8). Nothing to report, nothing sent.
+    // exchanged first hand (spec §10.8). With no hot key the report is
+    // empty, not left out: its round orders it against the older ones.
     fn outgoing_demand(&self) -> Vec<DemandReport> {
-        if self.own_demand.is_empty() {
-            return Vec::new();
-        }
         vec![DemandReport {
             origin: self.members.local().get(),
+            epoch: self.epoch,
             round: self.round_number,
             keys: self.own_demand.clone(),
         }]
@@ -986,6 +994,15 @@ mod tests {
             node.check(KEY, 0);
         }
         5 * PERIOD
+    }
+
+    fn empty_report(n: &Node) -> Vec<DemandReport> {
+        vec![DemandReport {
+            origin: LOCAL.get(),
+            epoch: n.epoch,
+            round: 0,
+            keys: Vec::new(),
+        }]
     }
 
     fn own_report(message: &Message) -> &DemandReport {
@@ -1151,6 +1168,7 @@ mod tests {
     #[test]
     fn a_ping_is_answered_with_an_ack_of_the_same_seq() {
         let mut n = node();
+        let no_hot_key = empty_report(&n);
         let ping = Message::Ping {
             seq: 77,
             updates: Vec::new(),
@@ -1163,7 +1181,7 @@ mod tests {
                 Message::Ack {
                     seq: 77,
                     updates: vec![news(0, 0, Alive)],
-                    demand: Vec::new(),
+                    demand: no_hot_key,
                 }
             )],
             "liveness is answered even to a stranger"
@@ -1375,6 +1393,7 @@ mod tests {
     #[test]
     fn a_suspect_refutes_in_the_ack_to_the_ping_that_accused_it() {
         let mut n = node();
+        let no_hot_key = empty_report(&n);
         let ping = Message::Ping {
             seq: 5,
             updates: vec![news(0, 0, Suspect)],
@@ -1387,7 +1406,7 @@ mod tests {
                 Message::Ack {
                     seq: 5,
                     updates: vec![news(0, 1, Alive)],
-                    demand: Vec::new(),
+                    demand: no_hot_key,
                 }
             )]
         );
@@ -1808,12 +1827,25 @@ mod tests {
         own_report(&relayed);
     }
 
+    // An empty report, not none: it carries a round, so a late message
+    // cannot undo a newer report (spec §5.2).
     #[test]
-    fn without_hot_keys_no_demand_is_sent() {
+    fn without_hot_keys_an_empty_report_is_sent() {
         let mut n = node_with([1]);
         n.check(KEY, 0);
         let out = sent(n.handle(Event::Tick, 0));
-        assert!(out[0].1.demand().is_empty(), "{out:?}");
+        assert!(own_report(&out[0].1).keys.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn each_start_reports_under_an_epoch_of_its_own() {
+        let epoch = |seed: u64| {
+            let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed);
+            n.introduce(PeerId::new(1), addr(1));
+            let out = sent(n.handle(Event::Tick, 0));
+            own_report(&out[0].1).epoch
+        };
+        assert_ne!(epoch(1), epoch(2));
     }
 
     fn reporting(from: u64, round: u16) -> Message {
@@ -1822,6 +1854,7 @@ mod tests {
             updates: Vec::new(),
             demand: vec![DemandReport {
                 origin: from,
+                epoch: 0,
                 round,
                 keys: vec![KeyDemand {
                     key_hash: KEY,
@@ -1833,10 +1866,24 @@ mod tests {
     }
 
     #[test]
-    fn a_message_without_a_report_means_the_sender_has_no_hot_key() {
+    fn an_empty_report_means_the_sender_has_no_hot_key() {
         let mut n = node_with([1]);
         deliver(&mut n, 1, reporting(1, 3), 0);
         assert!(!n.peer_demand().is_empty());
+
+        let mut cooled = reporting(1, 4);
+        if let Message::Ping { demand, .. } = &mut cooled {
+            demand[0].keys.clear();
+        }
+        deliver(&mut n, 1, cooled, 1);
+        assert!(n.peer_demand().is_empty());
+    }
+
+    // A message with no report has no round to tell how old it is.
+    #[test]
+    fn a_message_without_a_report_changes_nothing() {
+        let mut n = node_with([1]);
+        deliver(&mut n, 1, reporting(1, 3), 0);
 
         let silent = Message::Ping {
             seq: 8,
@@ -1844,7 +1891,7 @@ mod tests {
             demand: Vec::new(),
         };
         deliver(&mut n, 1, silent, 1);
-        assert!(n.peer_demand().is_empty());
+        assert!(!n.peer_demand().is_empty());
     }
 
     #[test]
@@ -2180,6 +2227,59 @@ mod tests {
         assert_eq!(cold_rate_after_round(&mut n, buried), 20.0);
     }
 
+    // Forgetting the dead must not hand the minority a majority of itself:
+    // it cannot tell a split from a death, so it keeps counting them.
+    #[test]
+    fn a_node_without_a_quorum_stays_at_the_floor_after_the_dead_are_forgotten() {
+        let (mut n, buried) = abandoned(PartitionPolicy::Quorum);
+        let mut now = buried;
+        while n.members().dead().count() > 0 {
+            now += TICK;
+            n.handle(Event::Tick, now);
+        }
+        assert_eq!(cold_rate_after_round(&mut n, now), 20.0, "R × β / 5");
+    }
+
+    // Ticks until `until`, answering the probes to the `answering` peers;
+    // the others are gone.
+    fn run_answering(n: &mut Node, answering: &[u64], from: Nanos, until: Nanos) {
+        let mut now = from;
+        while now < until {
+            now += TICK;
+            for (peer, message) in sent(n.handle(Event::Tick, now)) {
+                if let Message::Ping { seq, .. } = message
+                    && answering.contains(&peer.get())
+                {
+                    let answer = Message::Ack {
+                        seq,
+                        updates: vec![news(peer.get(), 0, Alive)],
+                        demand: Vec::new(),
+                    };
+                    deliver(n, peer.get(), answer, now + 1);
+                }
+            }
+        }
+    }
+
+    // A majority may shrink the cluster it counts: a cluster scaled down
+    // less than half at a time keeps its quorum all the way.
+    #[test]
+    fn a_cluster_shrunk_a_minority_at_a_time_keeps_its_quorum() {
+        let mut n = node_with([1, 2, 3, 4]);
+        n.set_partition_policy(PartitionPolicy::Quorum);
+        // 3 and 4 go for good: three of five, then, once they are
+        // forgotten, a cluster of three.
+        let forgotten = SWIM.suspicion_timeout + SWIM.tombstone_ttl + 10 * PERIOD;
+        run_answering(&mut n, &[1, 2], 0, forgotten);
+        assert_eq!(n.members().dead().count(), 0);
+
+        // Then 2 goes as well: two of three.
+        let end = forgotten + SWIM.suspicion_timeout + 10 * PERIOD;
+        run_answering(&mut n, &[1], forgotten, end);
+        assert_eq!(n.cluster_size(), 2);
+        assert_eq!(cold_rate_after_round(&mut n, end), 250.0, "α × R / 2");
+    }
+
     #[test]
     fn a_member_heard_of_through_gossip_is_reachable() {
         let mut n = node_with([1]);
@@ -2249,6 +2349,7 @@ mod tests {
         let mut n = node_with([1]);
         let report = |origin: u64| DemandReport {
             origin,
+            epoch: 0,
             round: 3,
             keys: vec![KeyDemand {
                 key_hash: KEY,

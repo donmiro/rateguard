@@ -342,7 +342,11 @@ impl Node {
                 {
                     self.gossip.push(dead);
                 }
-                self.members.forget_dead(now, self.swim.tombstone_ttl);
+                if self.members.forget_dead(now, self.swim.tombstone_ttl) > 0 {
+                    let members = &self.members;
+                    self.last_heard
+                        .retain(|&peer, _| members.status(peer).is_some());
+                }
                 self.relays.retain(|_, relay| relay.expires_at > now);
                 if now >= self.next_round_at {
                     self.round(now);
@@ -519,9 +523,13 @@ impl Node {
         let Ok(message) = proto::decode(bytes) else {
             return;
         };
-        self.last_heard.insert(from, now);
         for &update in message.updates() {
             self.learn(update, now);
+        }
+        // Only members are heard of: a stranger that does not introduce
+        // itself would grow the table without bound.
+        if self.members.status(from).is_some() {
+            self.last_heard.insert(from, now);
         }
         // Demand comes first hand and whole, in every message; an empty
         // report says the peer has no hot key. A message with no report
@@ -1892,6 +1900,39 @@ mod tests {
         };
         deliver(&mut n, 1, silent, 1);
         assert!(!n.peer_demand().is_empty());
+    }
+
+    // Pods come and go, each under a new address and so a new ID: what the
+    // node remembers of them must go once the member table forgets them.
+    #[test]
+    fn members_come_and_go_and_leave_no_trace() {
+        let mut n = node();
+        let mut now = 0;
+        for peer in 1..=20 {
+            let hello = Message::Ping {
+                seq: 1,
+                updates: vec![news(peer, 0, Alive)],
+                demand: Vec::new(),
+            };
+            deliver(&mut n, peer, hello, now);
+            while n.members().status(PeerId::new(peer)).is_some() {
+                now += TICK;
+                n.handle(Event::Tick, now);
+            }
+        }
+        assert!(n.last_heard.is_empty(), "{:?}", n.last_heard);
+    }
+
+    #[test]
+    fn a_stranger_that_does_not_introduce_itself_leaves_no_trace() {
+        let mut n = node_with([1]);
+        let anonymous = Message::Ping {
+            seq: 1,
+            updates: Vec::new(),
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 9, anonymous, 0);
+        assert!(!n.last_heard.contains_key(&PeerId::new(9)));
     }
 
     #[test]

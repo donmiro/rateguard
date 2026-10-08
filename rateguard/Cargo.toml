@@ -1,13 +1,18 @@
 [package]
 name = "rateguard"
-version = "0.1.0"
-edition = "2024"
-license.workspace = true
 description = "Distributed rate limiting without a datastore: one global limit, enforced locally"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["rate-limit", "rate-limiter", "distributed", "gossip", "tokio"]
+categories = ["network-programming", "web-programming", "concurrency"]
 
 [dependencies]
-rateguard-core = { path = "../rateguard-core" }
-rateguard-proto = { path = "../rateguard-proto" }
+rateguard-core = { version = "0.1.0", path = "../rateguard-core" }
+rateguard-proto = { version = "0.1.0", path = "../rateguard-proto" }
 tokio = { version = "1", features = ["net", "rt", "time", "macros"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
@@ -20,6 +25,8 @@ turmoil = ["dep:turmoil"]
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time", "macros", "test-util"] }
 criterion = "0.8"
+# examples/axum.rs, the middleware of the README.
+axum = "0.8"
 
 [[bench]]
 name = "check"

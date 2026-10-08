@@ -7,10 +7,9 @@
 whole fleet, with no Redis, no central service, and no network call on the
 request path.**
 
-> **Status: not released yet.** The core, the simulator and the `rateguard`
-> runtime with the `Guard` API below are done and tested; benchmarks, the
-> accuracy report and the API documentation are next. Nothing is published on
-> crates.io yet.
+> **Status: not released yet.** The core, the simulator, the `rateguard`
+> runtime and its benchmarks are done and tested; the accuracy report is next.
+> Nothing is published on crates.io yet.
 
 ```rust
 use rateguard::Guard;
@@ -62,7 +61,7 @@ if guard.check("api:tenant-42").is_allowed() {
 rateguard = "0.1"
 ```
 
-Requires Rust 1.85 or newer (2024 edition).
+Requires Rust 1.88 or newer (2024 edition).
 
 ## Usage
 
@@ -124,9 +123,15 @@ a key lives in the table depends on a secret random to each instance.
 
 ### With `axum`
 
+Runnable as `cargo run -p rateguard --example axum`.
+
 ```rust
-use axum::{extract::State, http::{header, StatusCode}, middleware::Next,
-           response::{IntoResponse, Response}, extract::Request};
+use axum::{
+    extract::{Request, State},
+    http::{StatusCode, header},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use rateguard::{Decision, Guard};
 
 async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Response {
@@ -136,7 +141,11 @@ async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Res
         Decision::Allow => next.run(req).await,
         Decision::Deny { retry_after } => (
             StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.as_secs().max(1).to_string())],
+            // Whole seconds, rounded up: rounding down invites an early retry.
+            [(
+                header::RETRY_AFTER,
+                retry_after.as_millis().div_ceil(1000).max(1).to_string(),
+            )],
         )
             .into_response(),
     }
@@ -148,14 +157,14 @@ async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Res
 | Option | Default | Meaning |
 |---|---|---|
 | `limit(rps)` | required | Requests per second per key, across the entire fleet |
-| `burst(n)` | `limit / 20`, at least 1 | How much of the limit may be spent instantaneously |
+| `burst(n)` | `limit / 20`, at least 1 | Requests one instance may admit back to back, on top of its share. Per instance: the fleet as a whole may admit `R` plus a burst on each. At most 16,777,215; `0` is taken as 1 |
 | `bind(addr)` | required | UDP address for gossip, as `ip:port` |
 | `advertise(addr)` | the `bind` address | Where the other instances reach this one; required when binding to `0.0.0.0` or `::`. In Kubernetes, the pod IP |
 | `seeds([..])` | `[]` | Peers to join through, as `ip:port` (no DNS names yet); any live member is enough |
 | `partition_policy(p)` | `HoldDown(10s)` | Behaviour when the cluster splits |
 | `protocol_period(d)` | `200 ms` | How often nodes exchange membership and demand |
 | `hot_keys(n)` | `64` | How many keys may be coordinated at once, at most 64 |
-| `tracked_keys(n)` | `4096` | Keys one instance keeps state for at once; the table holds twice as many |
+| `tracked_keys(n)` | `4096` | Keys one instance keeps state for at once, at least `hot_keys` and at most 1,048,576; the table holds twice as many |
 
 ### Without the network
 
@@ -204,7 +213,13 @@ match node.check(key_hash, now_nanos) {
 for Action::SendTo { peer, bytes } in node.handle(Event::Tick, now_nanos) {
     send(*peer, bytes);
 }
-node.handle(Event::MessageReceived { from, bytes: &datagram }, now_nanos);
+node.handle(
+    Event::MessageReceived {
+        from,
+        bytes: &datagram,
+    },
+    now_nanos,
+);
 ```
 
 ## How it works
@@ -339,6 +354,14 @@ same enforcement. And if your gossip traffic would cross an untrusted network,
 note that the protocol assumes a trusted one: it is neither encrypted nor
 authenticated.
 
+## Security
+
+The gossip protocol assumes a trusted network. Datagrams are neither encrypted
+nor authenticated: anyone who can reach the UDP port can join the cluster,
+announce demand that shifts the shares, or declare members dead. Keep the port
+on a private network, or behind a firewall that lets in only your own
+instances. Authenticated gossip is planned.
+
 ## FAQ
 
 **Is there a coordinator, leader, or master node?** No. Every node runs the same
@@ -349,9 +372,23 @@ loss stops the cluster.
 periods and the remaining nodes redistribute its share among themselves. Until
 that happens, the fleet is under the limit rather than over it.
 
-**What happens when a node restarts?** It rejoins through its seeds and starts
-on the cold-key share until its demand is observed again. A restart does not
-hand it a fresh full quota.
+**What happens when a node restarts?** It rejoins through its seeds. Until it
+has, and until its peers have heard its demand, every key it serves is held at
+a floor, `R × β` split over the members it knows of (under `Optimistic`,
+before it rejoins, at the cold-key share instead). A restart does not hand it a fresh full quota.
+
+**And when a node stops on purpose, in a rolling deploy?** Its peers cannot
+tell a stop from a crash: there is no goodbye message. They notice within the
+suspicion timeout (six seconds), and under the default `HoldDown` they keep
+the departed node's share out of use for the hold, ten seconds. A deploy that
+restarts instances one by one therefore runs a little under the limit while it
+lasts, never over it. An instance restarted on the same address and back
+within the suspicion timeout is never declared dead at all.
+
+**How do I health-check it?** `guard.is_running()` turns false if the
+background task has died, which is a bug; the instance then holds every key at
+the floor `R × β / N` rather than at shares its peers no longer count.
+`guard.cluster_size()` tells you how many members it sees, itself included.
 
 **Does clock skew matter?** No. Nodes never compare timestamps with each other;
 each uses only its own monotonic clock, and what travels between them are demand

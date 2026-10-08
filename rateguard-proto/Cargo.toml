@@ -1,8 +1,13 @@
 [package]
 name = "rateguard-proto"
-version = "0.1.0"
-edition = "2024"
+description = "The wire format of rateguard: SWIM membership and demand reports over UDP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["rate-limit", "swim", "gossip", "protocol"]
+categories = ["encoding", "network-programming"]
 
 [dependencies]
 postcard = { version = "1", default-features = false, features = ["alloc"] }

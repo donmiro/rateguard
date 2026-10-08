@@ -41,3 +41,14 @@ jobs:
           LOOM_MAX_PREEMPTIONS: 3
       - name: Turmoil
         run: cargo test -p rateguard --features turmoil --locked --test turmoil
+
+  # The oldest Rust the crates promise to build on (rust-version): 1.88,
+  # for let chains.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --workspace --all-targets --locked

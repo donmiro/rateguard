@@ -13,7 +13,8 @@ follow [Semantic Versioning](https://semver.org/).
   is looked up when the node starts and again while it runs: every reconnect
   interval while the node is alone, every 30 s once it has peers. Until
   it joins, the node holds every key at the floor, even while the name
-  resolves to nobody.
+  resolves to nobody; a name that resolves to the node alone three lookups
+  in a row makes it a fleet of one, with the whole limit.
 - `rateguard-core`: `Node::remove_seed` and `Node::expect_peers`.
 
 ## [0.1.0] - 2026-10-08

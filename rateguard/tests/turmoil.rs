@@ -162,17 +162,18 @@ fn three_nodes_share_one_limit() {
     assert_shared(&logs, 20..29);
 }
 
-// All three start at once and are listed only once ready, three seconds
-// later: every first lookup finds nobody, and only looking again brings
-// the fleet together.
-#[test]
-fn a_fleet_started_at_once_finds_itself_by_name() {
+// Hosts behind one name, all started at once and listed only once ready,
+// three seconds later: every first lookup finds nobody.
+fn listed(names: &[&'static str]) -> (turmoil::Sim<'static>, Vec<Log>) {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(40))
         .build();
     let service = Service::default();
-    let logs: Vec<Log> = (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
-    for (name, log) in ["a", "b", "c"].into_iter().zip(&logs) {
+    let logs: Vec<Log> = names
+        .iter()
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
+    for (&name, log) in names.iter().zip(&logs) {
         let (log, service) = (log.clone(), service.clone());
         sim.host(name, move || {
             let (log, service) = (log.clone(), service.clone());
@@ -196,14 +197,33 @@ fn a_fleet_started_at_once_finds_itself_by_name() {
         });
     }
     wait(&mut sim, Duration::from_secs(30));
+    (sim, logs)
+}
+
+// Only looking again brings the fleet together; never over meanwhile, not
+// even before anyone is listed: a node with nobody behind its name yet is
+// waiting to join, not a cluster of one.
+#[test]
+fn a_fleet_started_at_once_finds_itself_by_name() {
+    let (mut sim, logs) = listed(&["a", "b", "c"]);
     sim.run().unwrap();
-    // Never over, not even before anyone is listed: a node with nobody
-    // behind its name yet is waiting to join, not a cluster of one.
     for second in 0..29 {
         let total = total(&logs, second);
         assert!(total <= CEILING, "second {second}: {total} admitted");
     }
     assert_shared(&logs, 20..29);
+}
+
+// One replica, its name resolving to itself alone: a fleet of one, which
+// gets the whole limit, not a node waiting at the floor for peers.
+#[test]
+fn a_single_replica_behind_a_name_gets_the_whole_limit() {
+    let (mut sim, logs) = listed(&["a"]);
+    sim.run().unwrap();
+    for second in 15..29 {
+        let total = total(&logs, second);
+        assert!(total >= 390, "second {second}: {total} admitted of 400");
+    }
 }
 
 #[test]

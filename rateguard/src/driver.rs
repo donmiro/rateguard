@@ -75,6 +75,12 @@ pub(crate) async fn run<T: Transport>(
 /// all at once may find nobody behind the name at first.
 const RESOLVE_EVERY: Duration = Duration::from_secs(30);
 
+/// How many lookups in a row must find this node alone behind its names
+/// before it takes the fleet to be itself alone: about 4 s at the default
+/// reconnect interval. A fleet whose replicas become ready further apart
+/// than that runs over the limit until they find each other.
+const ALONE_AFTER: u32 = 3;
+
 /// What each name among the seeds resolved to, in order, `None` where the
 /// lookup failed.
 type Found = Vec<Option<Vec<SocketAddr>>>;
@@ -132,6 +138,8 @@ pub(crate) struct Names {
     kept: BTreeSet<PeerId>,
     /// Seeds added from names.
     added: BTreeSet<PeerId>,
+    /// Lookups in a row that found this node and nobody else.
+    alone: u32,
 }
 impl Names {
     pub fn new(local: PeerId) -> Self {
@@ -141,6 +149,7 @@ impl Names {
             last: Vec::new(),
             kept: BTreeSet::new(),
             added: BTreeSet::new(),
+            alone: 0,
         }
     }
 
@@ -165,6 +174,26 @@ impl Names {
     }
 
     fn update(&mut self, node: &mut Node, found: Found) {
+        // A replica running alone finds itself behind its name and nobody
+        // else, and would wait for peers for good. Nobody at all, or a
+        // failed lookup, is no such sign: a fleet started at once may not
+        // be listed yet.
+        let only_me = found.iter().all(|found| {
+            found.as_ref().is_some_and(|found| {
+                found
+                    .iter()
+                    .all(|&address| crate::key::peer_id(address.into()) == self.local)
+            })
+        }) && found.iter().flatten().any(|found| !found.is_empty());
+        self.alone = if only_me {
+            self.alone.saturating_add(1)
+        } else {
+            0
+        };
+        if self.alone == ALONE_AFTER {
+            node.expect_peers(false);
+        }
+
         self.last.resize(found.len(), Vec::new());
         for (last, found) in self.last.iter_mut().zip(found) {
             if let Some(found) = found {
@@ -371,6 +400,32 @@ mod tests {
         for host in [3, 4] {
             assert_eq!(node.address(id(host)), None, "{host}");
         }
+    }
+
+    #[test]
+    fn a_node_alone_behind_its_name_stops_waiting_for_peers() {
+        // What a node that takes itself for the whole fleet starts keys at.
+        let alone = node_at(1).new_key_quota();
+        let mut node = node_at(1);
+        node.expect_peers(true);
+        let mut names = Names::new(id(1));
+
+        // Nobody listed yet, a failed lookup, another replica: none counts,
+        // and the last starts the count again.
+        for found in [
+            vec![Some(vec![at(1)])],
+            vec![Some(vec![at(1)])],
+            vec![Some(Vec::new())],
+            vec![None],
+            vec![Some(vec![at(1), at(2)])],
+            vec![Some(vec![at(1)])],
+            vec![Some(vec![at(1)])],
+        ] {
+            names.update(&mut node, found);
+            assert_ne!(node.new_key_quota(), alone, "still waiting");
+        }
+        names.update(&mut node, vec![Some(vec![at(1)])]);
+        assert_eq!(node.new_key_quota(), alone, "a fleet of one");
     }
 
     #[test]

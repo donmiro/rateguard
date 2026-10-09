@@ -255,12 +255,13 @@ impl Node {
         self.refresh_cap(self.last_now);
     }
 
-    /// Waits to join even with no seed to join through yet: for seeds still
-    /// to be found, such as a DNS name nobody is behind yet. Until the node
-    /// joins it holds every key at the floor, as it does with seeds, rather
-    /// than take itself for a cluster of one.
-    pub fn expect_peers(&mut self) {
-        self.expects_peers = true;
+    /// Whether to wait to join even with no seed to join through yet: for
+    /// seeds still to be found, such as a DNS name nobody is behind yet.
+    /// Until the node joins it holds every key at the floor, as it does with
+    /// seeds, rather than take itself for a cluster of one. `false` once it
+    /// turns out to be the whole fleet.
+    pub fn expect_peers(&mut self, expected: bool) {
+        self.expects_peers = expected;
         self.refresh_cap(self.last_now);
     }
 
@@ -2519,18 +2520,20 @@ mod tests {
     #[test]
     fn a_node_expecting_peers_waits_with_no_seed_at_all() {
         let mut n = node();
-        n.expect_peers();
+        n.expect_peers(true);
         // R × β over itself alone; the test config has β = 0.1.
         assert_eq!(n.new_key_quota(), Quota::new(100, config().burst));
         n.add_seed(PeerId::new(1), addr(1));
         n.remove_seed(PeerId::new(1));
         assert_eq!(n.new_key_quota(), Quota::new(100, config().burst), "still");
+        n.expect_peers(false);
+        assert_eq!(cold_rate_after_round(&mut n, 0), 500.0, "a fleet of one");
     }
 
     #[test]
     fn a_node_expecting_peers_stops_waiting_once_it_joins() {
         let mut n = node();
-        n.expect_peers();
+        n.expect_peers(true);
         n.add_seed(PeerId::new(5), addr(5));
         let (_, seq) = round(&mut n, 0);
         let answer = Message::Ack {

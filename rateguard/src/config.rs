@@ -96,7 +96,11 @@ impl Builder {
     /// whole fleet, such as a Kubernetes headless service, keeps up with
     /// instances that come and go. Until the node joins someone, every key
     /// is held at the floor `R × β`, even while a name resolves to nobody
-    /// yet: an instance meant to run alone takes no seeds.
+    /// yet. Once its names resolve to this node alone three lookups in a
+    /// row, about 4 s, it takes itself for the whole fleet, a single
+    /// replica, and gets the whole limit: replicas that become ready
+    /// further apart than that may admit over the limit until they find
+    /// each other.
     pub fn seeds<S: Into<String>>(mut self, seeds: impl IntoIterator<Item = S>) -> Self {
         self.seeds = seeds.into_iter().map(Into::into).collect();
         self
@@ -311,7 +315,7 @@ fn start<T: crate::Transport>(
     // A name may have nobody behind it yet: the node waits to join all the
     // same, rather than take itself for a cluster of one meanwhile.
     if !settings.names.is_empty() {
-        node.expect_peers();
+        node.expect_peers(true);
     }
 
     let shared = Arc::new(crate::guard::Shared {

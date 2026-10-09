@@ -17,6 +17,12 @@ follow [Semantic Versioning](https://semver.org/).
   in a row makes it a fleet of one, with the whole limit.
 - `rateguard-core`: `Node::remove_seed` and `Node::expect_peers`.
 
+### Fixed
+
+- DNS seed lookups time out after 5 s per name, so a stalled lookup cannot
+  indefinitely block the other names or further discovery rounds. Failed
+  and timed-out lookups preserve the name's last known addresses.
+
 ## [0.1.0] - 2026-10-08
 
 The first release.

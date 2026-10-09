@@ -75,6 +75,11 @@ pub(crate) async fn run<T: Transport>(
 /// all at once may find nobody behind the name at first.
 const RESOLVE_EVERY: Duration = Duration::from_secs(30);
 
+/// The most time spent on one name per round: a stalled lookup must not
+/// keep the other names from supplying seeds. A timeout keeps that name's
+/// last addresses, just like a failed lookup.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How many lookups in a row must find this node alone behind its names
 /// before it takes the fleet to be itself alone: about 4 s at the default
 /// reconnect interval. A fleet whose replicas become ready further apart
@@ -99,7 +104,8 @@ pub(crate) async fn resolve<T: Transport>(
         let lookups = async {
             let mut all = Vec::with_capacity(names.len());
             for (host, port) in &names {
-                all.push(transport.resolve(host, *port).await.ok());
+                let lookup = tokio::time::timeout(RESOLVE_TIMEOUT, transport.resolve(host, *port));
+                all.push(lookup.await.ok().and_then(Result::ok));
             }
             all
         };
@@ -372,6 +378,69 @@ mod tests {
 
     fn id(host: u8) -> PeerId {
         crate::key::peer_id(Address::from(at(host)))
+    }
+
+    struct SlowLookup {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl Transport for SlowLookup {
+        async fn send_to(&self, _: &[u8], _: SocketAddr) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+        async fn recv_from(&self, _: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn resolve(&self, host: &str, _: u16) -> std::io::Result<Vec<SocketAddr>> {
+            match host {
+                "slow.svc" if self.calls.fetch_add(1, Ordering::Relaxed) == 0 => Ok(vec![at(2)]),
+                "slow.svc" => std::future::pending().await,
+                "working.svc" => Ok(vec![at(3)]),
+                _ => panic!("unexpected name: {host}"),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_lookup_preserves_old_seeds_and_does_not_block_other_names() {
+        let guard = crate::Guard::builder()
+            .bind("10.0.0.1:7946")
+            .limit(100)
+            .spawn_on(HungSend)
+            .unwrap();
+        let (found, mut lookups) = mpsc::channel(1);
+        let task = tokio::spawn(resolve(
+            Arc::new(SlowLookup {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            vec![("slow.svc".into(), 7946), ("working.svc".into(), 7946)],
+            Arc::downgrade(&guard.shared),
+            Duration::from_secs(2),
+            found,
+        ));
+        let mut node = node_at(1);
+        node.expect_peers(true);
+        let mut names = Names::new(id(1));
+        let first = lookups.recv().await.unwrap();
+        assert_eq!(first, vec![Some(vec![at(2)]), Some(vec![at(3)])]);
+        names.update(&mut node, first);
+
+        // Each later round must finish despite the first name hanging.
+        // Its last address remains a seed, and the working name is still
+        // looked up; a timeout is not an empty DNS answer.
+        for _ in 0..2 {
+            let next = tokio::time::timeout(Duration::from_secs(8), lookups.recv())
+                .await
+                .expect("a hung lookup must not hold the whole round")
+                .unwrap();
+            assert_eq!(next, vec![None, Some(vec![at(3)])]);
+            names.update(&mut node, next);
+            for host in [2, 3] {
+                assert_eq!(node.address(id(host)), Some(at(host).into()));
+            }
+        }
+
+        drop(lookups);
+        task.await.unwrap();
     }
 
     #[test]

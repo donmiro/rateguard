@@ -94,10 +94,12 @@ impl Builder {
     /// is enough. A name is looked up when the node starts and again while
     /// it runs, every address it resolves to a seed: a DNS name for the
     /// whole fleet, such as a Kubernetes headless service, keeps up with
-    /// instances that come and go. Until the node joins someone, every key
-    /// is held at the floor `R × β`, even while a name resolves to nobody
-    /// yet. Once its names resolve to this node alone three lookups in a
-    /// row, about 4 s, it takes itself for the whole fleet, a single
+    /// instances that come and go. Each lookup has a 5 s timeout; failed
+    /// or timed-out lookups keep that name's last addresses. Until the node
+    /// joins someone, every key is held at the floor `R × β`, even while a
+    /// name resolves to nobody yet. Once its names resolve to this node
+    /// alone three lookups in a row, about 4 s, it takes itself for the
+    /// whole fleet, a single
     /// replica, and gets the whole limit: replicas that become ready
     /// further apart than that may admit over the limit until they find
     /// each other.

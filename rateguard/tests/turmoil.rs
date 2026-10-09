@@ -63,22 +63,55 @@ fn node(
             } else {
                 builder.spawn_on(socket)?
             };
-            let mut ticker = tokio::time::interval(Duration::from_micros(2500));
-            loop {
-                ticker.tick().await;
-                if guard.check("k").is_allowed() {
-                    // Simulation time, not the host's: a restarted host
-                    // starts its own clock again.
-                    let second = turmoil::sim_elapsed().unwrap().as_secs();
-                    let mut log = log.lock().unwrap();
-                    match log.iter_mut().find(|(s, _)| *s == second) {
-                        Some((_, n)) => *n += 1,
-                        None => log.push((second, 1)),
-                    }
-                }
-            }
+            serve(guard, log).await
         }
     });
+}
+
+async fn serve(guard: Guard, log: Log) -> turmoil::Result {
+    let mut ticker = tokio::time::interval(Duration::from_micros(2500));
+    loop {
+        ticker.tick().await;
+        if guard.check("k").is_allowed() {
+            // Simulation time, not the host's: a restarted host starts its
+            // own clock again.
+            let second = turmoil::sim_elapsed().unwrap().as_secs();
+            let mut log = log.lock().unwrap();
+            match log.iter_mut().find(|(s, _)| *s == second) {
+                Some((_, n)) => *n += 1,
+                None => log.push((second, 1)),
+            }
+        }
+    }
+}
+
+// A headless service: its name resolves to the hosts listed in it, the way
+// Kubernetes lists the pods that are ready.
+type Service = Arc<Mutex<Vec<&'static str>>>;
+
+struct Listed(UdpSocket, Service);
+impl Transport for Listed {
+    fn send_to(
+        &self,
+        bytes: &[u8],
+        to: SocketAddr,
+    ) -> impl Future<Output = io::Result<usize>> + Send {
+        self.0.send_to(bytes, to)
+    }
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send {
+        self.0.recv_from(buf)
+    }
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        assert_eq!(host, "gossip.svc");
+        let listed = self.1.lock().unwrap().clone();
+        Ok(listed
+            .into_iter()
+            .map(|host| SocketAddr::new(turmoil::lookup(host), port))
+            .collect())
+    }
 }
 
 fn cluster(duration: Duration, rewrite_c: bool) -> (turmoil::Sim<'static>, Vec<Log>) {
@@ -127,6 +160,70 @@ fn three_nodes_share_one_limit() {
     wait(&mut sim, Duration::from_secs(30));
     sim.run().unwrap();
     assert_shared(&logs, 20..29);
+}
+
+// Hosts behind one name, all started at once and listed only once ready,
+// three seconds later: every first lookup finds nobody.
+fn listed(names: &[&'static str]) -> (turmoil::Sim<'static>, Vec<Log>) {
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(40))
+        .build();
+    let service = Service::default();
+    let logs: Vec<Log> = names
+        .iter()
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
+    for (&name, log) in names.iter().zip(&logs) {
+        let (log, service) = (log.clone(), service.clone());
+        sim.host(name, move || {
+            let (log, service) = (log.clone(), service.clone());
+            async move {
+                let me = SocketAddr::new(turmoil::lookup(name), PORT);
+                let socket = UdpSocket::bind((IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT)).await?;
+                let guard = Guard::builder()
+                    .bind(format!("0.0.0.0:{PORT}"))
+                    .advertise(me.to_string())
+                    .seeds([format!("gossip.svc:{PORT}")])
+                    .limit(LIMIT)
+                    .burst(BURST)
+                    .partition_policy(PartitionPolicy::HoldDown(Duration::from_secs(60)))
+                    .spawn_on(Listed(socket, service.clone()))?;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    service.lock().unwrap().push(name);
+                });
+                serve(guard, log).await
+            }
+        });
+    }
+    wait(&mut sim, Duration::from_secs(30));
+    (sim, logs)
+}
+
+// Only looking again brings the fleet together; never over meanwhile, not
+// even before anyone is listed: a node with nobody behind its name yet is
+// waiting to join, not a cluster of one.
+#[test]
+fn a_fleet_started_at_once_finds_itself_by_name() {
+    let (mut sim, logs) = listed(&["a", "b", "c"]);
+    sim.run().unwrap();
+    for second in 0..29 {
+        let total = total(&logs, second);
+        assert!(total <= CEILING, "second {second}: {total} admitted");
+    }
+    assert_shared(&logs, 20..29);
+}
+
+// One replica, its name resolving to itself alone: a fleet of one, which
+// gets the whole limit, not a node waiting at the floor for peers.
+#[test]
+fn a_single_replica_behind_a_name_gets_the_whole_limit() {
+    let (mut sim, logs) = listed(&["a"]);
+    sim.run().unwrap();
+    for second in 15..29 {
+        let total = total(&logs, second);
+        assert!(total >= 390, "second {second}: {total} admitted of 400");
+    }
 }
 
 #[test]

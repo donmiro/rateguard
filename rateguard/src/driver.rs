@@ -1,11 +1,15 @@
 //! The background task: the node, the socket and the ticker.
 
+use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use rateguard_core::boundary::{Action, Event, PeerId};
 use rateguard_core::node::Node;
+use rateguard_proto::Address;
+use tokio::sync::mpsc;
 
 use crate::guard::Shared;
 use crate::transport::Transport;
@@ -25,7 +29,8 @@ pub(crate) fn sender(bytes: &[u8]) -> Option<PeerId> {
 /// tick.
 pub(crate) async fn run<T: Transport>(
     mut node: Node,
-    transport: T,
+    transport: Arc<T>,
+    mut names: Names,
     shared: Weak<Shared>,
     mut ticker: tokio::time::Interval,
 ) {
@@ -56,8 +61,161 @@ pub(crate) async fn run<T: Transport>(
                 let Some(shared) = shared.upgrade() else { return };
                 sync(&mut node, &shared)
             }
+            found = names.next() => {
+                names.update(&mut node, found);
+                Vec::new()
+            }
         };
-        send(&node, &transport, actions, budget).await;
+        send(&node, &*transport, actions, budget).await;
+    }
+}
+
+/// How often the names among the seeds are looked up again once the node
+/// has peers. While it has none, every reconnect interval: a fleet started
+/// all at once may find nobody behind the name at first.
+const RESOLVE_EVERY: Duration = Duration::from_secs(30);
+
+/// How many lookups in a row must find this node alone behind its names
+/// before it takes the fleet to be itself alone: about 4 s at the default
+/// reconnect interval. A fleet whose replicas become ready further apart
+/// than that runs over the limit until they find each other.
+const ALONE_AFTER: u32 = 3;
+
+/// What each name among the seeds resolved to, in order, `None` where the
+/// lookup failed.
+type Found = Vec<Option<Vec<SocketAddr>>>;
+
+/// Looks the names among the seeds up, now and then again, until the node
+/// is gone. On its own task: a lookup may take seconds, the node's rounds
+/// may not.
+pub(crate) async fn resolve<T: Transport>(
+    transport: Arc<T>,
+    names: Vec<(String, u16)>,
+    shared: Weak<Shared>,
+    retry: Duration,
+    found: mpsc::Sender<Found>,
+) {
+    loop {
+        let lookups = async {
+            let mut all = Vec::with_capacity(names.len());
+            for (host, port) in &names {
+                all.push(transport.resolve(host, *port).await.ok());
+            }
+            all
+        };
+        // The node may stop meanwhile; the transport must go with it.
+        let all = tokio::select! {
+            all = lookups => all,
+            _ = found.closed() => return,
+        };
+        if found.send(all).await.is_err() {
+            return;
+        }
+        let Some(alone) = shared
+            .upgrade()
+            .map(|shared| shared.cluster_size.load(Ordering::Relaxed) <= 1)
+        else {
+            return;
+        };
+        let wait = if alone { retry } else { RESOLVE_EVERY };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = found.closed() => return,
+        }
+    }
+}
+
+/// The seeds that come from names: added as their addresses appear,
+/// removed as they go, so that the seed list follows the fleet rather than
+/// grow with every instance it ever had.
+#[derive(Debug)]
+pub(crate) struct Names {
+    local: PeerId,
+    lookups: Option<mpsc::Receiver<Found>>,
+    /// The last addresses of each name, kept through a failed lookup.
+    last: Vec<Vec<SocketAddr>>,
+    /// Seeds given as addresses: never removed.
+    kept: BTreeSet<PeerId>,
+    /// Seeds added from names.
+    added: BTreeSet<PeerId>,
+    /// Lookups in a row that found this node and nobody else.
+    alone: u32,
+}
+impl Names {
+    pub fn new(local: PeerId) -> Self {
+        Self {
+            local,
+            lookups: None,
+            last: Vec::new(),
+            kept: BTreeSet::new(),
+            added: BTreeSet::new(),
+            alone: 0,
+        }
+    }
+
+    /// A seed given as an address, which no lookup removes.
+    pub fn keep(&mut self, seed: PeerId) {
+        self.kept.insert(seed);
+    }
+
+    pub fn listen(&mut self, lookups: mpsc::Receiver<Found>) {
+        self.lookups = Some(lookups);
+    }
+
+    // The next round of lookups; never, if there are no names. Cancel-safe.
+    async fn next(&mut self) -> Found {
+        if let Some(lookups) = &mut self.lookups
+            && let Some(found) = lookups.recv().await
+        {
+            return found;
+        }
+        self.lookups = None;
+        std::future::pending().await
+    }
+
+    fn update(&mut self, node: &mut Node, found: Found) {
+        // A replica running alone finds itself behind its name and nobody
+        // else, and would wait for peers for good. Nobody at all, or a
+        // failed lookup, is no such sign: a fleet started at once may not
+        // be listed yet.
+        let only_me = found.iter().all(|found| {
+            found.as_ref().is_some_and(|found| {
+                found
+                    .iter()
+                    .all(|&address| crate::key::peer_id(address.into()) == self.local)
+            })
+        }) && found.iter().flatten().any(|found| !found.is_empty());
+        self.alone = if only_me {
+            self.alone.saturating_add(1)
+        } else {
+            0
+        };
+        if self.alone == ALONE_AFTER {
+            node.expect_peers(false);
+        }
+
+        self.last.resize(found.len(), Vec::new());
+        for (last, found) in self.last.iter_mut().zip(found) {
+            if let Some(found) = found {
+                *last = found;
+            }
+        }
+        let mut current = BTreeSet::new();
+        for &address in self.last.iter().flatten() {
+            let address = Address::from(address);
+            let id = crate::key::peer_id(address);
+            // A name for the whole fleet resolves to this node too.
+            if id == self.local || self.kept.contains(&id) {
+                continue;
+            }
+            if current.insert(id) && !self.added.contains(&id) {
+                node.add_seed(id, address);
+            }
+        }
+        for &gone in self.added.difference(&current) {
+            node.remove_seed(gone);
+        }
+        self.added = current;
     }
 }
 
@@ -182,6 +340,92 @@ mod tests {
         let start = tokio::time::Instant::now();
         send(&node, &HungSend, actions, budget).await;
         assert_eq!(start.elapsed(), budget);
+    }
+
+    fn node_at(host: u8) -> Node {
+        use rateguard_core::limiter::Config;
+        use rateguard_core::node::SwimConfig;
+
+        let config = Config {
+            limit_per_sec: 100,
+            burst: 5,
+            alpha: 0.5,
+            floor_factor: 0.05,
+            cooldown: 5_000_000_000,
+            hot_set_size: 4,
+            max_tracked_keys: 8,
+            demand_time_constant: 1_000_000_000,
+        };
+        let me = Address::V4([10, 0, 0, host], 7946);
+        Node::new(
+            config,
+            SwimConfig::default(),
+            crate::key::peer_id(me),
+            me,
+            1,
+        )
+    }
+
+    fn at(host: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, host], 7946))
+    }
+
+    fn id(host: u8) -> PeerId {
+        crate::key::peer_id(Address::from(at(host)))
+    }
+
+    #[test]
+    fn seeds_from_names_follow_the_lookups() {
+        let mut node = node_at(1);
+        let mut names = Names::new(id(1));
+        node.add_seed(id(9), at(9).into());
+        names.keep(id(9));
+
+        // Two names; the first resolves to this node too.
+        names.update(&mut node, vec![Some(vec![at(1), at(2)]), Some(vec![at(3)])]);
+        for host in [2, 3, 9] {
+            assert_eq!(node.address(id(host)), Some(at(host).into()), "{host}");
+        }
+
+        // 2 is gone, 4 has come, the second lookup failed: 3 is kept.
+        names.update(&mut node, vec![Some(vec![at(4)]), None]);
+        assert_eq!(node.address(id(2)), None);
+        assert_eq!(node.address(id(3)), Some(at(3).into()));
+        assert_eq!(node.address(id(4)), Some(at(4).into()));
+
+        // A seed given as an address outlives a name that resolved to it.
+        names.update(&mut node, vec![Some(vec![at(9)]), Some(Vec::new())]);
+        names.update(&mut node, vec![Some(Vec::new()), Some(Vec::new())]);
+        assert_eq!(node.address(id(9)), Some(at(9).into()));
+        for host in [3, 4] {
+            assert_eq!(node.address(id(host)), None, "{host}");
+        }
+    }
+
+    #[test]
+    fn a_node_alone_behind_its_name_stops_waiting_for_peers() {
+        // What a node that takes itself for the whole fleet starts keys at.
+        let alone = node_at(1).new_key_quota();
+        let mut node = node_at(1);
+        node.expect_peers(true);
+        let mut names = Names::new(id(1));
+
+        // Nobody listed yet, a failed lookup, another replica: none counts,
+        // and the last starts the count again.
+        for found in [
+            vec![Some(vec![at(1)])],
+            vec![Some(vec![at(1)])],
+            vec![Some(Vec::new())],
+            vec![None],
+            vec![Some(vec![at(1), at(2)])],
+            vec![Some(vec![at(1)])],
+            vec![Some(vec![at(1)])],
+        ] {
+            names.update(&mut node, found);
+            assert_ne!(node.new_key_quota(), alone, "still waiting");
+        }
+        names.update(&mut node, vec![Some(vec![at(1)])]);
+        assert_eq!(node.new_key_quota(), alone, "a fleet of one");
     }
 
     #[test]

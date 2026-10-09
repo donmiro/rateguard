@@ -90,7 +90,17 @@ impl Builder {
         self
     }
 
-    /// Peers to join through, as `ip:port`; any live member is enough.
+    /// Peers to join through, as `ip:port` or `host:port`; any live member
+    /// is enough. A name is looked up when the node starts and again while
+    /// it runs, every address it resolves to a seed: a DNS name for the
+    /// whole fleet, such as a Kubernetes headless service, keeps up with
+    /// instances that come and go. Until the node joins someone, every key
+    /// is held at the floor `R × β`, even while a name resolves to nobody
+    /// yet. Once its names resolve to this node alone three lookups in a
+    /// row, about 4 s, it takes itself for the whole fleet, a single
+    /// replica, and gets the whole limit: replicas that become ready
+    /// further apart than that may admit over the limit until they find
+    /// each other.
     pub fn seeds<S: Into<String>>(mut self, seeds: impl IntoIterator<Item = S>) -> Self {
         self.seeds = seeds.into_iter().map(Into::into).collect();
         self
@@ -189,11 +199,15 @@ impl Builder {
         if self.advertise.is_some() && (advertise.port() == 0 || bind.port() == 0) {
             return Err(Error::AdvertisePortZero);
         }
-        let seeds = self
-            .seeds
-            .iter()
-            .map(|text| text.parse().map_err(|_| Error::BadSeed(text.clone())))
-            .collect::<Result<Vec<SocketAddr>, _>>()?;
+        let mut seeds = Vec::new();
+        let mut names = Vec::new();
+        for text in &self.seeds {
+            match seed(text) {
+                Some(Seed::Address(address)) => seeds.push(address),
+                Some(Seed::Name(host, port)) => names.push((host, port)),
+                None => return Err(Error::BadSeed(text.clone())),
+            }
+        }
 
         let limit = self.limit.ok_or(Error::MissingLimit)?;
         if limit == 0 {
@@ -244,6 +258,7 @@ impl Builder {
             bind,
             advertise,
             seeds,
+            names,
             core,
             swim,
             policy: self.policy.unwrap_or_default().to_core(),
@@ -287,13 +302,20 @@ fn start<T: crate::Transport>(
         local.get() ^ entropy,
     );
     node.set_partition_policy(settings.policy);
+    let mut names = crate::driver::Names::new(local);
     for seed in settings.seeds {
         let address = Address::from(seed);
         let id = crate::key::peer_id(address);
         // One seed list for the whole fleet names the seeds themselves too.
         if id != local {
             node.add_seed(id, address);
+            names.keep(id);
         }
+    }
+    // A name may have nobody behind it yet: the node waits to join all the
+    // same, rather than take itself for a cluster of one meanwhile.
+    if !settings.names.is_empty() {
+        node.expect_peers(true);
     }
 
     let shared = Arc::new(crate::guard::Shared {
@@ -302,9 +324,22 @@ fn start<T: crate::Transport>(
         epoch: tokio::time::Instant::now(),
         running: AtomicBool::new(true),
     });
+    let transport = Arc::new(transport);
+    if !settings.names.is_empty() {
+        let (found, lookups) = tokio::sync::mpsc::channel(1);
+        names.listen(lookups);
+        tokio::spawn(crate::driver::resolve(
+            transport.clone(),
+            settings.names,
+            Arc::downgrade(&shared),
+            Duration::from_nanos(settings.swim.reconnect_interval),
+            found,
+        ));
+    }
     let task = tokio::spawn(crate::driver::run(
         node,
         transport,
+        names,
         Arc::downgrade(&shared),
         ticker,
     ));
@@ -316,12 +351,45 @@ fn start<T: crate::Transport>(
     crate::Guard { shared }
 }
 
+enum Seed {
+    Address(SocketAddr),
+    Name(String, u16),
+}
+
+// An `ip:port`, or a `host:port` whose host is a DNS name: dot-separated
+// labels of letters, digits, `-` and `_`, a trailing dot allowed, the last
+// not all digits, as no top-level domain is: `10.0.0.256` is a mistyped
+// address, not a name. An IPv6 address goes in brackets, `[::1]:7946`, as
+// it does for `bind`.
+fn seed(text: &str) -> Option<Seed> {
+    if let Ok(address) = text.parse() {
+        return Some(Seed::Address(address));
+    }
+    let (host, port) = text.rsplit_once(':')?;
+    let port = port.parse().ok()?;
+    let labels = host.strip_suffix('.').unwrap_or(host);
+    let is_name = !labels.is_empty()
+        && labels.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        && !labels
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last.chars().all(|c| c.is_ascii_digit()));
+    is_name.then(|| Seed::Name(host.to_owned(), port))
+}
+
 /// A builder's settings, checked.
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
     pub bind: SocketAddr,
     pub advertise: SocketAddr,
     pub seeds: Vec<SocketAddr>,
+    /// Seeds given as `host:port`, resolved by the background task.
+    pub names: Vec<(String, u16)>,
     pub core: Config,
     pub swim: SwimConfig,
     pub policy: partition::PartitionPolicy,
@@ -345,7 +413,7 @@ pub enum Error {
     MissingAdvertise,
     /// The advertised address is an unspecified IP: nobody could reach it.
     UnspecifiedAdvertise,
-    /// A seed is not an `ip:port`; DNS names are not supported yet.
+    /// A seed is neither an `ip:port` nor a `host:port`.
     BadSeed(String),
     /// More hot keys than the 64 one datagram can report.
     TooManyHotKeys(usize),
@@ -383,7 +451,7 @@ impl fmt::Display for Error {
                 f,
                 "the advertised address is an unspecified IP, nobody could reach it"
             ),
-            Error::BadSeed(text) => write!(f, "a seed is not an ip:port: {text}"),
+            Error::BadSeed(text) => write!(f, "a seed is not an ip:port or host:port: {text}"),
             Error::TooManyHotKeys(n) => write!(
                 f,
                 "{n} hot keys, between 1 and {} fit",
@@ -486,6 +554,61 @@ mod tests {
     }
 
     #[test]
+    fn seeds_are_addresses_or_names() {
+        let s = valid()
+            .seeds([
+                "10.0.0.2:7946",
+                "[fd00::2]:7946",
+                "node-b:7946",
+                "rateguard.prod.svc.cluster.local.:7946",
+                "_gossip.example.com:1",
+            ])
+            .settings()
+            .unwrap();
+        assert_eq!(
+            s.seeds,
+            [
+                "10.0.0.2:7946".parse().unwrap(),
+                "[fd00::2]:7946".parse().unwrap()
+            ]
+        );
+        let names: Vec<_> = s.names.iter().map(|(h, p)| (h.as_str(), *p)).collect();
+        assert_eq!(
+            names,
+            [
+                ("node-b", 7946),
+                ("rateguard.prod.svc.cluster.local.", 7946),
+                ("_gossip.example.com", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_seed_that_is_no_address_nor_name_is_an_error() {
+        for bad in [
+            "node-b",
+            "node-b:",
+            "node-b:port",
+            "node-b:65536",
+            ":7946",
+            "a..b:7946",
+            ".:7946",
+            "fd00::2:7946",
+            "node b:7946",
+            "http://node-b:7946",
+            "10.0.0.256:7946",
+            "10.0.0:7946",
+            "7946:7946",
+        ] {
+            let error = valid().seeds([bad]).settings().unwrap_err();
+            assert!(
+                matches!(&error, Error::BadSeed(text) if text == bad),
+                "{bad}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn every_bad_configuration_is_an_error() {
         use Error::*;
         type Case = (Builder, fn(&Error) -> bool);
@@ -508,7 +631,7 @@ mod tests {
                 valid().bind("0.0.0.0:7946").advertise("0.0.0.0:7946"),
                 |e| matches!(e, UnspecifiedAdvertise),
             ),
-            (valid().seeds(["node-a:7946"]), |e| matches!(e, BadSeed(_))),
+            (valid().seeds(["node-a"]), |e| matches!(e, BadSeed(_))),
             (valid().hot_keys(65), |e| matches!(e, TooManyHotKeys(65))),
             (valid().tracked_keys(10), |e| matches!(e, TooFewTrackedKeys)),
             (valid().burst(u32::MAX), |e| matches!(e, TooLargeBurst(_))),

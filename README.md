@@ -156,7 +156,7 @@ async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Res
 | `burst(n)` | `limit / 20`, at least 1 | Requests one instance may admit back to back, on top of its share. Per instance: the fleet as a whole may admit `R` plus a burst on each. At most 16,777,215; `0` is taken as 1 |
 | `bind(addr)` | required | UDP address for gossip, as `ip:port` |
 | `advertise(addr)` | the `bind` address | Where the other instances reach this one; required when binding to `0.0.0.0` or `::`. In Kubernetes, the pod IP |
-| `seeds([..])` | `[]` | Peers to join through, as `ip:port` (no DNS names yet); any live member is enough |
+| `seeds([..])` | `[]` | Peers to join through, as `ip:port` or `host:port`; any live member is enough. Names are looked up again while the node runs, so one name for the whole fleet, such as a Kubernetes headless service, keeps up with instances that come and go |
 | `partition_policy(p)` | `HoldDown(10s)` | Behaviour when the cluster splits |
 | `protocol_period(d)` | `200 ms` | How often nodes exchange membership and demand |
 | `hot_keys(n)` | `64` | How many keys may be coordinated at once, at most 64 |

@@ -197,6 +197,12 @@ fn a_fleet_started_at_once_finds_itself_by_name() {
     }
     wait(&mut sim, Duration::from_secs(30));
     sim.run().unwrap();
+    // Never over, not even before anyone is listed: a node with nobody
+    // behind its name yet is waiting to join, not a cluster of one.
+    for second in 0..29 {
+        let total = total(&logs, second);
+        assert!(total <= CEILING, "second {second}: {total} admitted");
+    }
     assert_shared(&logs, 20..29);
 }
 

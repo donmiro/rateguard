@@ -128,6 +128,7 @@ pub struct Node {
     quorum_size: usize,
     floored_until: Nanos,
     joined_at: Option<Nanos>,
+    expects_peers: bool,
     last_heard: BTreeMap<PeerId, Nanos>,
     reported: VecDeque<(Nanos, Vec<KeyDemand>)>,
     recent_shares: BTreeMap<u64, [f64; RISE_DELAY_ROUNDS]>,
@@ -214,6 +215,7 @@ impl Node {
             quorum_size: 1,
             floored_until: 0,
             joined_at: None,
+            expects_peers: false,
             last_heard: BTreeMap::new(),
             reported: VecDeque::new(),
             recent_shares: BTreeMap::new(),
@@ -250,6 +252,15 @@ impl Node {
         if !self.seeds.iter().any(|&(known, _)| known == seed) {
             self.seeds.push((seed, addr));
         }
+        self.refresh_cap(self.last_now);
+    }
+
+    /// Waits to join even with no seed to join through yet: for seeds still
+    /// to be found, such as a DNS name nobody is behind yet. Until the node
+    /// joins it holds every key at the floor, as it does with seeds, rather
+    /// than take itself for a cluster of one.
+    pub fn expect_peers(&mut self) {
+        self.expects_peers = true;
         self.refresh_cap(self.last_now);
     }
 
@@ -795,17 +806,17 @@ impl Node {
     //
     // - Learning (spec §10.5): the peers have not heard this node's demand
     //   yet, so they hand all but its floor out among themselves.
-    // - Waiting to join: a node with seeds and no peer yet does not even
-    //   know N. Taking itself for a cluster of one, it would hand out up to
-    //   R on top of what the cluster it is about to join already shares.
-    //   N is taken as itself and its seeds. Optimistic serves anyway, by
-    //   definition.
+    // - Waiting to join: a node with seeds, or told to expect peers, and no
+    //   peer yet does not even know N. Taking itself for a cluster of one,
+    //   it would hand out up to R on top of what the cluster it is about to
+    //   join already shares. N is taken as itself and its seeds.
+    //   Optimistic serves anyway, by definition.
     // - Quorum without a majority, see apply_policy.
     fn refresh_cap(&mut self, now: Nanos) {
         let config = self.limiter.config();
         let floor = |known: usize| config.limit_per_sec as f64 * config.floor_factor / known as f64;
 
-        let waiting = self.joined_at.is_none() && !self.seeds.is_empty();
+        let waiting = self.joined_at.is_none() && (self.expects_peers || !self.seeds.is_empty());
         let mut caps = Vec::with_capacity(3);
         if waiting && self.policy != PartitionPolicy::Optimistic {
             caps.push(floor(1 + self.seeds.len()));
@@ -2503,6 +2514,33 @@ mod tests {
         n.add_seed(PeerId::new(1), addr(1));
         // R × β over itself and its seed; the test config has β = 0.1.
         assert_eq!(n.new_key_quota(), Quota::new(50, config().burst));
+    }
+
+    #[test]
+    fn a_node_expecting_peers_waits_with_no_seed_at_all() {
+        let mut n = node();
+        n.expect_peers();
+        // R × β over itself alone; the test config has β = 0.1.
+        assert_eq!(n.new_key_quota(), Quota::new(100, config().burst));
+        n.add_seed(PeerId::new(1), addr(1));
+        n.remove_seed(PeerId::new(1));
+        assert_eq!(n.new_key_quota(), Quota::new(100, config().burst), "still");
+    }
+
+    #[test]
+    fn a_node_expecting_peers_stops_waiting_once_it_joins() {
+        let mut n = node();
+        n.expect_peers();
+        n.add_seed(PeerId::new(5), addr(5));
+        let (_, seq) = round(&mut n, 0);
+        let answer = Message::Ack {
+            seq,
+            updates: vec![news(5, 0, Alive)],
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 5, answer, ONE_MS);
+        n.handle(Event::Tick, PERIOD);
+        assert_ne!(n.new_key_quota(), Quota::new(100, config().burst));
     }
 
     #[test]

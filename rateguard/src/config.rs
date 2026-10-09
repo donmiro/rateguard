@@ -94,7 +94,9 @@ impl Builder {
     /// is enough. A name is looked up when the node starts and again while
     /// it runs, every address it resolves to a seed: a DNS name for the
     /// whole fleet, such as a Kubernetes headless service, keeps up with
-    /// instances that come and go.
+    /// instances that come and go. Until the node joins someone, every key
+    /// is held at the floor `R × β`, even while a name resolves to nobody
+    /// yet: an instance meant to run alone takes no seeds.
     pub fn seeds<S: Into<String>>(mut self, seeds: impl IntoIterator<Item = S>) -> Self {
         self.seeds = seeds.into_iter().map(Into::into).collect();
         self
@@ -306,6 +308,11 @@ fn start<T: crate::Transport>(
             names.keep(id);
         }
     }
+    // A name may have nobody behind it yet: the node waits to join all the
+    // same, rather than take itself for a cluster of one meanwhile.
+    if !settings.names.is_empty() {
+        node.expect_peers();
+    }
 
     let shared = Arc::new(crate::guard::Shared {
         table: crate::table::KeyTable::new(settings.core.max_tracked_keys, node.new_key_quota()),
@@ -346,8 +353,10 @@ enum Seed {
 }
 
 // An `ip:port`, or a `host:port` whose host is a DNS name: dot-separated
-// labels of letters, digits, `-` and `_`, a trailing dot allowed. An IPv6
-// address goes in brackets, `[::1]:7946`, as it does for `bind`.
+// labels of letters, digits, `-` and `_`, a trailing dot allowed, the last
+// not all digits, as no top-level domain is: `10.0.0.256` is a mistyped
+// address, not a name. An IPv6 address goes in brackets, `[::1]:7946`, as
+// it does for `bind`.
 fn seed(text: &str) -> Option<Seed> {
     if let Ok(address) = text.parse() {
         return Some(Seed::Address(address));
@@ -361,7 +370,11 @@ fn seed(text: &str) -> Option<Seed> {
                 && label
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        });
+        })
+        && !labels
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last.chars().all(|c| c.is_ascii_digit()));
     is_name.then(|| Seed::Name(host.to_owned(), port))
 }
 
@@ -579,6 +592,9 @@ mod tests {
             "fd00::2:7946",
             "node b:7946",
             "http://node-b:7946",
+            "10.0.0.256:7946",
+            "10.0.0:7946",
+            "7946:7946",
         ] {
             let error = valid().seeds([bad]).settings().unwrap_err();
             assert!(

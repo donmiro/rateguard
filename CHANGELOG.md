@@ -11,8 +11,10 @@ follow [Semantic Versioning](https://semver.org/).
 
 - Seeds given as `host:port`, such as a Kubernetes headless service. A name
   is looked up when the node starts and again while it runs: every reconnect
-  interval while the node is alone, every 30 s once it has peers.
-- `rateguard-core`: `Node::remove_seed`.
+  interval while the node is alone, every 30 s once it has peers. Until
+  it joins, the node holds every key at the floor, even while the name
+  resolves to nobody.
+- `rateguard-core`: `Node::remove_seed` and `Node::expect_peers`.
 
 ## [0.1.0] - 2026-10-08
 

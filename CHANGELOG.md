@@ -7,6 +7,13 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Seeds given as names are looked up concurrently, each given up on after
+  20 s, so a stalled lookup no longer holds up the other names or the
+  rounds after it. A name whose lookup fails or times out keeps its last
+  addresses.
+
 ## [0.1.1] - 2026-10-09
 
 ### Added

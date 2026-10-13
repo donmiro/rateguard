@@ -7,6 +7,18 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `Guard::leave`: an instance shutting down tells its peers, and they take
+  its share within a round, instead of after the suspicion timeout and,
+  under `HoldDown`, the hold. Dropping the last `Guard` leaves too. A deploy
+  or a scale-down no longer runs under the limit for about 16 s per
+  instance. The news is a new message, `Message::Leave`; versions from
+  before it drop the datagram and see the departure as a crash, as before.
+- `rateguard-core`: `Node::leave`, `Node::has_left`, `MemberTable::depart`,
+  `MemberTable::has_departed`, `MemberTable::joined_at`,
+  `SizeHistory::forget_one`.
+
 ### Fixed
 
 - Seeds given as names are looked up concurrently, each given up on after

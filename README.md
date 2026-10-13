@@ -88,7 +88,18 @@ match guard.check("api:tenant-42") {
 `Guard` is cheap to clone and `Send + Sync`. Clone it into every handler, task,
 or piece of state that needs it; all clones share one limiter. `spawn()` needs a
 tokio runtime to run the node in; `check()` does not, and works from any thread.
-The node stops when the last clone is dropped.
+
+When the instance shuts down, say so: the other instances take its share at
+once, instead of first suspecting it and then holding its share for a split
+that is not one.
+
+```rust
+// On SIGTERM, before the last requests drain.
+guard.leave().await;
+```
+
+Dropping the last clone leaves too, if the runtime is still running to send
+the news.
 
 ### Keys
 
@@ -346,6 +357,8 @@ and CI fails if it falls out of date.
 | One-way link, 0 → 1 lost | R | 1.00 R | 1.00 R | 0 | 0 s |
 | GC pause, 5 s on node 4 (the other four) | their shares unchanged | 0.80 R | 0.80 R | 0 | 9 s |
 | Rolling restart, one node every 8 s | ≤ R, no second without service | 1.00 R | 1.00 R | 0 | 2 s |
+| Node 4 crashes for good (the other four) | R once the suspicion and the hold are over | 1.00 R | 1.00 R | 0 | 17 s |
+| Node 4 leaves for good (the other four) | R at once | 1.00 R | 1.00 R | 0 | 1 s |
 | Traffic jumps 100×, cold to hot | R | 1.00 R | 1.00 R | 0 | 3 s |
 | A node joins 10 s late | R | 1.00 R | 1.01 R | 0 | 1 s |
 <!-- accuracy: end -->
@@ -393,7 +406,7 @@ authenticated.
 
 The gossip protocol assumes a trusted network. Datagrams are neither encrypted
 nor authenticated: anyone who can reach the UDP port can join the cluster,
-announce demand that shifts the shares, or declare members dead. Keep the port
+announce demand that shifts the shares, or declare members dead or gone. Keep the port
 on a private network, or behind a firewall that lets in only your own
 instances. Authenticated gossip is planned.
 
@@ -412,13 +425,17 @@ has, and until its peers have heard its demand, every key it serves is held at
 a floor, `R × β` split over the members it knows of (under `Optimistic`,
 before it rejoins, at the cold-key share instead). A restart does not hand it a fresh full quota.
 
-**And when a node stops on purpose, in a rolling deploy?** Its peers cannot
-tell a stop from a crash: there is no goodbye message. They notice within the
-suspicion timeout (six seconds), and under the default `HoldDown` they keep
-the departed node's share out of use for the hold, ten seconds. A deploy that
-restarts instances one by one therefore runs a little under the limit while it
-lasts, never over it. An instance restarted on the same address and back
-within the suspicion timeout is never declared dead at all.
+**And when a node stops on purpose, in a rolling deploy?** If it calls
+`guard.leave()`, or drops its last `Guard` while the runtime still runs, it
+tells its peers it is going, and they take its share within a round: a deploy
+runs at the limit throughout. Requests it still serves afterwards get the
+floor `R × β / N`, which its peers no longer count, so draining ones admit a
+little over the limit. An instance that just stops looks like a crash: its
+peers notice within the suspicion timeout (six seconds), and under the
+default `HoldDown` keep its share out of use for the hold, ten seconds, so
+the fleet runs a little under the limit meanwhile, never over it. Instances
+of a version from before `leave` do not understand the news and treat the
+departure as a crash.
 
 **How do I health-check it?** `guard.is_running()` turns false if the
 background task has died, which is a bug; the instance then holds every key at

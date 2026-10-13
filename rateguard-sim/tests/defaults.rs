@@ -185,6 +185,42 @@ fn a_rolling_restart_never_stops_service() {
     }
 }
 
+// A node that leaves on purpose, in a deploy or a scale-down, hands its
+// share to the others at once: no suspicion timeout, no HoldDown, since it
+// no longer serves. Never over R meanwhile: the invariant checks it.
+#[test]
+fn a_node_that_leaves_frees_its_share_within_a_second() {
+    let mut s = Sim::with_seeds(NODES, defaults(), PerfectLink::new(ONE_MS), &[0, 1]);
+    let leave = 20 * ONE_SEC;
+    let run = 40 * ONE_SEC;
+    for node in 0..NODES {
+        s.schedule_request_stream(node, KEY, 400, 0, run);
+    }
+    s.schedule_leave(4, leave);
+    s.run_until(run);
+
+    let four = [0, 1, 2, 3];
+    assert_between(
+        "the four before",
+        rate(&s, 10 * ONE_SEC, leave, &four),
+        0.78 * LIMIT,
+        0.82 * LIMIT,
+    );
+    for second in 21..40 {
+        let from = second * ONE_SEC;
+        let admitted = rate(&s, from, from + ONE_SEC, &four);
+        assert_between(
+            &format!("second {second}"),
+            admitted,
+            0.97 * LIMIT,
+            ceiling(1),
+        );
+    }
+    for viewer in four {
+        assert_eq!(s.node(viewer).cluster_size(), 4, "node {viewer}");
+    }
+}
+
 // Spec §6.2: traffic jumps a hundredfold, from 10 a second a node, cold,
 // to 1000, hot everywhere at once. The invariant holds through the jump,
 // and the cluster settles on R.

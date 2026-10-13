@@ -78,6 +78,27 @@ impl SizeHistory {
         }
         self.samples.front().expect("just pushed").1
     }
+
+    /// Takes one node out of every size recorded at `since` or later: it
+    /// was a member from then on and has left the cluster on purpose, so
+    /// there is nothing to hold for it. Sizes from before it joined count
+    /// others, who may still be serving, and are kept as they are.
+    pub fn forget_one(&mut self, since: Nanos) {
+        for (at, size) in &mut self.samples {
+            if *at >= since {
+                *size = size.saturating_sub(1).max(1);
+            }
+        }
+        // Equal neighbours break the strict fall; the older one goes.
+        let mut kept: VecDeque<(Nanos, usize)> = VecDeque::with_capacity(self.samples.len());
+        for sample in self.samples.drain(..) {
+            while kept.back().is_some_and(|&(_, s)| s <= sample.1) {
+                kept.pop_back();
+            }
+            kept.push_back(sample);
+        }
+        self.samples = kept;
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +135,33 @@ mod tests {
         let mut h = SizeHistory::new(0);
         h.record(0, 5);
         assert_eq!(h.record(1, 3), 3);
+    }
+
+    #[test]
+    fn a_node_that_left_is_not_held() {
+        let mut h = SizeHistory::new(10 * ONE_SEC);
+        h.record(0, 5);
+        h.forget_one(0);
+        assert_eq!(h.record(ONE_SEC, 4), 4);
+    }
+
+    #[test]
+    fn a_node_that_left_is_taken_only_out_of_the_sizes_it_was_in() {
+        // Six until 1 s, one of them lost; a newcomer from 3 s that leaves:
+        // the one lost is still held, the one that left is not.
+        let mut h = SizeHistory::new(10 * ONE_SEC);
+        h.record(0, 6);
+        h.record(ONE_SEC, 5);
+        h.record(3 * ONE_SEC, 6);
+        h.forget_one(3 * ONE_SEC);
+        assert_eq!(h.record(4 * ONE_SEC, 5), 5);
+
+        let mut h = SizeHistory::new(10 * ONE_SEC);
+        h.record(0, 6);
+        h.record(ONE_SEC, 4);
+        h.record(3 * ONE_SEC, 5);
+        h.forget_one(3 * ONE_SEC);
+        assert_eq!(h.record(4 * ONE_SEC, 4), 6);
     }
 
     #[test]

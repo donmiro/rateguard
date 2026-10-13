@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rateguard_core::gcra;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::key::key_hash;
@@ -37,8 +38,10 @@ pub(crate) struct Shared {
     pub table: KeyTable,
     pub cluster_size: AtomicUsize,
     pub epoch: Instant,
-    /// Cleared if the background task dies.
+    /// Cleared if the background task dies, or once the node has left.
     pub running: AtomicBool,
+    /// Asks the background task to leave; it answers once it has.
+    pub leave: mpsc::Sender<oneshot::Sender<()>>,
 }
 impl Shared {
     /// Nanoseconds since the node started, on tokio's clock: the OS's
@@ -95,7 +98,30 @@ impl Guard {
     /// Whether the background task still runs. If it died, a bug, the node
     /// is gone from its peers' view and holds every key at a small floor
     /// rather than at shares nobody counts any more: worth a health check.
+    /// False too once the node has [left](Guard::leave).
     pub fn is_running(&self) -> bool {
         self.shared.running.load(Ordering::Relaxed)
+    }
+
+    /// Leaves the cluster for good, telling the other instances so. They
+    /// take this one's share at once, where a node that just stops costs
+    /// them its share for the suspicion timeout and, under the default
+    /// `HoldDown`, the hold after it: a deploy or a scale-down that leaves
+    /// runs at the limit throughout, not under it.
+    ///
+    /// Call it when the instance starts shutting down. Its peers no longer
+    /// count it afterwards, so it holds every key at the floor `R × β / N`
+    /// from then on, a little over the limit for the requests still
+    /// draining, and [`is_running`](Guard::is_running) turns false.
+    /// Dropping the last `Guard` leaves too, if the runtime is still there
+    /// to send the news.
+    ///
+    /// Returns once the news has been handed to the transport, or at once
+    /// if the node has already left or stopped.
+    pub async fn leave(&self) {
+        let (done, left) = oneshot::channel();
+        if self.shared.leave.send(done).await.is_ok() {
+            let _ = left.await;
+        }
     }
 }

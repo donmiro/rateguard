@@ -47,25 +47,28 @@ fn node(
 ) {
     sim.host(name, move || {
         let log = log.clone();
-        async move {
-            let me = SocketAddr::new(turmoil::lookup(name), PORT);
-            let seed = SocketAddr::new(turmoil::lookup(seed), PORT);
-            let socket = UdpSocket::bind((IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT)).await?;
-            let builder = Guard::builder()
-                .bind(format!("0.0.0.0:{PORT}"))
-                .advertise(me.to_string())
-                .seeds([seed.to_string()])
-                .limit(LIMIT)
-                .burst(BURST)
-                .partition_policy(PartitionPolicy::HoldDown(Duration::from_secs(60)));
-            let guard = if rewrite {
-                builder.spawn_on(Rewriting(socket))?
-            } else {
-                builder.spawn_on(socket)?
-            };
-            serve(guard, log).await
-        }
+        async move { serve(spawn(name, seed, rewrite).await?, log).await }
     });
+}
+
+// A host's Guard, joining through `seed`, under a hold longer than any run
+// here: whatever share a node frees, it frees by leaving.
+async fn spawn(name: &'static str, seed: &'static str, rewrite: bool) -> turmoil::Result<Guard> {
+    let me = SocketAddr::new(turmoil::lookup(name), PORT);
+    let seed = SocketAddr::new(turmoil::lookup(seed), PORT);
+    let socket = UdpSocket::bind((IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT)).await?;
+    let builder = Guard::builder()
+        .bind(format!("0.0.0.0:{PORT}"))
+        .advertise(me.to_string())
+        .seeds([seed.to_string()])
+        .limit(LIMIT)
+        .burst(BURST)
+        .partition_policy(PartitionPolicy::HoldDown(Duration::from_secs(60)));
+    Ok(if rewrite {
+        builder.spawn_on(Rewriting(socket))?
+    } else {
+        builder.spawn_on(socket)?
+    })
 }
 
 async fn serve(guard: Guard, log: Log) -> turmoil::Result {
@@ -279,4 +282,52 @@ fn garbage_on_the_port_changes_nothing() {
     });
     sim.run().unwrap();
     assert_shared(&logs, 20..29);
+}
+
+// Under a 60 s hold a node that only stopped would leave the other two at
+// two thirds of the limit for the whole run, 666 a second; one that leaves
+// lets them have all they ask for, 800, at once.
+fn leaving(how: impl Fn(Guard) -> std::pin::Pin<Box<dyn Future<Output = ()>>> + 'static) {
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(40))
+        .build();
+    let logs: Vec<Log> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+    node(&mut sim, "a", "a", logs[0].clone(), false);
+    node(&mut sim, "b", "a", logs[1].clone(), false);
+    let how = std::rc::Rc::new(how);
+    sim.host("c", move || {
+        let how = how.clone();
+        async move {
+            let guard = spawn("c", "a", false).await?;
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let _ = tokio::time::timeout(Duration::from_secs(15), serve(guard.clone(), log)).await;
+            how(guard).await;
+            std::future::pending().await
+        }
+    });
+    wait(&mut sim, Duration::from_secs(30));
+    sim.run().unwrap();
+    for second in 17..29 {
+        let total = total(&logs, second);
+        assert!(
+            (790..=800).contains(&total),
+            "second {second}: {total} admitted of the 800 asked for"
+        );
+    }
+}
+
+#[test]
+fn a_node_that_leaves_hands_its_share_over_at_once() {
+    leaving(|guard| {
+        Box::pin(async move {
+            guard.leave().await;
+            assert!(!guard.is_running());
+            guard.leave().await;
+        })
+    });
+}
+
+#[test]
+fn dropping_the_last_guard_leaves_too() {
+    leaving(|guard| Box::pin(async move { drop(guard) }));
 }

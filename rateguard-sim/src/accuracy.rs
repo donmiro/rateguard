@@ -226,6 +226,33 @@ fn rolling_restart() -> Row {
     )
 }
 
+// Node 4 stops for good at 20 s; the other four, 1600 a second between
+// them, take up its share. A crash costs them the suspicion timeout and the
+// hold first, a leave nothing.
+fn stop(scenario: &'static str, expected: &'static str, leave: bool) -> Row {
+    let stop = 20 * ONE_SEC;
+    let run = 60 * ONE_SEC;
+    let mut s = Sim::with_seeds(NODES, defaults(), PerfectLink::new(ONE_MS), &[0, 1]);
+    s.remove_invariant("admission-window");
+    streams(&mut s, [400; NODES], run);
+    if leave {
+        s.schedule_leave(4, stop);
+    } else {
+        s.schedule_restart(4, stop, Nanos::MAX / 2);
+    }
+    s.run_until(run);
+    row(
+        scenario,
+        expected,
+        &s,
+        Measure {
+            event: stop,
+            steady: (45 * ONE_SEC, run),
+            nodes: vec![0, 1, 2, 3],
+        },
+    )
+}
+
 fn jump() -> Row {
     let jump = 20 * ONE_SEC;
     let run = 50 * ONE_SEC;
@@ -325,6 +352,12 @@ pub fn rows() -> Vec<Row> {
         one_way(),
         gc_pause(),
         rolling_restart(),
+        stop(
+            "Node 4 crashes for good (the other four)",
+            "R once the suspicion and the hold are over",
+            false,
+        ),
+        stop("Node 4 leaves for good (the other four)", "R at once", true),
         jump(),
         late_joiner(),
     ]

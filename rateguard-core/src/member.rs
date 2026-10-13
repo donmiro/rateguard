@@ -49,6 +49,11 @@ struct Member {
     incarnation: u32,
     status: Status,
     since: Nanos,
+    /// When it last became live.
+    joined: Nanos,
+    /// Dead because it said it was leaving, not because it stopped
+    /// answering.
+    departed: bool,
 }
 impl Member {
     fn update(&self, peer: PeerId) -> Update {
@@ -137,6 +142,8 @@ impl MemberTable {
             return Applied::Ignored;
         }
 
+        let was_live = from.is_some_and(|member| member.status != Status::Dead);
+        let is_live = update.status != Status::Dead;
         self.members.insert(
             peer,
             Member {
@@ -144,11 +151,14 @@ impl MemberTable {
                 incarnation: update.incarnation,
                 status: update.status,
                 since: now,
+                joined: match from {
+                    Some(member) if was_live || !is_live => member.joined,
+                    _ => now,
+                },
+                departed: false,
             },
         );
 
-        let was_live = from.is_some_and(|member| member.status != Status::Dead);
-        let is_live = update.status != Status::Dead;
         match (was_live, is_live) {
             (false, true) => {
                 let at = self
@@ -190,6 +200,33 @@ impl MemberTable {
         };
         self.apply(update, now);
         Some(update)
+    }
+
+    /// Marks a dead member as departed: it said it was leaving, so it is no
+    /// longer serving, unlike one that only stopped answering. Whether it
+    /// was dead and not departed already; news that brings it back clears
+    /// the mark.
+    pub fn depart(&mut self, peer: PeerId) -> bool {
+        match self.members.get_mut(&peer) {
+            Some(member) if member.status == Status::Dead && !member.departed => {
+                member.departed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the member is dead because it said it was leaving.
+    pub fn has_departed(&self, peer: PeerId) -> bool {
+        self.members
+            .get(&peer)
+            .is_some_and(|member| member.departed)
+    }
+
+    /// When the member last became live; `None` for a stranger, a
+    /// forgotten member, or this node.
+    pub fn joined_at(&self, peer: PeerId) -> Option<Nanos> {
+        self.members.get(&peer).map(|member| member.joined)
     }
 
     /// Members known to be dead and not yet forgotten.
@@ -318,6 +355,33 @@ mod tests {
         assert_eq!(t.address(id(0)), Some(addr(0)), "itself too");
         assert_eq!(t.address(id(9)), None);
         assert_eq!(t.update_about(id(0)).unwrap().addr, addr(0));
+    }
+
+    #[test]
+    fn only_the_dead_depart_and_coming_back_undoes_it() {
+        let mut t = table();
+        t.apply(news(1, 0, Alive), 0);
+        assert!(!t.depart(id(1)), "alive");
+        assert!(!t.depart(id(9)), "a stranger");
+        t.apply(news(1, 0, Dead), ONE_SEC);
+        assert!(t.depart(id(1)));
+        assert!(!t.depart(id(1)), "once");
+        assert!(t.has_departed(id(1)));
+        t.apply(news(1, 1, Alive), 2 * ONE_SEC);
+        assert!(!t.has_departed(id(1)));
+    }
+
+    #[test]
+    fn a_member_joins_when_it_becomes_live() {
+        let mut t = table();
+        t.apply(news(1, 0, Alive), ONE_SEC);
+        t.apply(news(1, 0, Suspect), 2 * ONE_SEC);
+        t.apply(news(1, 1, Alive), 3 * ONE_SEC);
+        assert_eq!(t.joined_at(id(1)), Some(ONE_SEC), "a refutation is no join");
+        t.apply(news(1, 1, Dead), 4 * ONE_SEC);
+        assert_eq!(t.joined_at(id(1)), Some(ONE_SEC), "nor is a death");
+        t.apply(news(1, 2, Alive), 5 * ONE_SEC);
+        assert_eq!(t.joined_at(id(1)), Some(5 * ONE_SEC));
     }
 
     #[test]

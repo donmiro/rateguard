@@ -132,6 +132,7 @@ pub struct Node {
     last_heard: BTreeMap<PeerId, Nanos>,
     reported: VecDeque<(Nanos, Vec<KeyDemand>)>,
     recent_shares: BTreeMap<u64, [f64; RISE_DELAY_ROUNDS]>,
+    left: bool,
 }
 /// The sizes of a node's collections; see [`Node::footprint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +220,7 @@ impl Node {
             last_heard: BTreeMap::new(),
             reported: VecDeque::new(),
             recent_shares: BTreeMap::new(),
+            left: false,
         }
     }
 
@@ -403,6 +405,9 @@ impl Node {
     pub fn handle(&mut self, event: Event<'_>, now: Nanos) -> &[Action] {
         self.advance(now);
         self.actions.clear();
+        if self.left {
+            return &self.actions;
+        }
 
         match event {
             Event::Tick => {
@@ -427,6 +432,43 @@ impl Node {
         }
 
         &self.actions
+    }
+
+    /// Leaves the cluster for good: tells every live peer, once, that this
+    /// node is stopping, so that they take its share at once instead of
+    /// first suspecting it and then, under
+    /// [`HoldDown`](PartitionPolicy::HoldDown), holding its share for a
+    /// split that is not one. A peer the datagram does not reach finds the
+    /// death by probing, as after a crash.
+    ///
+    /// The node is done afterwards: [`handle`](Node::handle) does nothing
+    /// more, lest it refute its own death. Whatever it still admits comes
+    /// on top of the limit, since its peers no longer count it.
+    pub fn leave(&mut self, now: Nanos) -> &[Action] {
+        self.advance(now);
+        self.actions.clear();
+        if self.left {
+            return &self.actions;
+        }
+        self.left = true;
+        // Dead beats Alive within one incarnation, so no new one is needed.
+        let own = Update {
+            status: Status::Dead,
+            ..self
+                .members
+                .update_about(self.members.local())
+                .expect("a node always knows itself")
+        };
+        let peers = self.members.peers().to_vec();
+        for peer in peers {
+            self.send(peer, &Message::Leave { updates: vec![own] });
+        }
+        &self.actions
+    }
+
+    /// Whether the node has [left](Node::leave).
+    pub fn has_left(&self) -> bool {
+        self.left
     }
 
     fn round(&mut self, now: Nanos) {
@@ -593,8 +635,19 @@ impl Node {
         let Ok(message) = proto::decode(bytes) else {
             return;
         };
+        // A leave says one thing, about its own sender; anything else in
+        // that shape is not one.
+        if let Message::Leave { updates } = &message
+            && !matches!(updates.as_slice(), [own] if own.member == from.get() && own.status == Status::Dead)
+        {
+            return;
+        }
         for &update in message.updates() {
             self.learn(update, now);
+        }
+        if let Message::Leave { .. } = message {
+            self.depart(from);
+            return;
         }
         // Only members are heard of: a stranger that does not introduce
         // itself would grow the table without bound.
@@ -617,7 +670,39 @@ impl Node {
                 seq, ref demand, ..
             } => self.acknowledged(from, seq, demand, now),
             Message::PingReq { seq, target, .. } => self.relay(from, seq, PeerId::new(target), now),
+            Message::Leave { .. } => unreachable!("handled above"),
         }
+    }
+
+    // A peer that left on purpose admits nothing more: whatever HoldDown
+    // would hold for it, its demand and its place in the cluster size, is
+    // released at once, and Quorum no longer counts it among the dead. Its
+    // death itself was learned with the message and is gossiped on; the
+    // peers that hear of it only that way hold it as after a crash.
+    fn depart(&mut self, peer: PeerId) {
+        // Not dead: we know of a later incarnation, the leave is old news.
+        if !self.members.depart(peer) {
+            return;
+        }
+        self.peer_demand.forget(peer);
+        self.last_heard.remove(&peer);
+        if let Some(since) = self.members.joined_at(peer) {
+            self.sizes.forget_one(since);
+        }
+        // The size a majority is counted against counted it too.
+        let known = self.known_for_quorum();
+        self.quorum_size = self.quorum_size.saturating_sub(1).max(known);
+    }
+
+    // The members a majority is counted against: the live, and the dead
+    // that may yet be serving on the other side of a split.
+    fn known_for_quorum(&self) -> usize {
+        self.members.cluster_size()
+            + self
+                .members
+                .dead()
+                .filter(|&peer| !self.members.has_departed(peer))
+                .count()
     }
 
     // An ACK relayed by a helper carries the target's report: the one way
@@ -790,7 +875,7 @@ impl Node {
             .iter()
             .filter(|&&peer| self.members.status(peer) == Some(Status::Alive))
             .count();
-        let known = size + self.members.dead().count();
+        let known = self.known_for_quorum();
         let counted = known.max(self.quorum_size);
         let quorum = partition::has_quorum(alive, counted);
         self.quorum_size = if quorum { known } else { counted };
@@ -2628,5 +2713,129 @@ mod tests {
             None,
             "demand is taken first hand only"
         );
+    }
+
+    fn leave_of(peer: u64) -> Message {
+        Message::Leave {
+            updates: vec![news(peer, 0, Dead)],
+        }
+    }
+
+    fn hello(peer: u64, incarnation: u32) -> Message {
+        Message::Ping {
+            seq: 1,
+            updates: vec![news(peer, incarnation, Alive)],
+            demand: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_node_that_leaves_tells_every_live_peer_once_and_stops() {
+        let mut n = node_with([1, 2, 3]);
+        n.handle(Event::Tick, 0);
+        let told = sent(n.leave(ONE_MS));
+        let to: BTreeSet<u64> = told.iter().map(|(peer, _)| peer.get()).collect();
+        assert_eq!(to, BTreeSet::from([1, 2, 3]));
+        assert!(told.iter().all(|(_, message)| *message == leave_of(0)));
+        assert!(n.has_left());
+
+        assert!(n.leave(2 * ONE_MS).is_empty(), "once");
+        assert!(n.handle(Event::Tick, PERIOD).is_empty(), "no more rounds");
+        let accused = Message::Ping {
+            seq: 1,
+            updates: vec![news(0, 0, Dead)],
+            demand: Vec::new(),
+        };
+        assert!(
+            deliver(&mut n, 1, accused, PERIOD + ONE_MS).is_empty(),
+            "its own death is not refuted"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_leaves_is_dead_at_once_and_the_news_passed_on() {
+        let mut n = node_with([1, 2]);
+        assert!(
+            deliver(&mut n, 1, leave_of(1), ONE_MS).is_empty(),
+            "unanswered"
+        );
+        assert_eq!(n.members().status(PeerId::new(1)), Some(Dead));
+        assert!(n.members().has_departed(PeerId::new(1)));
+        assert_eq!(n.cluster_size(), 2);
+        let (_, _, updates) = round_with_news(&mut n, 1);
+        assert!(updates.contains(&news(1, 0, Dead)));
+    }
+
+    #[test]
+    fn under_hold_down_a_peer_that_leaves_is_not_held() {
+        let mut n = node_with([1, 2, 3, 4]);
+        n.set_partition_policy(PartitionPolicy::HoldDown(30 * PERIOD));
+        n.handle(Event::Tick, 0);
+        deliver(&mut n, 1, reporting(1, 3), ONE_MS);
+        for peer in 2..=4 {
+            deliver(&mut n, peer, hello(peer, 0), ONE_MS);
+        }
+        assert_eq!(cold_rate_after_round(&mut n, PERIOD), 100.0, "α × R / 5");
+
+        deliver(&mut n, 1, leave_of(1), PERIOD + ONE_MS);
+        assert!(n.peer_demand().is_empty(), "its demand is not held");
+        assert_eq!(
+            cold_rate_after_round(&mut n, 2 * PERIOD),
+            125.0,
+            "α × R / 4 at once"
+        );
+    }
+
+    #[test]
+    fn under_quorum_a_peer_that_leaves_is_not_counted_among_the_dead() {
+        let mut n = node_with([1]);
+        n.set_partition_policy(PartitionPolicy::Quorum);
+        n.handle(Event::Tick, 0);
+        deliver(&mut n, 1, leave_of(1), ONE_MS);
+        assert_eq!(
+            cold_rate_after_round(&mut n, PERIOD),
+            500.0,
+            "α × R alone, not the floor of a minority"
+        );
+    }
+
+    #[test]
+    fn a_leave_that_is_not_its_senders_own_is_ignored() {
+        let mut n = node_with([1, 2]);
+        let forged = [
+            leave_of(2),
+            Message::Leave {
+                updates: vec![news(1, 0, Dead), news(2, 0, Dead)],
+            },
+            Message::Leave {
+                updates: vec![news(1, 0, Alive)],
+            },
+            Message::Leave {
+                updates: Vec::new(),
+            },
+        ];
+        for message in forged {
+            deliver(&mut n, 1, message, ONE_MS);
+        }
+        assert_eq!(n.cluster_size(), 3);
+    }
+
+    #[test]
+    fn a_leave_older_than_the_peers_incarnation_changes_nothing() {
+        let mut n = node_with([1]);
+        deliver(&mut n, 1, hello(1, 2), ONE_MS);
+        deliver(&mut n, 1, leave_of(1), 2 * ONE_MS);
+        assert_eq!(n.members().status(PeerId::new(1)), Some(Alive));
+        assert!(!n.members().has_departed(PeerId::new(1)));
+    }
+
+    #[test]
+    fn a_peer_that_left_and_comes_back_is_a_member_again() {
+        let mut n = node_with([1]);
+        deliver(&mut n, 1, leave_of(1), ONE_MS);
+        deliver(&mut n, 1, hello(1, 1), 2 * ONE_MS);
+        assert_eq!(n.members().status(PeerId::new(1)), Some(Alive));
+        assert!(!n.members().has_departed(PeerId::new(1)));
+        assert_eq!(n.cluster_size(), 2);
     }
 }

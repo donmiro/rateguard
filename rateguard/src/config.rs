@@ -319,11 +319,13 @@ fn start<T: crate::Transport>(
         node.expect_peers(true);
     }
 
+    let (leave, leaving) = tokio::sync::mpsc::channel(1);
     let shared = Arc::new(crate::guard::Shared {
         table: crate::table::KeyTable::new(settings.core.max_tracked_keys, node.new_key_quota()),
         cluster_size: AtomicUsize::new(node.cluster_size()),
         epoch: tokio::time::Instant::now(),
         running: AtomicBool::new(true),
+        leave,
     });
     let transport = Arc::new(transport);
     if !settings.names.is_empty() {
@@ -343,6 +345,7 @@ fn start<T: crate::Transport>(
         names,
         Arc::downgrade(&shared),
         ticker,
+        leaving,
     ));
     tokio::spawn(crate::driver::watch(
         task,

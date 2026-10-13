@@ -157,14 +157,24 @@ pub enum Message {
         /// The sender's demand report.
         demand: Vec<DemandReport>,
     },
+    /// I am stopping for good. Sent once, to every member the sender
+    /// knows, and never answered. Unlike a death found by probing, a leave
+    /// is no sign of a split: the sender no longer admits anything, so its
+    /// share is free at once. A version that predates the variant drops
+    /// the datagram and finds the death by probing, as before.
+    Leave {
+        /// The sender's own record, `Dead`, and nothing else.
+        updates: Vec<Update>,
+    },
 }
 impl Message {
-    /// The `seq` of any message.
+    /// The `seq` of any message; 0 for a `Leave`, which has none.
     pub fn seq(&self) -> u32 {
         match self {
             Message::Ping { seq, .. } | Message::Ack { seq, .. } | Message::PingReq { seq, .. } => {
                 *seq
             }
+            Message::Leave { .. } => 0,
         }
     }
 
@@ -173,16 +183,18 @@ impl Message {
         match self {
             Message::Ping { updates, .. }
             | Message::Ack { updates, .. }
-            | Message::PingReq { updates, .. } => updates,
+            | Message::PingReq { updates, .. }
+            | Message::Leave { updates } => updates,
         }
     }
 
-    /// The demand reports of any message.
+    /// The demand reports of any message; none in a `Leave`.
     pub fn demand(&self) -> &[DemandReport] {
         match self {
             Message::Ping { demand, .. }
             | Message::Ack { demand, .. }
             | Message::PingReq { demand, .. } => demand,
+            Message::Leave { .. } => &[],
         }
     }
 }
@@ -380,6 +392,9 @@ mod tests {
                 updates,
                 demand: vec![report(vec![key(13, 40.0)])],
             },
+            Message::Leave {
+                updates: vec![update(3, Status::Dead)],
+            },
         ] {
             let bytes = encode(&message).unwrap();
             assert_eq!(decode(&bytes).unwrap(), message);
@@ -493,6 +508,48 @@ mod tests {
             demand: Vec::new(),
         };
         assert_eq!(encode(&ping).unwrap(), [0, 1, 0, 0]);
+        let leave = Message::Leave {
+            updates: Vec::new(),
+        };
+        assert_eq!(encode(&leave).unwrap(), [3, 0]);
+    }
+
+    // A rolling upgrade runs both versions side by side. A node that
+    // predates Leave must drop it as one bad datagram, nothing worse.
+    #[test]
+    fn a_leave_is_refused_by_a_version_that_predates_it() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum Before {
+            Ping {
+                seq: u32,
+                updates: Vec<Update>,
+                demand: Vec<DemandReport>,
+            },
+            Ack {
+                seq: u32,
+                updates: Vec<Update>,
+                demand: Vec<DemandReport>,
+            },
+            PingReq {
+                seq: u32,
+                target: u64,
+                updates: Vec<Update>,
+                demand: Vec<DemandReport>,
+            },
+        }
+        let ping = encode(&Message::Ping {
+            seq: 1,
+            updates: vec![update(3, Status::Alive)],
+            demand: Vec::new(),
+        })
+        .unwrap();
+        assert!(postcard::from_bytes::<Before>(&ping).is_ok());
+        let leave = encode(&Message::Leave {
+            updates: vec![update(3, Status::Dead)],
+        })
+        .unwrap();
+        assert!(postcard::from_bytes::<Before>(&leave).is_err());
     }
 
     #[test]
@@ -619,6 +676,7 @@ mod tests {
                         demand,
                     }
                 ),
+                updates().prop_map(|updates| Message::Leave { updates }),
             ]
         }
 

@@ -94,13 +94,14 @@ impl Builder {
     /// is enough. A name is looked up when the node starts and again while
     /// it runs, every address it resolves to a seed: a DNS name for the
     /// whole fleet, such as a Kubernetes headless service, keeps up with
-    /// instances that come and go. Until the node joins someone, every key
-    /// is held at the floor `R × β`, even while a name resolves to nobody
-    /// yet. Once its names resolve to this node alone three lookups in a
-    /// row, about 4 s, it takes itself for the whole fleet, a single
-    /// replica, and gets the whole limit: replicas that become ready
-    /// further apart than that may admit over the limit until they find
-    /// each other.
+    /// instances that come and go. The names are looked up all at once,
+    /// each given up on after 20 s; a name whose lookup fails or times out
+    /// keeps its last addresses. Until the node joins someone, every key is
+    /// held at the floor `R × β`, even while a name resolves to nobody yet.
+    /// Once its names resolve to this node alone three lookups in a row,
+    /// about 4 s, it takes itself for the whole fleet, a single replica,
+    /// and gets the whole limit: replicas that become ready further apart
+    /// than that may admit over the limit until they find each other.
     pub fn seeds<S: Into<String>>(mut self, seeds: impl IntoIterator<Item = S>) -> Self {
         self.seeds = seeds.into_iter().map(Into::into).collect();
         self

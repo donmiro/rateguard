@@ -601,6 +601,11 @@ impl Node {
                     self.order.insert(at, peer);
                 }
                 Change::Joined(_) => {}
+                // A peer that left on purpose has nothing to hold, even a
+                // report that reached us after its leave.
+                Change::Left(peer) if self.members.has_departed(peer) => {
+                    self.peer_demand.forget(peer)
+                }
                 Change::Left(peer) => self.peer_demand.leave(peer, now, hold_of(self.policy)),
             }
         }
@@ -660,11 +665,13 @@ impl Node {
         }
         // Demand comes first hand and whole, in every message; an empty
         // report says the peer has no hot key. A message with no report
-        // has no round to order it by, and changes nothing.
-        if let Some(report) = message
-            .demand()
-            .iter()
-            .find(|report| report.origin == from.get())
+        // has no round to order it by, and changes nothing. One sent before
+        // a leave may arrive after it, and is too late.
+        if !self.members.has_departed(from)
+            && let Some(report) = message
+                .demand()
+                .iter()
+                .find(|report| report.origin == from.get())
         {
             self.peer_demand.apply(from, report, now);
         }
@@ -722,7 +729,9 @@ impl Node {
                 .as_ref()
                 .is_some_and(|helpers| helpers.contains(&from));
             if from == target || by_helper {
-                if by_helper && let Some(report) = demand.iter().find(|r| r.origin == target.get())
+                if by_helper
+                    && !self.members.has_departed(target)
+                    && let Some(report) = demand.iter().find(|r| r.origin == target.get())
                 {
                     self.peer_demand.apply(target, report, now);
                 }
@@ -2790,6 +2799,52 @@ mod tests {
             125.0,
             "α × R / 4 at once"
         );
+    }
+
+    // A report the peer sent before its leave may arrive after it, reordered
+    // on the way: it is too late, and nothing is held for it.
+    #[test]
+    fn a_report_that_arrives_after_a_leave_is_not_held() {
+        let mut n = node_with([1, 2, 3, 4]);
+        n.set_partition_policy(PartitionPolicy::HoldDown(30 * PERIOD));
+        n.handle(Event::Tick, 0);
+        for peer in 2..=4 {
+            deliver(&mut n, peer, hello(peer, 0), ONE_MS);
+        }
+        deliver(&mut n, 1, leave_of(1), ONE_MS);
+        deliver(&mut n, 1, reporting(1, 3), 2 * ONE_MS);
+        assert_eq!(
+            cold_rate_after_round(&mut n, PERIOD),
+            125.0,
+            "α × R / 4 at once"
+        );
+        assert!(n.peer_demand().is_empty(), "its demand is not held");
+
+        // Later still, once the leave has been followed: not taken either.
+        deliver(&mut n, 1, reporting(1, 4), PERIOD + ONE_MS);
+        assert!(n.peer_demand().is_empty(), "nor taken after the round");
+    }
+
+    #[test]
+    fn a_relayed_report_that_arrives_after_a_leave_is_not_held() {
+        let mut n = node_with([1, 2, 3, 4]);
+        n.set_partition_policy(PartitionPolicy::HoldDown(30 * PERIOD));
+        let (target, seq) = round(&mut n, 0);
+        let (helper, _) = tick(&mut n, SWIM.ack_timeout)[0].clone();
+        deliver(
+            &mut n,
+            target.get(),
+            leave_of(target.get()),
+            SWIM.ack_timeout + ONE_MS,
+        );
+        deliver(
+            &mut n,
+            helper.get(),
+            ack_reporting(seq, target.get()),
+            SWIM.ack_timeout + 2 * ONE_MS,
+        );
+        n.handle(Event::Tick, PERIOD);
+        assert!(n.peer_demand().is_empty(), "its demand is not held");
     }
 
     #[test]

@@ -61,12 +61,10 @@ impl SizeHistory {
     /// Records the size seen at `now` and returns the largest one of the
     /// window that ends there.
     pub fn record(&mut self, now: Nanos, size: usize) -> usize {
-        // A monotonic queue: sizes strictly falling from front to back, so
-        // the front is the largest. A sample no larger than a newer one can
-        // never be the maximum again.
-        while self.samples.back().is_some_and(|&(_, s)| s <= size) {
-            self.samples.pop_back();
-        }
+        // Every sample of the window is kept, not just a monotonic queue of
+        // them: forget_one can lower a newer sample below an older one it
+        // would have displaced, and that one is the maximum again. A window
+        // holds one sample a round, so a scan is cheap.
         self.samples.push_back((now, size));
         while self.samples.len() > 1
             && self
@@ -76,7 +74,11 @@ impl SizeHistory {
         {
             self.samples.pop_front();
         }
-        self.samples.front().expect("just pushed").1
+        self.samples
+            .iter()
+            .map(|&(_, size)| size)
+            .max()
+            .expect("just pushed")
     }
 
     /// Takes one node out of every size recorded at `since` or later: it
@@ -89,15 +91,6 @@ impl SizeHistory {
                 *size = size.saturating_sub(1).max(1);
             }
         }
-        // Equal neighbours break the strict fall; the older one goes.
-        let mut kept: VecDeque<(Nanos, usize)> = VecDeque::with_capacity(self.samples.len());
-        for sample in self.samples.drain(..) {
-            while kept.back().is_some_and(|&(_, s)| s <= sample.1) {
-                kept.pop_back();
-            }
-            kept.push_back(sample);
-        }
-        self.samples = kept;
     }
 }
 
@@ -154,7 +147,7 @@ mod tests {
         h.record(ONE_SEC, 5);
         h.record(3 * ONE_SEC, 6);
         h.forget_one(3 * ONE_SEC);
-        assert_eq!(h.record(4 * ONE_SEC, 5), 5);
+        assert_eq!(h.record(4 * ONE_SEC, 5), 6);
 
         let mut h = SizeHistory::new(10 * ONE_SEC);
         h.record(0, 6);
@@ -162,6 +155,31 @@ mod tests {
         h.record(3 * ONE_SEC, 5);
         h.forget_one(3 * ONE_SEC);
         assert_eq!(h.record(4 * ONE_SEC, 4), 6);
+    }
+
+    // A newcomer that rises back to the size before a crash, then leaves:
+    // the crash is still held until it ages out of the window.
+    #[test]
+    fn a_crash_is_held_after_a_newcomer_leaves() {
+        let mut h = SizeHistory::new(10 * ONE_SEC);
+        h.record(0, 5);
+        h.record(ONE_SEC, 4);
+        h.record(2 * ONE_SEC, 5);
+        h.forget_one(2 * ONE_SEC);
+        assert_eq!(h.record(4 * ONE_SEC, 4), 5);
+        assert_eq!(h.record(10 * ONE_SEC - 1, 4), 5);
+        assert_eq!(h.record(10 * ONE_SEC, 4), 4);
+    }
+
+    #[test]
+    fn a_crash_is_held_after_two_newcomers_leave() {
+        let mut h = SizeHistory::new(10 * ONE_SEC);
+        h.record(0, 5);
+        h.record(ONE_SEC, 4);
+        h.record(2 * ONE_SEC, 6);
+        h.forget_one(2 * ONE_SEC);
+        h.forget_one(2 * ONE_SEC);
+        assert_eq!(h.record(4 * ONE_SEC, 4), 5);
     }
 
     #[test]

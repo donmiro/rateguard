@@ -434,7 +434,7 @@ impl Node {
         &self.actions
     }
 
-    /// Leaves the cluster for good: tells every live peer, once, that this
+    /// Leaves the cluster for good: tells every live peer that this
     /// node is stopping, so that they take its share at once instead of
     /// first suspecting it and then, under
     /// [`HoldDown`](PartitionPolicy::HoldDown), holding its share for a
@@ -459,9 +459,13 @@ impl Node {
                 .update_about(self.members.local())
                 .expect("a node always knows itself")
         };
+        // Twice: a lost datagram only falls back to the crash path, but a
+        // second costs nothing, and a repeat changes nothing at the peer.
         let peers = self.members.peers().to_vec();
         for peer in peers {
-            self.send(peer, &Message::Leave { updates: vec![own] });
+            for _ in 0..2 {
+                self.send(peer, &Message::Leave { updates: vec![own] });
+            }
         }
         &self.actions
     }
@@ -1835,7 +1839,7 @@ mod tests {
     fn a_helper_relays_the_targets_report() {
         let mut n = node();
         let forwarded = deliver(&mut n, 3, ping_req(40, 9), 0);
-        let own = forwarded[0].1.seq();
+        let own = forwarded[0].1.seq().unwrap();
         let relayed = deliver(&mut n, 9, ack_reporting(own, 9), ONE_MS);
         let [(_, answer)] = relayed.as_slice() else {
             panic!("the target's ACK must be relayed, got {relayed:?}");
@@ -1880,7 +1884,7 @@ mod tests {
     fn a_relay_is_answered_only_by_its_target() {
         let mut n = node();
         let forwarded = deliver(&mut n, 3, ping_req(40, 9), 0);
-        let own = forwarded[0].1.seq();
+        let own = forwarded[0].1.seq().unwrap();
         assert!(deliver(&mut n, 8, ack(own), ONE_MS).is_empty());
     }
 
@@ -1888,7 +1892,7 @@ mod tests {
     fn an_unanswered_relay_expires_after_a_period() {
         let mut n = node();
         let forwarded = deliver(&mut n, 3, ping_req(40, 9), 0);
-        let own = forwarded[0].1.seq();
+        let own = forwarded[0].1.seq().unwrap();
 
         n.handle(Event::Tick, PERIOD);
         assert!(
@@ -2730,12 +2734,13 @@ mod tests {
     }
 
     #[test]
-    fn a_node_that_leaves_tells_every_live_peer_once_and_stops() {
+    fn a_node_that_leaves_tells_every_live_peer_and_stops() {
         let mut n = node_with([1, 2, 3]);
         n.handle(Event::Tick, 0);
         let told = sent(n.leave(ONE_MS));
-        let to: BTreeSet<u64> = told.iter().map(|(peer, _)| peer.get()).collect();
-        assert_eq!(to, BTreeSet::from([1, 2, 3]));
+        let mut to: Vec<u64> = told.iter().map(|(peer, _)| peer.get()).collect();
+        to.sort();
+        assert_eq!(to, [1, 1, 2, 2, 3, 3], "twice, in case one is lost");
         assert!(told.iter().all(|(_, message)| *message == leave_of(0)));
         assert!(n.has_left());
 
@@ -2778,6 +2783,7 @@ mod tests {
         assert_eq!(cold_rate_after_round(&mut n, PERIOD), 100.0, "α × R / 5");
 
         deliver(&mut n, 1, leave_of(1), PERIOD + ONE_MS);
+        deliver(&mut n, 1, leave_of(1), PERIOD + 2 * ONE_MS);
         assert!(n.peer_demand().is_empty(), "its demand is not held");
         assert_eq!(
             cold_rate_after_round(&mut n, 2 * PERIOD),

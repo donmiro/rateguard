@@ -157,7 +157,7 @@ pub enum Message {
         /// The sender's demand report.
         demand: Vec<DemandReport>,
     },
-    /// I am stopping for good. Sent once, to every member the sender
+    /// I am stopping for good. Sent twice, to every member the sender
     /// knows, and never answered. Unlike a death found by probing, a leave
     /// is no sign of a split: the sender no longer admits anything, so its
     /// share is free at once. A version that predates the variant drops
@@ -168,13 +168,13 @@ pub enum Message {
     },
 }
 impl Message {
-    /// The `seq` of any message; 0 for a `Leave`, which has none.
-    pub fn seq(&self) -> u32 {
+    /// The `seq` of any message; none for a `Leave`.
+    pub fn seq(&self) -> Option<u32> {
         match self {
             Message::Ping { seq, .. } | Message::Ack { seq, .. } | Message::PingReq { seq, .. } => {
-                *seq
+                Some(*seq)
             }
-            Message::Leave { .. } => 0,
+            Message::Leave { .. } => None,
         }
     }
 

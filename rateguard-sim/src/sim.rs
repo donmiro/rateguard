@@ -34,6 +34,13 @@ enum Kind {
     Deliver { from: PeerId, bytes: Vec<u8> },
     Crash,
     Restart,
+    Leave,
+}
+
+// What a node is asked to do.
+enum Do<'a> {
+    Handle(Event<'a>),
+    Leave,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +220,13 @@ impl<L: Link> Sim<L> {
         self.schedule(up_at, node, Kind::Restart);
     }
 
+    /// The node leaves the cluster on purpose at `at`, telling its peers,
+    /// and is down from then on.
+    pub fn schedule_leave(&mut self, node: NodeIndex, at: Nanos) {
+        assert!(node < self.nodes.len(), "no such node: {node}");
+        self.schedule(at, node, Kind::Leave);
+    }
+
     pub fn is_down(&self, node: NodeIndex) -> bool {
         self.down[node]
     }
@@ -349,7 +363,7 @@ impl<L: Link> Sim<L> {
     }
 
     fn paused_until(&self, event: &Scheduled) -> Option<Nanos> {
-        if matches!(event.kind, Kind::Crash | Kind::Restart) {
+        if matches!(event.kind, Kind::Crash | Kind::Restart | Kind::Leave) {
             return None;
         }
         self.pauses
@@ -379,6 +393,13 @@ impl<L: Link> Sim<L> {
                 self.events += 1;
                 return;
             }
+            Kind::Leave => {
+                if !self.down[target] {
+                    self.dispatch(target, Do::Leave);
+                    self.down[target] = true;
+                }
+                return;
+            }
             Kind::Tick { generation } if generation != self.generations[target] => return,
             _ if self.down[target] => return,
             _ => {}
@@ -397,21 +418,21 @@ impl<L: Link> Sim<L> {
                 Happened::Admission(admission)
             }
             Kind::Tick { generation } => {
-                self.dispatch(target, Event::Tick);
+                self.dispatch(target, Do::Handle(Event::Tick));
                 self.schedule(now + TICK, target, Kind::Tick { generation });
                 Happened::Tick
             }
             Kind::Deliver { from, bytes } => {
                 self.dispatch(
                     target,
-                    Event::MessageReceived {
+                    Do::Handle(Event::MessageReceived {
                         from,
                         bytes: &bytes,
-                    },
+                    }),
                 );
                 Happened::Delivery
             }
-            Kind::Crash | Kind::Restart => unreachable!("handled above"),
+            Kind::Crash | Kind::Restart | Kind::Leave => unreachable!("handled above"),
         };
 
         self.check_invariants(target, &happened);
@@ -448,7 +469,7 @@ impl<L: Link> Sim<L> {
         }
     }
 
-    fn dispatch(&mut self, source: NodeIndex, event: Event<'_>) {
+    fn dispatch(&mut self, source: NodeIndex, what: Do<'_>) {
         let Self {
             nodes,
             queue,
@@ -462,7 +483,11 @@ impl<L: Link> Sim<L> {
         let now = *now;
         let node_count = nodes.len();
 
-        for action in nodes[source].handle(event, now) {
+        let actions = match what {
+            Do::Handle(event) => nodes[source].handle(event, now),
+            Do::Leave => nodes[source].leave(now),
+        };
+        for action in actions {
             match action {
                 Action::SendTo { peer, bytes } => {
                     datagrams[source] += 1;

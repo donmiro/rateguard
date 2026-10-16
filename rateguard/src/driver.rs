@@ -9,7 +9,7 @@ use std::time::Duration;
 use rateguard_core::boundary::{Action, Event, PeerId};
 use rateguard_core::node::Node;
 use rateguard_proto::Address;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::guard::Shared;
@@ -26,27 +26,32 @@ pub(crate) fn sender(bytes: &[u8]) -> Option<PeerId> {
         .map(|update| PeerId::new(update.member))
 }
 
-/// Runs the node until the last `Guard` is gone; it notices on the next
-/// tick.
+/// Runs the node until it is asked to leave or the last `Guard` is gone,
+/// then leaves the cluster.
 pub(crate) async fn run<T: Transport>(
     mut node: Node,
     transport: Arc<T>,
     mut names: Names,
     shared: Weak<Shared>,
     mut ticker: tokio::time::Interval,
+    mut leave: mpsc::Receiver<oneshot::Sender<()>>,
 ) {
+    let Some(epoch) = shared.upgrade().map(|shared| shared.epoch) else {
+        return;
+    };
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Sending is given one tick: a transport that never completes a send
     // must not freeze the node, nor keep it alive once the last Guard is
     // gone.
     let budget = ticker.period();
     let mut buf = vec![0u8; rateguard_proto::MAX_DATAGRAM];
+    let mut done = None;
     loop {
         // The shared state is held only while the node works, never across
         // an await: the last Guard dropped must be noticed.
         let actions = tokio::select! {
             received = transport.recv_from(&mut buf) => {
-                let Some(shared) = shared.upgrade() else { return };
+                let Some(shared) = shared.upgrade() else { break };
                 match received {
                     Ok((len, _)) => match sender(&buf[..len]) {
                         Some(from) => {
@@ -59,15 +64,33 @@ pub(crate) async fn run<T: Transport>(
                 }
             }
             _ = ticker.tick() => {
-                let Some(shared) = shared.upgrade() else { return };
+                let Some(shared) = shared.upgrade() else { break };
                 sync(&mut node, &shared)
             }
             found = names.next() => {
                 names.update(&mut node, found);
                 Vec::new()
             }
+            // None: the last Guard is gone.
+            asked = leave.recv() => {
+                done = asked;
+                break;
+            }
         };
         send(&node, &*transport, actions, budget).await;
+    }
+
+    // The quotas drop to the floor before the peers hear: from the moment
+    // they do, they no longer count this node.
+    if let Some(shared) = shared.upgrade() {
+        hold_at_floor(&shared, node.limiter().config());
+        shared.running.store(false, Ordering::Relaxed);
+    }
+    let now = epoch.elapsed().as_nanos() as u64;
+    let actions = node.leave(now).to_vec();
+    send(&node, &*transport, actions, budget).await;
+    if let Some(done) = done {
+        let _ = done.send(());
     }
 }
 
@@ -252,19 +275,25 @@ pub(crate) async fn watch(
         return;
     };
     if error.is_panic() {
-        let n = shared.cluster_size.load(Ordering::Relaxed).max(1);
-        let floor = config.limit_per_sec as f64 * config.floor_factor / n as f64;
-        let quota = rateguard_core::gcra::Quota::per_second(floor, config.burst);
-        let now = shared.now();
-        shared
-            .table
-            .for_each(|_, slot| slot.gcra.set_quota(quota, now));
-        shared
-            .table
-            .for_each_free(|slot| slot.gcra.set_quota(quota, now));
-        shared.table.overflow().gcra.set_quota(quota, now);
+        hold_at_floor(&shared, &config);
     }
     shared.running.store(false, Ordering::Relaxed);
+}
+
+// Every key to the floor `R × β / N`, the part of the limit a cluster
+// leaves to each member: for a node its peers no longer count.
+fn hold_at_floor(shared: &Shared, config: &rateguard_core::limiter::Config) {
+    let n = shared.cluster_size.load(Ordering::Relaxed).max(1);
+    let floor = config.limit_per_sec as f64 * config.floor_factor / n as f64;
+    let quota = rateguard_core::gcra::Quota::per_second(floor, config.burst);
+    let now = shared.now();
+    shared
+        .table
+        .for_each(|_, slot| slot.gcra.set_quota(quota, now));
+    shared
+        .table
+        .for_each_free(|slot| slot.gcra.set_quota(quota, now));
+    shared.table.overflow().gcra.set_quota(quota, now);
 }
 
 // One tick: attempts in, the core's round, quotas out (spec §5.3).

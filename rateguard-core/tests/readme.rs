@@ -56,8 +56,10 @@ fn without_the_network() {
     }
 
     // From your own timer (several times per protocol period) and socket.
-    for Action::SendTo { peer, bytes } in node.handle(Event::Tick, now_nanos) {
-        send(*peer, bytes);
+    for action in node.handle(Event::Tick, now_nanos) {
+        if let Action::SendTo { peer, bytes } = action {
+            send(*peer, bytes);
+        }
     }
     node.handle(
         Event::MessageReceived {

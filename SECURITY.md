@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| 0.1.x | yes |
+| 0.2.x | yes |
+| 0.1.x | no |
 
 ## Reporting a vulnerability
 
@@ -18,7 +19,7 @@ with credit to you unless you prefer otherwise.
 rateguard's gossip protocol **assumes a trusted network**, as the README says:
 datagrams are neither encrypted nor authenticated. That anyone who can reach
 the UDP port can join the cluster, announce demand that shifts the shares, or
-declare members dead is the documented design of 0.1, not a vulnerability.
+declare members dead or gone is the documented design of 0.x, not a vulnerability.
 Keep the port on a private network or behind a firewall that admits only your
 own instances.
 

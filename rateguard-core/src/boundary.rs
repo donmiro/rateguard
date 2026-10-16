@@ -24,6 +24,7 @@ impl PeerId {
 
 /// Something that happened outside the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event<'a> {
     /// Time passed. See [`Node::handle`](crate::node::Node::handle) for how
     /// often it should come.
@@ -40,6 +41,7 @@ pub enum Event<'a> {
 
 /// Something the core asks the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Action {
     /// Send the bytes to `peer` as one datagram. Losing it is fine: the
     /// protocol is built for loss.

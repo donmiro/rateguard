@@ -28,6 +28,7 @@ use crate::membership::{Change, Membership};
 
 /// What applying a piece of news did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Applied {
     /// Old or repeated news: nothing changed.
     Ignored,

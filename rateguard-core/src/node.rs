@@ -682,6 +682,8 @@ impl Node {
             } => self.acknowledged(from, seq, demand, now),
             Message::PingReq { seq, target, .. } => self.relay(from, seq, PeerId::new(target), now),
             Message::Leave { .. } => unreachable!("handled above"),
+            // A message this version does not know changes nothing.
+            _ => {}
         }
     }
 

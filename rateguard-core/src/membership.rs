@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 
 /// A peer entering or leaving [`peers`](Membership::peers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Change {
     /// The peer became live.
     Joined(PeerId),

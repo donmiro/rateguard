@@ -13,6 +13,7 @@ const ONE_SEC: Nanos = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// What a node does when its cluster shrinks; see the variants.
+#[non_exhaustive]
 pub enum PartitionPolicy {
     /// Shares follow the surviving cluster at once. Up to k·R during a
     /// split; nothing is ever left unused.

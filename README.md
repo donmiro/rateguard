@@ -54,7 +54,7 @@ if guard.check("api:tenant-42").is_allowed() {
 
 ```toml
 [dependencies]
-rateguard = "0.1"
+rateguard = "0.2"
 ```
 
 Requires Rust 1.88 or newer (2024 edition).
@@ -217,8 +217,10 @@ match node.check(key_hash, now_nanos) {
 }
 
 // From your own timer (several times per protocol period) and socket.
-for Action::SendTo { peer, bytes } in node.handle(Event::Tick, now_nanos) {
-    send(*peer, bytes);
+for action in node.handle(Event::Tick, now_nanos) {
+    if let Action::SendTo { peer, bytes } = action {
+        send(*peer, bytes);
+    }
 }
 node.handle(
     Event::MessageReceived {

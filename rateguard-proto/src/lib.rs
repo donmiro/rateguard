@@ -126,6 +126,7 @@ pub struct DemandReport {
 /// A SWIM message. Every one carries membership news and demand. The
 /// variant order is the wire format: do not reorder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Message {
     /// Are you alive? The answer is an `Ack` with the same `seq`.
     Ping {
@@ -201,6 +202,7 @@ impl Message {
 
 /// Why a message could not be encoded or decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// More than [`MAX_UPDATES`] updates.
     TooManyUpdates(usize),

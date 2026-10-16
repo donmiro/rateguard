@@ -513,6 +513,8 @@ impl<L: Link> Sim<L> {
                         *next_seq += 1;
                     }
                 }
+                // The simulator must model every action the core can ask for.
+                other => unreachable!("an action the simulator does not know: {other:?}"),
             }
         }
     }

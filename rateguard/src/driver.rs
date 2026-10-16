@@ -330,7 +330,11 @@ fn sync(node: &mut Node, shared: &Arc<Shared>) -> Vec<Action> {
 // that took too long to leave, is the protocol's normal case.
 async fn send<T: Transport>(node: &Node, transport: &T, actions: Vec<Action>, budget: Duration) {
     let batch = async {
-        for Action::SendTo { peer, bytes } in actions {
+        for action in actions {
+            // Sending is the only action this runtime knows.
+            let Action::SendTo { peer, bytes } = action else {
+                continue;
+            };
             if let Some(address) = node.address(peer) {
                 let _ = transport.send_to(&bytes, address.into()).await;
             }

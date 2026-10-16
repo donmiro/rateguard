@@ -198,7 +198,12 @@ impl Limiter {
             state.demand.tick(now);
             let rate = state.demand.rate();
             let is_hot = hot_set.update_with(key, rate, threshold, now, elsewhere(key, state));
-            is_hot || state.gcra.has_debt(now) || rate >= SILENT_DEMAND
+            // Attempts not folded in yet are demand too: a key first seen
+            // at the moment of the tick would go with them.
+            is_hot
+                || state.gcra.has_debt(now)
+                || rate >= SILENT_DEMAND
+                || state.demand.has_pending()
         });
         for (&key, state) in keys.iter_mut() {
             let wanted = if hot_set.is_hot(key) {
@@ -369,6 +374,21 @@ mod tests {
             hot_set_size: 4,
             ..config()
         });
+    }
+
+    // A runtime hands over the attempts of a new key in the very tick of a
+    // round: the demand has had no time to measure them yet, and the key
+    // must wait for the next tick, not be dropped with them.
+    #[test]
+    fn attempts_counted_at_the_moment_of_a_tick_are_kept_for_the_next() {
+        let mut l = limiter();
+        l.record_attempts(KEY, 50, ONE_SEC, N);
+        l.tick(ONE_SEC, N);
+        assert!(l.tracked(KEY), "dropped with its attempts");
+        l.tick(ONE_SEC + ONE_SEC / 5, N);
+        assert!(l.hot_demand().is_empty() && l.tracked(KEY));
+        let demand = l.keys[&KEY].demand.rate();
+        assert!(demand > 10.0, "the attempts count: {demand}");
     }
 
     #[test]

@@ -69,23 +69,12 @@ async fn checks_crowded_into_the_overflow_slot_are_counted_apart() {
     assert!(stats.overflowed >= 150, "{stats:?}");
 }
 
-// Steady traffic on one key, until the guard is dropped: a key checked
-// once may be forgotten at once, if its attempts reach the node in the
-// very tick of a round.
-fn traffic(guard: &Guard, key: &'static str) {
-    let guard = guard.clone();
-    tokio::spawn(async move {
-        loop {
-            let _ = guard.check(key);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    });
-}
-
 #[tokio::test]
 async fn a_lone_node_tells_its_cluster_and_keys() {
     let guard = builder(100, 5).spawn().unwrap();
-    traffic(&guard, "k");
+    // One check, before the first tick: its attempt reaches the node in the
+    // tick of the first round, and the key must not be dropped with it.
+    let _ = guard.check("k");
     let stats = until(&guard, |s| s.tracked_keys == 1).await;
     assert_eq!((stats.cluster_size, stats.counted_size), (1, 1));
     assert_eq!((stats.suspects, stats.hot_keys), (0, 0));

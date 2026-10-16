@@ -69,6 +69,12 @@ impl Demand {
         self.last_tick = Some(now);
     }
 
+    /// Whether attempts wait for a tick to be folded in: counted at the
+    /// moment of the last tick, they had no interval to be measured over.
+    pub fn has_pending(&self) -> bool {
+        self.attempts_since_tick > 0
+    }
+
     /// The average, in attempts per second, as of the last tick.
     pub fn rate(&self) -> f64 {
         self.current_rate

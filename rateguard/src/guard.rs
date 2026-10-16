@@ -1,7 +1,7 @@
 //! The request path.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use rateguard_core::gcra;
@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::key::key_hash;
+use crate::stats::{Report, Stats};
 use crate::table::KeyTable;
 
 /// The answer to a request. Two answers and no more, ever: matching both is
@@ -42,12 +43,25 @@ pub(crate) struct Shared {
     pub running: AtomicBool,
     /// Asks the background task to leave; it answers once it has.
     pub leave: mpsc::Sender<oneshot::Sender<()>>,
+    /// Admit what would be denied; read on the way to a denial only.
+    pub dry_run: AtomicBool,
+    /// For `Guard::stats`; never taken on the request path.
+    pub report: Mutex<Report>,
+    /// The `guard` label of the metrics: the address the node advertises.
+    #[cfg(feature = "metrics")]
+    pub metrics_label: String,
 }
 impl Shared {
     /// Nanoseconds since the node started, on tokio's clock: the OS's
     /// monotonic clock in production, simulated time under a simulator.
     pub fn now(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// The report, even if the background task panicked holding it: what
+    /// it left is still worth showing.
+    pub fn report(&self) -> MutexGuard<'_, Report> {
+        self.report.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -79,15 +93,53 @@ impl Guard {
         let shared = &*self.shared;
         let now = shared.now();
         let slot = shared.table.slot(key_hash(key));
-        if !shared.table.is_overflow(slot) {
-            slot.attempts.fetch_add(1, crate::sync::Ordering::Relaxed);
-        }
+        slot.count_attempt();
         match slot.gcra.check(now) {
             gcra::Decision::Allow => Decision::Allow,
-            gcra::Decision::Deny { retry_at } => Decision::Deny {
-                retry_after: Duration::from_nanos(retry_at - now),
-            },
+            gcra::Decision::Deny { retry_at } => {
+                slot.count_denial();
+                if shared.dry_run.load(Ordering::Relaxed) {
+                    return Decision::Allow;
+                }
+                Decision::Deny {
+                    retry_after: Duration::from_nanos(retry_at - now),
+                }
+            }
         }
+    }
+
+    /// The node's state as of the last tick of its background task, for a
+    /// dashboard or a health check: what it admitted and denied, how it
+    /// sees the cluster, and why, if it does, it holds every key at the
+    /// floor. Takes a lock the request path never takes.
+    pub fn stats(&self) -> Stats {
+        let shared = &*self.shared;
+        let report = shared.report();
+        let mut stats = report.stats.clone();
+        stats.admitted = report.attempts.saturating_sub(stats.denied);
+        stats.since_last_round = report
+            .last_round
+            .map(|at| Duration::from_nanos(shared.now().saturating_sub(at)));
+        stats.running = self.is_running();
+        stats.dry_run = shared.dry_run.load(Ordering::Relaxed);
+        stats
+    }
+
+    /// The rate, in requests per second, this instance admits for `key`
+    /// now, on top of its burst: its share of the limit. `None` if it keeps
+    /// no state for the key; the key's next request then starts at the
+    /// rate of a new key. Never takes a place in the key table.
+    pub fn share(&self, key: &str) -> Option<f64> {
+        let slot = self.shared.table.find(key_hash(key))?;
+        Some(slot.gcra.quota().rate_per_sec())
+    }
+
+    /// Starts or ends a dry run, for every clone of this `Guard`: when on,
+    /// [`check`](Guard::check) admits every request and counts those it
+    /// would have denied in [`Stats::denied`]. For trying a limit on real
+    /// traffic first, then enforcing it with no restart.
+    pub fn set_dry_run(&self, on: bool) {
+        self.shared.dry_run.store(on, Ordering::Relaxed);
     }
 
     /// The nodes this one counts in the cluster, itself included.

@@ -69,6 +69,7 @@ pub struct Builder {
     period: Option<Duration>,
     hot_keys: Option<usize>,
     tracked_keys: Option<usize>,
+    dry_run: bool,
 }
 
 impl Builder {
@@ -135,6 +136,15 @@ impl Builder {
     /// How many keys one node coordinates at once; at most 64, the default.
     pub fn hot_keys(mut self, n: usize) -> Self {
         self.hot_keys = Some(n);
+        self
+    }
+
+    /// Starts the node in a dry run: every request is admitted, and those
+    /// that would have been denied are counted in
+    /// [`Stats::denied`](crate::Stats::denied). Off by default; see
+    /// [`Guard::set_dry_run`](crate::Guard::set_dry_run).
+    pub fn dry_run(mut self, on: bool) -> Self {
+        self.dry_run = on;
         self
     }
 
@@ -263,6 +273,7 @@ impl Builder {
             core,
             swim,
             policy: self.policy.unwrap_or_default().to_core(),
+            dry_run: self.dry_run,
         })
     }
 }
@@ -326,6 +337,10 @@ fn start<T: crate::Transport>(
         epoch: tokio::time::Instant::now(),
         running: AtomicBool::new(true),
         leave,
+        dry_run: AtomicBool::new(settings.dry_run),
+        report: Default::default(),
+        #[cfg(feature = "metrics")]
+        metrics_label: settings.advertise.to_string(),
     });
     let transport = Arc::new(transport);
     if !settings.names.is_empty() {
@@ -397,6 +412,7 @@ pub(crate) struct Settings {
     pub core: Config,
     pub swim: SwimConfig,
     pub policy: partition::PartitionPolicy,
+    pub dry_run: bool,
 }
 
 /// Why a node could not start.

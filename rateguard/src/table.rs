@@ -18,20 +18,44 @@ const EMPTY: u64 = 0;
 /// A slot being reset: neither a key nor free.
 const BUSY: u64 = u64::MAX;
 
-/// One key's state: its GCRA and the attempts since the last tick.
+/// One key's state: its GCRA, and the attempts and denials since the last
+/// tick, both in one word. 32 bytes, two slots to a cache line: the size
+/// the README's memory bound (guarantee 4) counts, which a word of its own
+/// for the denials would have broken.
 #[derive(Debug)]
 pub(crate) struct Slot {
     key: AtomicU64,
     pub gcra: AtomicGcra,
-    pub attempts: AtomicU64,
+    /// Attempts in the low half, denials in the high: under 2³² of either
+    /// in one tick, as six million a second on one key, the most a node
+    /// handles, makes 300,000 in 50 ms.
+    counts: AtomicU64,
 }
+const ATTEMPT: u64 = 1;
+const DENIAL: u64 = 1 << 32;
 impl Slot {
     fn new(quota: Quota) -> Self {
         Self {
             key: AtomicU64::new(EMPTY),
             gcra: AtomicGcra::new(quota),
-            attempts: AtomicU64::new(0),
+            counts: AtomicU64::new(0),
         }
+    }
+
+    /// One more request, admitted or not.
+    pub fn count_attempt(&self) {
+        self.counts.fetch_add(ATTEMPT, Ordering::Relaxed);
+    }
+
+    /// One more denial, besides its attempt.
+    pub fn count_denial(&self) {
+        self.counts.fetch_add(DENIAL, Ordering::Relaxed);
+    }
+
+    /// The attempts and denials counted since the last call, cleared.
+    pub fn take_counts(&self) -> (u64, u64) {
+        let counts = self.counts.swap(0, Ordering::Relaxed);
+        (counts & (DENIAL - 1), counts >> 32)
     }
 }
 
@@ -172,6 +196,13 @@ impl KeyTable {
         winner
     }
 
+    /// The slot holding `key`, if one does; never takes one.
+    pub fn find(&self, key: u64) -> Option<&Slot> {
+        self.candidates(key)
+            .find(|slot| slot.key.load(Ordering::Acquire) == key)
+    }
+
+    #[cfg(test)]
     pub fn is_overflow(&self, slot: &Slot) -> bool {
         std::ptr::eq(slot, &self.overflow)
     }
@@ -216,7 +247,7 @@ impl KeyTable {
             return false;
         }
         slot.gcra.reset(quota);
-        slot.attempts.store(0, Ordering::Relaxed);
+        slot.counts.store(0, Ordering::Relaxed);
         slot.key.store(EMPTY, Ordering::Release);
         true
     }
@@ -241,6 +272,26 @@ mod tests {
             let key = (i << 40) | (5 << 32) | 3;
             assert!(!t.is_overflow(t.slot(key)), "key {i} overflowed");
         }
+    }
+
+    // The README's memory bound counts 32 bytes a slot (guarantee 4), two
+    // to a 64-byte cache line.
+    #[test]
+    fn a_slot_is_a_half_cache_line() {
+        assert_eq!(std::mem::size_of::<Slot>(), 32);
+    }
+
+    #[test]
+    fn a_slot_counts_attempts_and_denials_apart() {
+        let t = KeyTable::new(1, q());
+        let slot = t.slot(1);
+        for _ in 0..5 {
+            slot.count_attempt();
+        }
+        slot.count_denial();
+        slot.count_denial();
+        assert_eq!(slot.take_counts(), (5, 2));
+        assert_eq!(slot.take_counts(), (0, 0), "taking them clears them");
     }
 
     #[test]
@@ -272,7 +323,8 @@ mod tests {
         for _ in 0..10 {
             t.slot(1).gcra.check(0);
         }
-        t.slot(1).attempts.fetch_add(3, Ordering::Relaxed);
+        t.slot(1).count_attempt();
+        t.slot(1).count_denial();
         let slot = t.slot(1);
         assert!(t.release(slot, 1, q()));
         assert!(!t.release(slot, 1, q()), "freed once only");
@@ -282,7 +334,7 @@ mod tests {
             "the freed slot is reused"
         );
         assert!(!next.gcra.has_debt(0));
-        assert_eq!(next.attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(next.take_counts(), (0, 0));
     }
 
     #[test]
@@ -349,14 +401,14 @@ mod tests {
             for _ in 0..8 {
                 s.spawn(|| {
                     for &key in &keys {
-                        t.slot(key).attempts.fetch_add(1, Ordering::Relaxed);
+                        t.slot(key).count_attempt();
                     }
                 });
             }
         });
         let mut seen = std::collections::HashMap::new();
         t.for_each(|key, slot| {
-            *seen.entry(key).or_insert(0) += slot.attempts.load(Ordering::Relaxed);
+            *seen.entry(key).or_insert(0) += slot.take_counts().0;
         });
         assert_eq!(seen.len(), 300, "one slot per key");
         let lost = 8 * 300 - seen.values().sum::<u64>();

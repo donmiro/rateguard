@@ -133,6 +133,21 @@ pub struct Node {
     reported: VecDeque<(Nanos, Vec<KeyDemand>)>,
     recent_shares: BTreeMap<u64, [f64; RISE_DELAY_ROUNDS]>,
     left: bool,
+    held: Held,
+}
+
+/// Why a node holds every key at the floor `R·β/N`, if it does; see
+/// [`Node::held`]. More than one reason may hold at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct Held {
+    /// It has seeds, or expects peers, and has not joined anyone yet.
+    pub joining: bool,
+    /// It has joined, but its peers may not have heard its demand yet.
+    pub learning: bool,
+    /// Under `Quorum`, it has lost its majority, or regained it too
+    /// recently to have been heard.
+    pub without_quorum: bool,
 }
 /// The sizes of a node's collections; see [`Node::footprint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +236,7 @@ impl Node {
             reported: VecDeque::new(),
             recent_shares: BTreeMap::new(),
             left: false,
+            held: Held::default(),
         }
     }
 
@@ -334,6 +350,19 @@ impl Node {
     // largest of the hold. Cold and hot keys use the same one (spec §4.1).
     fn allocation_size(&self) -> usize {
         self.members.cluster_size().max(self.held_size)
+    }
+
+    /// The N the limit is shared out over: the [cluster
+    /// size](Node::cluster_size), or more under `HoldDown` while a lost
+    /// member is still held.
+    pub fn counted_size(&self) -> usize {
+        self.allocation_size()
+    }
+
+    /// Why every key is held at the floor, as of the last round or change
+    /// of seeds.
+    pub fn held(&self) -> Held {
+        self.held
     }
 
     /// The member table, read only.
@@ -918,17 +947,23 @@ impl Node {
         let floor = |known: usize| config.limit_per_sec as f64 * config.floor_factor / known as f64;
 
         let waiting = self.joined_at.is_none() && (self.expects_peers || !self.seeds.is_empty());
+        let held = Held {
+            joining: waiting && self.policy != PartitionPolicy::Optimistic,
+            learning: !waiting && !self.informed_since(self.joined_at.unwrap_or(0), now),
+            without_quorum: self.policy == PartitionPolicy::Quorum && now < self.floored_until,
+        };
         let mut caps = Vec::with_capacity(3);
-        if waiting && self.policy != PartitionPolicy::Optimistic {
+        if held.joining {
             caps.push(floor(1 + self.seeds.len()));
         }
-        if !waiting && !self.informed_since(self.joined_at.unwrap_or(0), now) {
+        if held.learning {
             caps.push(floor(self.allocation_size()));
         }
-        if self.policy == PartitionPolicy::Quorum && now < self.floored_until {
+        if held.without_quorum {
             caps.push(floor(self.quorum_size));
         }
         self.limiter.set_cap(caps.into_iter().reduce(f64::min));
+        self.held = held;
     }
 
     // Learning (spec §10.5): whether every live peer has been heard since
@@ -2523,6 +2558,58 @@ mod tests {
         let (mut n, buried) = abandoned(PartitionPolicy::Quorum);
         // R × β / 5, the five the node knows of, the dead included.
         assert_eq!(cold_rate_after_round(&mut n, buried), 20.0);
+    }
+
+    #[test]
+    fn held_says_a_node_waits_to_join_then_learns_then_is_free() {
+        let mut n = waiting_for(PartitionPolicy::default());
+        n.handle(Event::Tick, 0);
+        assert_eq!(
+            n.held(),
+            Held {
+                joining: true,
+                ..Held::default()
+            }
+        );
+
+        let hello = Message::Ack {
+            seq: 1,
+            updates: vec![news(1, 0, Alive)],
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 1, hello, 1);
+        n.handle(Event::Tick, PERIOD);
+        assert_eq!(
+            n.held(),
+            Held {
+                learning: true,
+                ..Held::default()
+            }
+        );
+
+        deliver(&mut n, 1, ack(9), PERIOD + 1);
+        n.handle(Event::Tick, 2 * PERIOD);
+        assert_eq!(n.held(), Held::default());
+    }
+
+    #[test]
+    fn held_says_a_node_is_without_a_quorum() {
+        let (mut n, buried) = abandoned(PartitionPolicy::Quorum);
+        n.handle(Event::Tick, buried.next_multiple_of(PERIOD));
+        assert!(n.held().without_quorum);
+    }
+
+    #[test]
+    fn the_counted_size_keeps_a_lost_member_for_the_hold() {
+        let hold = 20 * PERIOD;
+        let (mut n, buried) = abandoned(PartitionPolicy::HoldDown(hold));
+        n.handle(Event::Tick, buried.next_multiple_of(PERIOD));
+        assert_eq!((n.cluster_size(), n.counted_size()), (1, 5));
+        n.handle(
+            Event::Tick,
+            (buried + hold + PERIOD).next_multiple_of(PERIOD),
+        );
+        assert_eq!((n.cluster_size(), n.counted_size()), (1, 1));
     }
 
     // Forgetting the dead must not hand the minority a majority of itself:

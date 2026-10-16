@@ -299,13 +299,21 @@ fn hold_at_floor(shared: &Shared, config: &rateguard_core::limiter::Config) {
 // One tick: attempts in, the core's round, quotas out (spec §5.3).
 fn sync(node: &mut Node, shared: &Arc<Shared>) -> Vec<Action> {
     let now = shared.now();
+    let (mut attempts, mut denied) = (0, 0);
     shared.table.for_each(|key, slot| {
-        let n = slot.attempts.swap(0, crate::sync::Ordering::Relaxed);
+        let (n, d) = slot.take_counts();
         if n > 0 {
             node.record_attempts(key, n, now);
         }
+        attempts += n;
+        denied += d;
     });
+    // Not a key: counted, but no demand of anyone's.
+    let (overflowed, d) = shared.table.overflow().take_counts();
+    attempts += overflowed;
+    denied += d;
     let actions = node.handle(Event::Tick, now).to_vec();
+    report(node, shared, attempts, denied, overflowed);
 
     let new_key = node.new_key_quota();
     shared.table.for_each(|key, slot| match node.quota(key) {
@@ -323,6 +331,44 @@ fn sync(node: &mut Node, shared: &Arc<Shared>) -> Vec<Action> {
         .cluster_size
         .store(node.cluster_size(), Ordering::Relaxed);
     actions
+}
+
+// This tick's counts and the node's state into the report for
+// Guard::stats.
+fn report(node: &Node, shared: &Shared, attempts: u64, denied: u64, overflowed: u64) {
+    use rateguard_core::membership::Membership;
+    use rateguard_proto::Status;
+
+    let members = node.members();
+    let suspects = members
+        .peers()
+        .iter()
+        .filter(|&&peer| members.status(peer) == Some(Status::Suspect))
+        .count();
+    let held = node.held();
+    let mut report = shared.report();
+    report.attempts += attempts;
+    report.last_round = node.last_round();
+    let stats = &mut report.stats;
+    stats.denied += denied;
+    stats.overflowed += overflowed;
+    stats.cluster_size = node.cluster_size();
+    stats.counted_size = node.counted_size();
+    stats.suspects = suspects;
+    stats.tracked_keys = node.limiter().tracked_keys();
+    stats.hot_keys = node.limiter().hot_keys();
+    stats.joining = held.joining;
+    stats.learning = held.learning;
+    stats.without_quorum = held.without_quorum;
+
+    #[cfg(feature = "metrics")]
+    {
+        let mut stats = stats.clone();
+        stats.admitted = report.attempts.saturating_sub(stats.denied);
+        stats.dry_run = shared.dry_run.load(Ordering::Relaxed);
+        drop(report);
+        crate::metrics::publish(&stats, &shared.metrics_label);
+    }
 }
 
 // The whole batch gets the budget, not each datagram: three PING-REQs on a

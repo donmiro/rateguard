@@ -45,6 +45,9 @@ if guard.check("api:tenant-42").is_allowed() {
   many distinct keys your traffic actually contains.
 - **Network partitions are a configuration choice**, with proven overshoot bounds
   for each policy, rather than undefined behaviour.
+- **Observable, and safe to roll out.** `stats()` and optional `metrics` say
+  what each instance admits and denies and why; a dry run counts what would
+  be denied without denying it, and enforcement turns on with no restart.
 - **Synchronous API.** `check()` is a plain function. No `async`, no executor
   required, callable from any thread.
 - **No `unsafe`**, and a pure sans-I/O core: no async runtime, no clock, no
@@ -54,10 +57,14 @@ if guard.check("api:tenant-42").is_allowed() {
 
 ```toml
 [dependencies]
-rateguard = "0.2"
+rateguard = "0.3"
 ```
 
-Requires Rust 1.88 or newer (2024 edition).
+Requires Rust 1.88 or newer (2024 edition). Optional features:
+
+- `tower`: a `tower` layer, for axum and any tower stack;
+- `metrics`: what `Guard::stats` tells, through the
+  [`metrics`](https://crates.io/crates/metrics) facade.
 
 ## Usage
 
@@ -130,33 +137,24 @@ a key lives in the table depends on a secret random to each instance.
 
 ### With `axum`
 
-Runnable as `cargo run -p rateguard --example axum`.
+With the `tower` feature, `RateLimitLayer` takes the key from each request
+and answers a denied one with `429 Too Many Requests` and `Retry-After`.
+Runnable as `cargo run -p rateguard --features tower --example axum`.
 
 ```rust
-use axum::{
-    extract::{Request, State},
-    http::{StatusCode, header},
-    middleware::Next,
-    response::{IntoResponse, Response},
-};
-use rateguard::{Decision, Guard};
+use axum::extract::Request;
+use rateguard::tower::RateLimitLayer;
 
-async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Response {
-    let key = format!("api:{}", tenant_of(&req));
+// One limit per tenant. A request with no tenant is not limited:
+// return a key for it too, such as "api:anonymous", to limit it.
+let limit = RateLimitLayer::new(guard, |req: &Request| {
+    let tenant = req.headers().get("x-tenant")?.to_str().ok()?;
+    Some(format!("api:{tenant}"))
+});
 
-    match guard.check(&key) {
-        Decision::Allow => next.run(req).await,
-        Decision::Deny { retry_after } => (
-            StatusCode::TOO_MANY_REQUESTS,
-            // Whole seconds, rounded up: rounding down invites an early retry.
-            [(
-                header::RETRY_AFTER,
-                retry_after.as_millis().div_ceil(1000).max(1).to_string(),
-            )],
-        )
-            .into_response(),
-    }
-}
+let app = Router::new()
+    .route("/", get(|| async { "served\n" }))
+    .layer(limit);
 ```
 
 ### Configuration
@@ -172,6 +170,56 @@ async fn rate_limit(State(guard): State<Guard>, req: Request, next: Next) -> Res
 | `protocol_period(d)` | `200 ms` | How often nodes exchange membership and demand |
 | `hot_keys(n)` | `64` | How many keys may be coordinated at once, at most 64 |
 | `tracked_keys(n)` | `4096` | Keys one instance keeps state for at once, at least `hot_keys` and at most 1,048,576; the table holds twice as many |
+| `dry_run(on)` | `false` | Admit every request and count those that would be denied; see [Dry run](#dry-run) |
+
+### Observability
+
+`guard.stats()` tells what one instance did and how it sees the cluster, as
+of the last tick of its background task, 50 ms ago at most. It takes a lock
+the request path never takes.
+
+```rust
+let stats = guard.stats();
+// Since the instance started.
+println!("{} admitted, {} denied", stats.admitted, stats.denied);
+```
+
+| Field | What a dashboard learns from it |
+|---|---|
+| `admitted`, `denied` | What this instance decided; in a dry run, `denied` counts what it would have denied |
+| `overflowed` | Checks on keys with no place of their own in the key table: if it grows, raise `tracked_keys` |
+| `cluster_size`, `counted_size` | Members seen, and the N the limit is shared over. `counted_size` stays higher under `HoldDown` while a lost member is held: the fleet is under the limit then, not over |
+| `suspects` | Members not heard from lately; many of them, a network in trouble |
+| `joining`, `learning`, `without_quorum` | Why every key is held at the floor `R × β / N`, if one is true: no peer reached yet, peers not yet told this node's demand, or no majority under `Quorum` |
+| `tracked_keys`, `hot_keys` | Keys with state here, and keys coordinated with the peers |
+| `since_last_round` | Far over the protocol period, the background task is stuck |
+| `running`, `dry_run` | Whether the node still runs, and whether this is a dry run |
+
+`guard.share(key)` is the rate one key is admitted at on this instance now:
+its share of the limit, before the burst.
+
+With the `metrics` feature the background task publishes the same, labelled
+`guard` with the address the instance advertises:
+`rateguard_checks_total{decision="allow"|"deny"}`,
+`rateguard_overflowed_total`, and the gauges `rateguard_cluster_size`,
+`rateguard_counted_size`, `rateguard_suspects`, `rateguard_tracked_keys`,
+`rateguard_hot_keys`, `rateguard_held{reason="joining"|"learning"|"without_quorum"}`
+and `rateguard_dry_run`. Install any `metrics` recorder, Prometheus or
+another; nothing is published on the request path.
+
+### Dry run
+
+To try a limit on real traffic before enforcing it, start with
+`.dry_run(true)`: `check()` then admits every request, and counts those it
+would have denied in `stats().denied`. When the numbers look right, turn
+enforcement on with no restart, from any clone of the guard:
+
+```rust
+guard.set_dry_run(false);
+```
+
+A denied request in a dry run uses up nothing, as when enforcing: the count
+of would-be denials is the count enforcement would give.
 
 ### Without the network
 
@@ -442,7 +490,8 @@ departure as a crash.
 **How do I health-check it?** `guard.is_running()` turns false if the
 background task has died, which is a bug; the instance then holds every key at
 the floor `R × β / N` rather than at shares its peers no longer count.
-`guard.cluster_size()` tells you how many members it sees, itself included.
+`guard.cluster_size()` tells you how many members it sees, itself included, and
+`guard.stats()` the rest, see [Observability](#observability).
 
 **Does clock skew matter?** No. Nodes never compare timestamps with each other;
 each uses only its own monotonic clock, and what travels between them are demand

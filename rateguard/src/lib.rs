@@ -34,11 +34,17 @@ mod config;
 mod driver;
 mod guard;
 mod key;
+#[cfg(feature = "metrics")]
+mod metrics;
+mod stats;
 mod sync;
 mod table;
+#[cfg(feature = "tower")]
+pub mod tower;
 mod transport;
 
 pub use config::{Builder, Error, PartitionPolicy};
 pub use guard::{Decision, Guard};
 pub use key::key_hash;
+pub use stats::Stats;
 pub use transport::Transport;

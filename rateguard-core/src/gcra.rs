@@ -70,6 +70,17 @@ impl Quota {
         }
     }
 
+    /// The rate, in requests per second: the one it was made with, up to
+    /// the rounding of the interval to whole nanoseconds.
+    pub fn rate_per_sec(&self) -> f64 {
+        ONE_SEC as f64 / self.interval as f64
+    }
+
+    /// How many requests may arrive back to back.
+    pub fn burst(&self) -> u32 {
+        self.burst
+    }
+
     /// The quota as one word, for an `AtomicU64`.
     pub fn pack(self) -> u64 {
         (self.interval << BURST_BITS) | self.burst as u64
@@ -261,6 +272,12 @@ mod tests {
 
     fn quota(rate: u32, burst: u32) -> Quota {
         Quota::new(rate, burst)
+    }
+
+    #[test]
+    fn a_quota_tells_its_rate_and_burst() {
+        let q = Quota::per_second(2.5, 7);
+        assert_eq!((q.rate_per_sec(), q.burst()), (2.5, 7));
     }
 
     #[test]

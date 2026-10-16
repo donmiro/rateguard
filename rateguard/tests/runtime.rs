@@ -25,6 +25,25 @@ fn alone(limit: u32, burst: u32) -> Guard {
         .unwrap()
 }
 
+// Joining over real sockets takes a few rounds, more on a busy machine:
+// wait for the sizes rather than sleep a fixed time, and name the sizes
+// last seen if they never come. 1 is a node that did not join; more than
+// the nodes here, a stranger that did.
+async fn until_each_sees(guards: &[&Guard], size: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sizes: Vec<usize> = guards.iter().map(|guard| guard.cluster_size()).collect();
+        if sizes.iter().all(|&seen| seen == size) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cluster sizes {sizes:?} after 10 s, {size} expected at each"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_lone_node_admits_one_burst_at_once() {
     let guard = alone(100, 5);
@@ -185,8 +204,7 @@ async fn two_nodes_on_loopback_find_each_other() {
         .limit(100)
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!((a.cluster_size(), b.cluster_size()), (2, 2));
+    until_each_sees(&[&a, &b], 2).await;
 }
 
 #[tokio::test]
@@ -203,8 +221,7 @@ async fn a_node_finds_its_seed_by_name() {
         .limit(100)
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!((a.cluster_size(), b.cluster_size()), (2, 2));
+    until_each_sees(&[&a, &b], 2).await;
 }
 
 // The lookups run on a task of their own, which holds the socket too: it
@@ -240,8 +257,7 @@ async fn a_node_bound_to_port_zero_advertises_the_port_it_got() {
         .limit(100)
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!((seed.cluster_size(), joiner.cluster_size()), (2, 2));
+    until_each_sees(&[&seed, &joiner], 2).await;
 }
 
 #[test]

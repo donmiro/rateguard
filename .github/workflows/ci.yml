@@ -30,6 +30,9 @@ jobs:
       # the RATEGUARD_SEED=... line that replays it locally.
       - name: Test
         run: cargo test --workspace --locked
+      # The optional integrations, with the tests and example they gate.
+      - name: Features
+        run: cargo test -p rateguard --features tower,metrics --locked
       # The key table's races, explored exhaustively. A crate-local cfg:
       # `--cfg loom` would switch tokio into its own loom build too.
       - name: Loom
@@ -54,4 +57,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - name: Check
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets --all-features --locked

@@ -1,0 +1,46 @@
+//! What `Guard::stats` tells, through the `metrics` facade: published by the
+//! background task once a tick, so the request path pays nothing for it.
+//! Every metric carries `guard`, the address the node advertises: a process
+//! may run several.
+
+use crate::stats::Stats;
+
+pub(crate) fn publish(stats: &Stats, guard: &str) {
+    let label = ("guard", guard.to_owned());
+    let flag = |on: bool| if on { 1.0 } else { 0.0 };
+
+    let checks = |decision: &'static str| {
+        metrics::counter!(
+            "rateguard_checks_total",
+            &[label.clone(), ("decision", decision.to_owned())]
+        )
+    };
+    checks("allow").absolute(stats.admitted);
+    checks("deny").absolute(stats.denied);
+    metrics::counter!("rateguard_overflowed_total", std::slice::from_ref(&label))
+        .absolute(stats.overflowed);
+
+    let gauges = [
+        ("rateguard_cluster_size", stats.cluster_size as f64),
+        ("rateguard_counted_size", stats.counted_size as f64),
+        ("rateguard_suspects", stats.suspects as f64),
+        ("rateguard_tracked_keys", stats.tracked_keys as f64),
+        ("rateguard_hot_keys", stats.hot_keys as f64),
+        ("rateguard_dry_run", flag(stats.dry_run)),
+    ];
+    for (name, value) in gauges {
+        metrics::gauge!(name, std::slice::from_ref(&label)).set(value);
+    }
+    let held = [
+        ("joining", stats.joining),
+        ("learning", stats.learning),
+        ("without_quorum", stats.without_quorum),
+    ];
+    for (reason, on) in held {
+        metrics::gauge!(
+            "rateguard_held",
+            &[label.clone(), ("reason", reason.to_owned())]
+        )
+        .set(flag(on));
+    }
+}

@@ -11,22 +11,35 @@ keywords = ["rate-limit", "rate-limiter", "distributed", "gossip", "tokio"]
 categories = ["network-programming", "web-programming", "concurrency"]
 
 [dependencies]
-rateguard-core = { version = "0.2.0", path = "../rateguard-core" }
-rateguard-proto = { version = "0.2.0", path = "../rateguard-proto" }
+rateguard-core = { version = "0.3.0", path = "../rateguard-core" }
+rateguard-proto = { version = "0.3.0", path = "../rateguard-proto" }
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 turmoil = { version = "0.7", optional = true }
+metrics = { version = "0.24", optional = true }
+http = { version = "1", optional = true }
+tower-layer = { version = "0.3", optional = true }
+tower-service = { version = "0.3", optional = true }
+pin-project-lite = { version = "0.2", optional = true }
 
 [features]
 # A Transport for turmoil's simulated UDP, for the wiring tests.
 turmoil = ["dep:turmoil"]
+# Publishes what Guard::stats tells through the `metrics` facade.
+metrics = ["dep:metrics"]
+# rateguard::tower::RateLimitLayer, for axum and any tower stack.
+tower = ["dep:http", "dep:tower-layer", "dep:tower-service", "dep:pin-project-lite"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time", "macros", "test-util"] }
 criterion = "0.8"
 # examples/axum.rs, the middleware of the README.
 axum = "0.8"
+# tests/tower.rs drives the layer.
+tower = { version = "0.5", features = ["util"] }
+# tests/metrics.rs reads the published metrics back.
+metrics-util = { version = "0.20.4", features = ["debugging"] }
 
 [[bench]]
 name = "check"
@@ -37,3 +50,15 @@ loom = "0.7"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rateguard_loom)"] }
+
+[[example]]
+name = "axum"
+required-features = ["tower"]
+
+[[test]]
+name = "metrics"
+required-features = ["metrics"]
+
+[[test]]
+name = "tower"
+required-features = ["tower"]

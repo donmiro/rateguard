@@ -233,6 +233,12 @@ impl AtomicGcra {
     /// versioning the pair, which no longer fits one atomic word. Accepted:
     /// the costly side is the strict one.
     pub fn set_quota(&self, quota: Quota, now: Nanos) {
+        // Most calls change nothing, a runtime setting every slot's quota
+        // every tick: then they write nothing either, and a quota another
+        // thread sets meanwhile is not overwritten with a stale one.
+        if self.quota.load(Ordering::Acquire) == quota.pack() {
+            return;
+        }
         let old = Quota::unpack(self.quota.swap(quota.pack(), Ordering::AcqRel));
         if old == quota {
             return;

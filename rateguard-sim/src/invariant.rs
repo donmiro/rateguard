@@ -1,7 +1,7 @@
 //! Properties checked after every event of a simulation.
 
 use rateguard_core::gcra::{Decision, Nanos};
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::membership;
 use rateguard_core::node::Node;
 
@@ -27,6 +27,18 @@ pub struct View<'a> {
     pub happened: &'a Happened,
     pub nodes: &'a [Node],
     pub config: &'a Config,
+    /// The widest limit each key given one has had at any node; the other
+    /// keys have the config's.
+    pub key_limits: &'a HashMap<u64, Limit>,
+}
+impl View<'_> {
+    /// The widest limit `key` has had at any node.
+    pub fn limit_of(&self, key: u64) -> Limit {
+        self.key_limits
+            .get(&key)
+            .copied()
+            .unwrap_or(self.config.limit())
+    }
 }
 
 /// A property checked after every event of a run. A violation stops the run
@@ -170,9 +182,9 @@ impl Invariant for AdmissionWindow {
         }
 
         let admitted = times.len() as u128;
-        let rate_part =
-            self.limits as u128 * view.config.limit_per_sec as u128 * self.window as u128;
-        let burst_part = view.nodes.len() as u128 * view.config.burst as u128 * ONE_SEC as u128;
+        let limit = view.limit_of(admission.key);
+        let rate_part = self.limits as u128 * limit.per_second as u128 * self.window as u128;
+        let burst_part = view.nodes.len() as u128 * limit.burst as u128 * ONE_SEC as u128;
 
         if admitted * ONE_SEC as u128 > rate_part + burst_part {
             return Err(format!(
@@ -209,6 +221,8 @@ mod tests {
     }
 
     fn view<'a>(nodes: &'a [Node], config: &'a Config, happened: &'a Happened) -> View<'a> {
+        static NO_LIMITS: std::sync::LazyLock<HashMap<u64, Limit>> =
+            std::sync::LazyLock::new(HashMap::new);
         View {
             event: 0,
             now: 0,
@@ -216,6 +230,7 @@ mod tests {
             happened,
             nodes,
             config,
+            key_limits: &NO_LIMITS,
         }
     }
 

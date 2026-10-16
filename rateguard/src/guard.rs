@@ -1,6 +1,6 @@
 //! The request path.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -8,7 +8,10 @@ use rateguard_core::gcra;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use crate::key::key_hash;
+use crate::classes::Classes;
+use crate::config::Error;
+use crate::key::{class_hash, hash_in};
+use crate::limit::Limit;
 use crate::stats::{Report, Stats};
 use crate::table::KeyTable;
 
@@ -47,6 +50,13 @@ pub(crate) struct Shared {
     pub dry_run: AtomicBool,
     /// For `Guard::stats`; never taken on the request path.
     pub report: Mutex<Report>,
+    /// The classes of limits, the default one included.
+    pub classes: Classes,
+    /// The rate a key not seen before starts with, as a part of its R, as
+    /// an `f64`'s bits; kept current by the background task.
+    pub fresh_factor: AtomicU64,
+    /// The quota free slots carry, packed: the strictest of any class.
+    pub free_quota: AtomicU64,
     /// The `guard` label of the metrics: the address the node advertises.
     #[cfg(feature = "metrics")]
     pub metrics_label: String,
@@ -56,6 +66,14 @@ impl Shared {
     /// monotonic clock in production, simulated time under a simulator.
     pub fn now(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// The quota of a key taking its first slot in the class with this
+    /// hash.
+    pub fn fresh_quota(&self, class: u64) -> gcra::Quota {
+        let limit = self.classes.limit_of(class);
+        let factor = f64::from_bits(self.fresh_factor.load(Ordering::Relaxed));
+        gcra::Quota::per_second(limit.per_second as f64 * factor, limit.burst)
     }
 
     /// The report, even if the background task panicked holding it: what
@@ -90,10 +108,58 @@ impl Guard {
     /// The key is hashed here, at a cost that grows with its length: keep
     /// keys short, or hash long ones yourself.
     pub fn check(&self, key: &str) -> Decision {
+        self.check_hashed(0, hash_in(0, key))
+    }
+
+    /// Like [`check`](Guard::check), for a key of the class `class`: at
+    /// that class's limit. One key in two classes is two keys. A class this
+    /// node does not know, a typo or one since removed, takes the default
+    /// limit, and its checks are counted in
+    /// [`Stats::unknown_class`](crate::Stats::unknown_class).
+    ///
+    /// ```no_run
+    /// # fn run(guard: rateguard::Guard) {
+    /// let decision = guard.check_in("pro", "tenant:42");
+    /// # }
+    /// ```
+    pub fn check_in(&self, class: &str, key: &str) -> Decision {
+        let class = class_hash(class);
+        self.check_hashed(class, hash_in(class, key))
+    }
+
+    fn check_hashed(&self, class: u64, key: u64) -> Decision {
         let shared = &*self.shared;
         let now = shared.now();
-        let slot = shared.table.slot(key_hash(key));
-        slot.count_attempt();
+        let (slot, taken) = shared.table.claim(key);
+        // A key is always of one class, the class being part of its hash,
+        // so the slot is told it on every check: that also puts it back if
+        // a thread that lost a race for another key's slot wrote its own
+        // there late. The overflow slot is every class's at once.
+        let mend = slot.class.load(Ordering::Relaxed) != class && !shared.table.is_overflow(slot);
+        if mend {
+            slot.class.store(class, Ordering::Relaxed);
+        }
+        // Then the attempt, released after the class: the background task
+        // that takes the attempt sees the class it belongs to. Counted
+        // before the GCRA step, so that a slot with an attempt to count is
+        // not freed under the check, see the background task's tick.
+        slot.count_attempt(if mend {
+            Ordering::Release
+        } else {
+            Ordering::Relaxed
+        });
+        // A slot taken just now carries the strictest quota of any class:
+        // it gets its own class's. If the slot went to another key
+        // meanwhile, a race for this one lost after all, the quota goes
+        // back to the free slots' strict one, for the background task to
+        // set right at its next tick.
+        if taken {
+            slot.gcra.set_quota(shared.fresh_quota(class), now);
+            if !shared.table.holds(slot, key) {
+                let free = gcra::Quota::unpack(shared.free_quota.load(Ordering::Relaxed));
+                slot.gcra.set_quota(free, now);
+            }
+        }
         match slot.gcra.check(now) {
             gcra::Decision::Allow => Decision::Allow,
             gcra::Decision::Deny { retry_at } => {
@@ -130,8 +196,68 @@ impl Guard {
     /// no state for the key; the key's next request then starts at the
     /// rate of a new key. Never takes a place in the key table.
     pub fn share(&self, key: &str) -> Option<f64> {
-        let slot = self.shared.table.find(key_hash(key))?;
+        self.share_in("", key)
+    }
+
+    /// Like [`share`](Guard::share), for a key of the class `class`.
+    pub fn share_in(&self, class: &str, key: &str) -> Option<f64> {
+        let slot = self.shared.table.find(hash_in(class_hash(class), key))?;
         Some(slot.gcra.quota().rate_per_sec())
+    }
+
+    /// Adds the class `name` or changes its limit, for every clone of this
+    /// `Guard`. New keys of the class take it at once, known ones from the
+    /// next tick of the background task.
+    ///
+    /// Every instance of the service must be given the same classes:
+    /// while one has a class's new limit and another the old, the fleet
+    /// admits no more than the higher of the two. A raised limit is never
+    /// overshot; a lowered one takes effect once every instance has it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EmptyClassName`]: `""` is the default class, see
+    /// [`set_limit`](Guard::set_limit). [`Error::TooManyClasses`] for a new
+    /// class beyond [`Builder::max_classes`](crate::Builder::max_classes).
+    /// [`Error::ZeroLimit`] and [`Error::TooLargeBurst`], as for
+    /// [`Builder::limit`](crate::Builder::limit).
+    pub fn set_class(&self, name: &str, limit: Limit) -> Result<(), Error> {
+        self.shared.classes.set(name, limit)
+    }
+
+    /// Removes the class `name`: its keys take the default limit from then
+    /// on. Whether there was such a class.
+    pub fn remove_class(&self, name: &str) -> bool {
+        self.shared.classes.remove(name)
+    }
+
+    /// Changes the limit of the default class, the one of
+    /// [`check`](Guard::check); as [`set_class`](Guard::set_class) does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ZeroLimit`] and [`Error::TooLargeBurst`].
+    pub fn set_limit(&self, limit: Limit) -> Result<(), Error> {
+        self.shared.classes.set_default(limit)
+    }
+
+    /// Replaces every named class at once: those not listed are removed.
+    /// All or nothing: on an error no class changes. For applying a whole
+    /// set of tariffs from a config file or a control plane.
+    ///
+    /// # Errors
+    ///
+    /// As [`set_class`](Guard::set_class).
+    pub fn set_classes<S: Into<String>>(
+        &self,
+        classes: impl IntoIterator<Item = (S, Limit)>,
+    ) -> Result<(), Error> {
+        self.shared.classes.replace(classes)
+    }
+
+    /// The named classes and their limits, in no particular order.
+    pub fn classes(&self) -> Vec<(String, Limit)> {
+        self.shared.classes.list()
     }
 
     /// Starts or ends a dry run, for every clone of this `Guard`: when on,
@@ -175,5 +301,39 @@ impl Guard {
         if self.shared.leave.send(done).await.is_ok() {
             let _ = left.await;
         }
+    }
+}
+
+#[cfg(all(test, not(rateguard_loom)))]
+mod tests {
+    use super::*;
+
+    // Two threads taking slots for one new key at once may both think they
+    // took one; the one whose copy is given back may still write its class
+    // into the slot after another key has taken it. That key's next check
+    // puts its own class back.
+    #[tokio::test]
+    async fn a_slot_with_another_key_s_class_gets_its_own_back_at_the_next_check() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let guard = Guard::builder()
+            .bind(format!("127.0.0.1:{port}"))
+            .limit(1000)
+            .class("pro", Limit::per_second(100))
+            .spawn()
+            .unwrap();
+        let _ = guard.check_in("pro", "k");
+        let slot = guard
+            .shared
+            .table
+            .find(hash_in(class_hash("pro"), "k"))
+            .unwrap();
+        assert_eq!(slot.class.load(Ordering::Relaxed), class_hash("pro"));
+        slot.class.store(class_hash("free"), Ordering::Relaxed);
+        let _ = guard.check_in("pro", "k");
+        assert_eq!(slot.class.load(Ordering::Relaxed), class_hash("pro"));
     }
 }

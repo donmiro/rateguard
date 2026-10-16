@@ -8,13 +8,8 @@ use rateguard::tower::RateLimitLayer;
 use tower::{Layer, Service, ServiceExt, service_fn};
 
 fn guard(limit: u32, burst: u32) -> Guard {
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     Guard::builder()
-        .bind(format!("127.0.0.1:{port}"))
+        .bind("127.0.0.1:0")
         .limit(limit)
         .burst(burst)
         .spawn()
@@ -127,4 +122,43 @@ async fn the_layer_works_in_axum() {
     assert_eq!(first.status(), StatusCode::OK);
     let second = app.oneshot(get()).await.unwrap();
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_key_function_may_name_the_class_too() {
+    let guard = Guard::builder()
+        .bind("127.0.0.1:0")
+        .limit(100)
+        .burst(5)
+        .class("pro", rateguard::Limit::per_second(100).burst(2))
+        .spawn()
+        .unwrap();
+    let inner = service_fn(|_: Request<String>| async {
+        Ok::<_, Infallible>(Response::new("served".to_owned()))
+    });
+    let mut svc = RateLimitLayer::new(guard, |req: &Request<String>| {
+        let plan = req.headers().get("x-plan")?.to_str().ok()?;
+        Some((plan.to_owned(), "tenant:42"))
+    })
+    .layer(inner);
+    let pro = || {
+        Request::builder()
+            .header("x-plan", "pro")
+            .body(String::new())
+            .unwrap()
+    };
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let res = svc.ready().await.unwrap().call(pro()).await.unwrap();
+        statuses.push(res.status());
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS
+        ],
+        "pro's burst of 2"
+    );
 }

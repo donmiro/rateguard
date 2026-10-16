@@ -6,7 +6,7 @@
 //! node. Seeds are fixed, so the table is the same on every run.
 
 use rateguard_core::gcra::{Decision, Nanos};
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::partition::PartitionPolicy;
 
 use crate::link::{Fate, Link, NetConfig, NodeIndex, PerfectLink, SeededLink};
@@ -295,6 +295,31 @@ fn late_joiner() -> Row {
     )
 }
 
+// The key's limit changes from `from` to `to` while the cluster runs: the
+// news reaches the nodes one a second, as a rolling config change would.
+fn limit_change(scenario: &'static str, expected: &'static str, from: u32, to: u32) -> Row {
+    let change = 20 * ONE_SEC;
+    let run = 50 * ONE_SEC;
+    let limit = |per_second: u32| Limit {
+        per_second,
+        burst: per_second / 20,
+    };
+    let mut s = Sim::new(NODES, defaults(), PerfectLink::new(ONE_MS));
+    s.remove_invariant("admission-window");
+    s.set_key_limit(KEY, limit(from));
+    for node in 0..NODES {
+        s.schedule_key_limit(change + node as Nanos * ONE_SEC, node, KEY, limit(to));
+    }
+    streams(&mut s, SKEWED.map(|rate| rate * 2), run);
+    s.run_until(run);
+    row(
+        scenario,
+        expected,
+        &s,
+        whole(change, change + 15 * ONE_SEC, run),
+    )
+}
+
 /// Every scenario, measured.
 pub fn rows() -> Vec<Row> {
     let lossy = NetConfig {
@@ -360,6 +385,18 @@ pub fn rows() -> Vec<Row> {
         stop("Node 4 leaves for good (the other four)", "R at once", true),
         jump(),
         late_joiner(),
+        limit_change(
+            "Limit lowered to R/2, one node a second",
+            "≤ R in passing, R/2 after",
+            1000,
+            500,
+        ),
+        limit_change(
+            "Limit raised from R/2 to R, one node a second",
+            "≤ R, then R",
+            500,
+            1000,
+        ),
     ]
 }
 

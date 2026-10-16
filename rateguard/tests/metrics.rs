@@ -54,6 +54,7 @@ async fn the_background_task_publishes_counts_and_state() {
         ("rateguard_checks_total", vec![("decision", "allow")], 5.0),
         ("rateguard_checks_total", vec![("decision", "deny")], 3.0),
         ("rateguard_overflowed_total", vec![], 0.0),
+        ("rateguard_unknown_class_total", vec![], 0.0),
         ("rateguard_cluster_size", vec![], 1.0),
         ("rateguard_counted_size", vec![], 1.0),
         ("rateguard_suspects", vec![], 0.0),

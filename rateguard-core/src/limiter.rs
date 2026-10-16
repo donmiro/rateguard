@@ -1,9 +1,10 @@
 //! Enforcement on one node: a GCRA per key, on a share of the limit.
 //!
-//! A cold key gets `R/N × α`; a hot key gets the share it is given by
-//! [`Limiter::tick_with_shares`], or `R/N` by [`Limiter::tick`]. A key a
-//! peer holds hot that finds no room in the hot set here gets the floor
-//! `R × β / N`: the peer takes all of the limit but that.
+//! Every key has a [`Limit`] of its own, R: the config's by default, or one
+//! given with it. A cold key gets `R/N × α`; a hot key gets the share it is
+//! given by [`Limiter::tick_with_shares`], or `R/N` by [`Limiter::tick`]. A
+//! key a peer holds hot that finds no room in the hot set here gets the
+//! floor `R × β / N`: the peer takes all of the limit but that.
 //! [`Limiter::check`] is the hot path: one map lookup and one GCRA step, no
 //! I/O, and no allocation for a key it already knows. The tick does
 //! everything else once per protocol period.
@@ -20,12 +21,41 @@ use crate::hot_set::HotSet;
 
 const SILENT_DEMAND: f64 = 1e-3;
 
+/// How fast the rate of denials follows a change: slower than demand, so
+/// that a key denied in bursts stays listed between them.
+const DENIAL_TIME_CONSTANT: Nanos = 10_000_000_000;
+
+/// One key's limit: R, the cluster-wide rate, and the burst one node may
+/// admit back to back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limit {
+    /// R, in requests per second, across the whole cluster.
+    pub per_second: u32,
+    /// How many requests the key may get back to back on one node.
+    pub burst: u32,
+}
+impl Limit {
+    fn validate(&self) {
+        assert!(self.per_second > 0, "a limit must be > 0 a second");
+        assert!(
+            self.burst > 0 && self.burst <= crate::gcra::MAX_BURST,
+            "a burst must be in 1..={}",
+            crate::gcra::MAX_BURST
+        );
+    }
+
+    fn rate(&self) -> f64 {
+        self.per_second as f64
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 /// How one node enforces the limit; see the fields.
 pub struct Config {
-    /// R: the cluster-wide limit for each key, in requests per second.
+    /// R: the cluster-wide limit of a key given none of its own, in
+    /// requests per second.
     pub limit_per_sec: u32,
-    /// How many requests a key may get back to back on one node.
+    /// How many requests such a key may get back to back on one node.
     pub burst: u32,
     /// α, in (0, 1]: the part of the per-node rate a cold key gets, and the
     /// threshold at which it turns hot.
@@ -56,6 +86,14 @@ pub struct Config {
     pub demand_time_constant: Nanos,
 }
 impl Config {
+    /// The limit of a key given none of its own.
+    pub fn limit(&self) -> Limit {
+        Limit {
+            per_second: self.limit_per_sec,
+            burst: self.burst,
+        }
+    }
+
     fn validate(&self) {
         assert!(self.limit_per_sec > 0, "limit_per_sec must be > 0");
         assert!(self.burst > 0, "burst must be > 0");
@@ -87,7 +125,9 @@ impl Config {
 
 #[derive(Debug)]
 struct KeyState {
+    limit: Limit,
     demand: Demand,
+    denials: Demand,
     gcra: Gcra,
     applied: Quota,
 }
@@ -98,6 +138,7 @@ pub struct Limiter {
     config: Config,
     hot_set: HotSet,
     keys: HashMap<u64, KeyState>,
+    /// A part of each key's R that no key gets more than.
     cap: Option<f64>,
 }
 impl Limiter {
@@ -116,26 +157,66 @@ impl Limiter {
         }
     }
 
-    /// Holds every key, hot or cold, at no more than `cap` requests per
-    /// second, or lifts the cap. New keys follow at once, known ones from
-    /// the next tick. For a node that has lost its quorum, see
-    /// [`PartitionPolicy::Quorum`](crate::partition::PartitionPolicy).
+    /// Holds every key, hot or cold, at no more than `cap` times its own
+    /// R, or lifts the cap: the floor `R × β / k` of a node waiting, learning
+    /// or without a quorum is the cap `β / k`. New keys follow at once,
+    /// known ones from the next tick. For a node that has lost its quorum,
+    /// see [`PartitionPolicy::Quorum`](crate::partition::PartitionPolicy).
     pub fn set_cap(&mut self, cap: Option<f64>) {
         self.cap = cap;
     }
 
-    /// Admits or denies one request for `key`. The attempt counts toward the
-    /// key's demand either way, cold keys included.
+    /// Admits or denies one request for `key` at the config's limit. The
+    /// attempt counts toward the key's demand either way, cold keys
+    /// included.
     pub fn check(&mut self, key: u64, now: Nanos, cluster_size: usize) -> Decision {
-        let state = self.entry(key, now, cluster_size);
-        state.demand.record_attempt();
-        state.gcra.check(now)
+        self.check_in(key, self.config.limit(), now, cluster_size)
     }
 
-    /// Counts `n` attempts for `key` without deciding on them: for a runtime
-    /// that enforces in its own table and only needs the allocation.
-    pub fn record_attempts(&mut self, key: u64, n: u64, now: Nanos, cluster_size: usize) {
-        self.entry(key, now, cluster_size).demand.record_attempts(n);
+    /// Like [`check`](Limiter::check), for a key with a limit of its own.
+    /// A key whose limit changes keeps its state; the new limit applies
+    /// from the next tick.
+    ///
+    /// # Panics
+    ///
+    /// If the limit is zero, or its burst zero or over
+    /// [`MAX_BURST`](crate::gcra::MAX_BURST).
+    pub fn check_in(
+        &mut self,
+        key: u64,
+        limit: Limit,
+        now: Nanos,
+        cluster_size: usize,
+    ) -> Decision {
+        let state = self.entry(key, limit, now, cluster_size);
+        state.demand.record_attempt();
+        let decision = state.gcra.check(now);
+        if decision != Decision::Allow {
+            state.denials.record_attempt();
+        }
+        decision
+    }
+
+    /// Counts `attempts` for `key`, `denials` of them denied, without
+    /// deciding on them: for a runtime that enforces in its own table and
+    /// only needs the allocation. `limit` is the key's, as the runtime
+    /// last knew it.
+    ///
+    /// # Panics
+    ///
+    /// As [`check_in`](Limiter::check_in) does.
+    pub fn record(
+        &mut self,
+        key: u64,
+        attempts: u64,
+        denials: u64,
+        limit: Limit,
+        now: Nanos,
+        cluster_size: usize,
+    ) {
+        let state = self.entry(key, limit, now, cluster_size);
+        state.demand.record_attempts(attempts);
+        state.denials.record_attempts(denials);
     }
 
     /// The quota `key` is held to, if it is tracked.
@@ -143,20 +224,36 @@ impl Limiter {
         self.keys.get(&key).map(|state| state.applied)
     }
 
-    /// The quota a key not seen before starts with: the cold share, under
-    /// the cap if one is set.
-    pub fn new_key_quota(&self, cluster_size: usize) -> Quota {
-        self.cold_quota(cluster_size)
+    /// The limit `key` was last given, if it is tracked.
+    pub fn limit(&self, key: u64) -> Option<Limit> {
+        self.keys.get(&key).map(|state| state.limit)
     }
 
-    fn entry(&mut self, key: u64, now: Nanos, cluster_size: usize) -> &mut KeyState {
-        let cold = self.cold_quota(cluster_size);
+    /// The quota a key not seen before starts with in `limit`: the cold
+    /// share, under the cap if one is set.
+    pub fn new_key_quota(&self, limit: Limit, cluster_size: usize) -> Quota {
+        self.cold_quota(limit, cluster_size)
+    }
+
+    /// The rate a key not seen before starts with, as a part of its R: for
+    /// a runtime that sizes the quota of a new key on the request path.
+    pub fn new_key_factor(&self, cluster_size: usize) -> f64 {
+        (self.config.alpha / cluster_size as f64).min(self.cap.unwrap_or(f64::INFINITY))
+    }
+
+    fn entry(&mut self, key: u64, limit: Limit, now: Nanos, cluster_size: usize) -> &mut KeyState {
+        limit.validate();
+        let cold = self.cold_quota(limit, cluster_size);
         let time_constant = self.config.demand_time_constant;
-        self.keys.entry(key).or_insert_with(|| KeyState {
+        let state = self.keys.entry(key).or_insert_with(|| KeyState {
+            limit,
             demand: Demand::starting_at(time_constant, now),
+            denials: Demand::starting_at(DENIAL_TIME_CONSTANT, now),
             gcra: Gcra::new(cold),
             applied: cold,
-        })
+        });
+        state.limit = limit;
+        state
     }
 
     /// Updates demand, moves keys between cold and hot, applies their new
@@ -164,30 +261,29 @@ impl Limiter {
     /// A hot key gets an even split, `R/N`: for a share that follows
     /// demand, see [`tick_with_shares`](Limiter::tick_with_shares).
     pub fn tick(&mut self, now: Nanos, cluster_size: usize) {
-        let even = self.per_node_rate(cluster_size);
-        self.tick_with_shares(now, cluster_size, |_| false, |_, _| even);
+        let n = cluster_size as f64;
+        self.tick_with_shares(now, cluster_size, |_| false, |_, _, limit| limit / n);
     }
 
     /// Like [`tick`](Limiter::tick), but a hot key gets the rate
-    /// `share(key, own_demand)` returns, in requests per second, and a key
-    /// for which `hot_elsewhere` is true is hot here too while it has any
-    /// demand at all (see [`hot_set`](crate::hot_set)).
+    /// `share(key, own_demand, limit)` returns, in requests per second, for
+    /// a key whose R is `limit`; and a key for which `hot_elsewhere` is
+    /// true is hot here too while it has any demand at all (see
+    /// [`hot_set`](crate::hot_set)).
     pub fn tick_with_shares(
         &mut self,
         now: Nanos,
         cluster_size: usize,
         hot_elsewhere: impl Fn(u64) -> bool,
-        mut share: impl FnMut(u64, f64) -> f64,
+        mut share: impl FnMut(u64, f64, f64) -> f64,
     ) {
-        let threshold = self.per_node_rate(cluster_size) * self.config.alpha;
-        let cold = self.cold_quota(cluster_size);
-        let (burst, cap) = (self.config.burst, self.cap.unwrap_or(f64::INFINITY));
-        // A key a peer holds hot, with no room for it here: that peer takes
-        // all of the limit but the floors, so the floor is all there is.
-        let floor =
-            self.config.limit_per_sec as f64 * self.config.floor_factor / cluster_size as f64;
-        let cold_rate = self.per_node_rate(cluster_size) * self.config.alpha;
-        let crowded_out = quota_for(floor.min(cold_rate).min(cap), burst);
+        assert!(cluster_size > 0, "cluster_size must be > 0");
+        let (n, alpha, beta) = (
+            cluster_size as f64,
+            self.config.alpha,
+            self.config.floor_factor,
+        );
+        let cap = self.cap.unwrap_or(f64::INFINITY);
         let (keys, hot_set) = (&mut self.keys, &mut self.hot_set);
 
         // Two passes: a key promoted late in the first may evict one seen
@@ -196,7 +292,9 @@ impl Limiter {
             |key: u64, state: &KeyState| state.demand.rate() >= SILENT_DEMAND && hot_elsewhere(key);
         keys.retain(|&key, state| {
             state.demand.tick(now);
+            state.denials.tick(now);
             let rate = state.demand.rate();
+            let threshold = state.limit.rate() / n * alpha;
             let is_hot = hot_set.update_with(key, rate, threshold, now, elsewhere(key, state));
             // Attempts not folded in yet are demand too: a key first seen
             // at the moment of the tick would go with them.
@@ -206,12 +304,20 @@ impl Limiter {
                 || state.demand.has_pending()
         });
         for (&key, state) in keys.iter_mut() {
+            let (limit, burst) = (state.limit.rate(), state.limit.burst);
             let wanted = if hot_set.is_hot(key) {
-                quota_for(share(key, state.demand.rate()).min(cap), burst)
+                quota_for(
+                    share(key, state.demand.rate(), limit).min(limit * cap),
+                    burst,
+                )
             } else if elsewhere(key, state) {
-                crowded_out
+                // A key a peer holds hot, with no room for it here: that
+                // peer takes all of the limit but the floors, so the floor
+                // is all there is.
+                let floor = limit * beta / n;
+                quota_for(floor.min(limit / n * alpha).min(limit * cap), burst)
             } else {
-                cold
+                quota_for((limit / n * alpha).min(limit * cap), burst)
             };
             if state.applied != wanted {
                 state.gcra.set_quota(wanted, now);
@@ -234,6 +340,30 @@ impl Limiter {
             .collect();
         hot.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         hot
+    }
+
+    /// Up to `k` keys with the most denials, in denials a second over the
+    /// last ten seconds or so, most denied first. A key denied nothing
+    /// lately is not listed.
+    pub fn most_denied(&self, k: usize) -> Vec<(u64, f64)> {
+        let mut denied: Vec<(u64, f64)> = self
+            .keys
+            .iter()
+            .map(|(&key, state)| (key, state.denials.rate()))
+            .filter(|&(_, rate)| rate >= SILENT_DEMAND)
+            .collect();
+        // Once a tick over every tracked key: the first k found in linear
+        // time, and only they sorted.
+        let order = |a: &(u64, f64), b: &(u64, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+        if k < denied.len() {
+            if k == 0 {
+                return Vec::new();
+            }
+            denied.select_nth_unstable_by(k - 1, order);
+            denied.truncate(k);
+        }
+        denied.sort_by(order);
+        denied
     }
 
     /// The config it was made with.
@@ -286,16 +416,11 @@ impl Limiter {
         }
     }
 
-    fn per_node_rate(&self, cluster_size: usize) -> f64 {
+    fn cold_quota(&self, limit: Limit, cluster_size: usize) -> Quota {
         assert!(cluster_size > 0, "cluster_size must be > 0");
-        self.config.limit_per_sec as f64 / cluster_size as f64
-    }
-
-    fn cold_quota(&self, cluster_size: usize) -> Quota {
-        let cap = self.cap.unwrap_or(f64::INFINITY);
         quota_for(
-            (self.per_node_rate(cluster_size) * self.config.alpha).min(cap),
-            self.config.burst,
+            limit.rate() * self.new_key_factor(cluster_size),
+            limit.burst,
         )
     }
 }
@@ -376,13 +501,130 @@ mod tests {
         });
     }
 
+    const PRO: Limit = Limit {
+        per_second: 200,
+        burst: 4,
+    };
+
+    fn quota_rate(l: &Limiter, key: u64) -> f64 {
+        l.quota(key).expect("tracked").rate_per_sec()
+    }
+
+    #[test]
+    fn a_key_with_a_limit_of_its_own_gets_the_cold_share_of_it() {
+        let mut l = limiter();
+        l.check_in(KEY, PRO, 0, N);
+        l.tick(0, N);
+        // α × 200 / 5, not α × 1000 / 5.
+        assert_eq!(quota_rate(&l, KEY), 20.0);
+        assert_eq!(l.quota(KEY).unwrap().burst(), 4);
+        assert_eq!(l.limit(KEY), Some(PRO));
+    }
+
+    #[test]
+    fn a_new_key_starts_at_the_cold_share_of_its_limit() {
+        let l = limiter();
+        assert_eq!(l.new_key_quota(PRO, N).rate_per_sec(), 20.0);
+        assert_eq!(l.new_key_quota(config().limit(), N).rate_per_sec(), 100.0);
+    }
+
+    #[test]
+    fn a_key_turns_hot_at_the_threshold_of_its_own_limit() {
+        let mut l = limiter();
+        l.tick(0, N);
+        // 60 in a second, an average of 38 after one tick: under the
+        // default threshold of 100, over PRO's 20.
+        for _ in 0..60 {
+            l.record(KEY, 1, 0, PRO, 0, N);
+            l.record(KEY + 1, 1, 0, config().limit(), 0, N);
+        }
+        l.tick(ONE_SEC, N);
+        assert!(l.is_hot(KEY), "hot by its own limit");
+        assert!(!l.is_hot(KEY + 1), "cold by the default one");
+    }
+
+    #[test]
+    fn a_hot_key_is_shared_out_of_its_own_limit() {
+        let mut l = limiter();
+        l.tick(0, N);
+        for _ in 0..100 {
+            l.record(KEY, 1, 0, PRO, 0, N);
+        }
+        let mut limits = Vec::new();
+        l.tick_with_shares(
+            ONE_SEC,
+            N,
+            |_| false,
+            |_, _, limit| {
+                limits.push(limit);
+                limit / N as f64
+            },
+        );
+        assert_eq!(limits, vec![200.0]);
+        assert_eq!(quota_rate(&l, KEY), 40.0);
+    }
+
+    #[test]
+    fn the_cap_is_a_part_of_each_key_s_own_limit() {
+        let mut l = limiter();
+        l.set_cap(Some(0.02));
+        l.check_in(KEY, PRO, 0, N);
+        l.check(KEY + 1, 0, N);
+        l.tick(0, N);
+        assert_eq!(quota_rate(&l, KEY), 4.0, "200 × 0.02");
+        assert_eq!(quota_rate(&l, KEY + 1), 20.0, "1000 × 0.02");
+    }
+
+    #[test]
+    fn a_new_limit_for_a_known_key_applies_at_the_next_tick() {
+        let mut l = limiter();
+        l.check(KEY, 0, N);
+        l.tick(0, N);
+        assert_eq!(quota_rate(&l, KEY), 100.0);
+        l.record(KEY, 1, 0, PRO, 1, N);
+        l.tick(ONE_SEC, N);
+        assert_eq!(quota_rate(&l, KEY), 20.0);
+    }
+
+    #[test]
+    fn the_most_denied_keys_come_busiest_first() {
+        let mut l = limiter();
+        l.tick(0, N);
+        l.record(KEY, 50, 40, config().limit(), 0, N);
+        l.record(KEY + 1, 50, 10, config().limit(), 0, N);
+        l.record(KEY + 2, 50, 0, config().limit(), 0, N);
+        l.tick(ONE_SEC, N);
+        let denied: Vec<u64> = l.most_denied(10).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(
+            denied,
+            vec![KEY, KEY + 1],
+            "a key never denied is not listed"
+        );
+        assert_eq!(l.most_denied(1).len(), 1);
+        assert_eq!(l.most_denied(1)[0].0, KEY, "the busiest, not any one");
+        assert!(l.most_denied(0).is_empty());
+    }
+
+    #[test]
+    fn a_denial_in_check_counts_toward_the_denied_keys() {
+        let mut l = limiter();
+        l.tick(0, N);
+        for _ in 0..20 {
+            l.check(KEY, 0, N); // burst 10, then denials
+        }
+        l.tick(ONE_SEC, N);
+        let denied = l.most_denied(10);
+        assert_eq!(denied.len(), 1);
+        assert!(denied[0].1 > 0.0, "{denied:?}");
+    }
+
     // A runtime hands over the attempts of a new key in the very tick of a
     // round: the demand has had no time to measure them yet, and the key
     // must wait for the next tick, not be dropped with them.
     #[test]
     fn attempts_counted_at_the_moment_of_a_tick_are_kept_for_the_next() {
         let mut l = limiter();
-        l.record_attempts(KEY, 50, ONE_SEC, N);
+        l.record(KEY, 50, 0, config().limit(), ONE_SEC, N);
         l.tick(ONE_SEC, N);
         assert!(l.tracked(KEY), "dropped with its attempts");
         l.tick(ONE_SEC + ONE_SEC / 5, N);
@@ -452,7 +694,7 @@ mod tests {
             l.check(KEY, 0, N);
         }
         // 50 a second is under the hot threshold of 100: cold by itself.
-        l.tick_with_shares(ONE_SEC, N, |key| key == KEY, |_, _| 250.0);
+        l.tick_with_shares(ONE_SEC, N, |key| key == KEY, |_, _, _| 250.0);
         assert!(l.is_hot(KEY));
         assert_eq!(l.hot_demand().len(), 1);
         let (_, _, primary) = l.hot_demand()[0];
@@ -485,7 +727,7 @@ mod tests {
         for _ in 0..50 {
             l.check(KEY, ONE_SEC, N);
         }
-        l.tick_with_shares(2 * ONE_SEC, N, |key| key == KEY, |_, _| 250.0);
+        l.tick_with_shares(2 * ONE_SEC, N, |key| key == KEY, |_, _, _| 250.0);
         assert!(
             !l.is_hot(KEY),
             "no room: KEY does not beat the weakest by 10%"
@@ -516,7 +758,7 @@ mod tests {
                 l.check(new, ONE_SEC, N);
             }
         }
-        l.tick_with_shares(2 * ONE_SEC, N, |_| false, |_, _| 900.0);
+        l.tick_with_shares(2 * ONE_SEC, N, |_| false, |_, _, _| 900.0);
 
         for key in 1..=4 {
             assert!(!l.is_hot(key), "key {key} evicted");
@@ -533,9 +775,9 @@ mod tests {
         let mut l = limiter();
         l.tick(0, N);
         l.check(KEY, 0, N);
-        l.tick_with_shares(ONE_SEC, N, |_| true, |_, _| 250.0);
+        l.tick_with_shares(ONE_SEC, N, |_| true, |_, _, _| 250.0);
         assert!(l.is_hot(KEY), "a request a second ago is demand");
-        l.tick_with_shares(60 * ONE_SEC, N, |_| true, |_, _| 250.0);
+        l.tick_with_shares(60 * ONE_SEC, N, |_| true, |_, _, _| 250.0);
         assert!(!l.is_hot(KEY));
         assert_eq!(l.tracked_keys(), 0, "reclaimed as before");
     }
@@ -556,8 +798,8 @@ mod tests {
         drive_until_hot(&mut l);
         l.check(KEY + 1, ONE_SEC, N);
 
-        l.set_cap(Some(20.0));
-        l.tick_with_shares(2 * ONE_SEC, N, |_| false, |_, _| 250.0);
+        l.set_cap(Some(0.02)); // 20 of R = 1000
+        l.tick_with_shares(2 * ONE_SEC, N, |_| false, |_, _, _| 250.0);
         assert_eq!(
             interval_at(&mut l, KEY, 3 * ONE_SEC),
             50_000_000,
@@ -575,7 +817,7 @@ mod tests {
         );
 
         l.set_cap(None);
-        l.tick_with_shares(4 * ONE_SEC, N, |_| false, |_, _| 250.0);
+        l.tick_with_shares(4 * ONE_SEC, N, |_| false, |_, _, _| 250.0);
         assert_eq!(interval_at(&mut l, KEY, 5 * ONE_SEC), 4_000_000, "lifted");
     }
 
@@ -587,7 +829,7 @@ mod tests {
         for _ in 0..500 {
             by_check.check(KEY, 0, N);
         }
-        by_record.record_attempts(KEY, 500, 0, N);
+        by_record.record(KEY, 500, 0, config().limit(), 0, N);
         by_check.tick(ONE_SEC, N);
         by_record.tick(ONE_SEC, N);
         assert!(by_record.is_hot(KEY));
@@ -598,12 +840,15 @@ mod tests {
     fn a_new_key_starts_at_the_capped_cold_quota() {
         let mut l = limiter();
         assert_eq!(
-            l.new_key_quota(N),
+            l.new_key_quota(config().limit(), N),
             Quota::new(100, config().burst),
             "α × R / N"
         );
-        l.set_cap(Some(20.0));
-        assert_eq!(l.new_key_quota(N), Quota::new(20, config().burst));
+        l.set_cap(Some(0.02)); // 20 of R = 1000
+        assert_eq!(
+            l.new_key_quota(config().limit(), N),
+            Quota::new(20, config().burst)
+        );
         assert_eq!(l.quota(KEY), None, "not tracked");
     }
 
@@ -616,7 +861,10 @@ mod tests {
             burst: 1,
             ..config()
         });
-        assert_eq!(l.new_key_quota(20), Quota::per_second(0.25, 1));
+        assert_eq!(
+            l.new_key_quota(l.config().limit(), 20),
+            Quota::per_second(0.25, 1)
+        );
     }
 
     #[test]
@@ -629,7 +877,7 @@ mod tests {
             2 * ONE_SEC,
             N,
             |_| false,
-            |key, own| {
+            |key, own, _| {
                 asked.push((key, own));
                 250.0
             },

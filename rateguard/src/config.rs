@@ -70,6 +70,8 @@ pub struct Builder {
     hot_keys: Option<usize>,
     tracked_keys: Option<usize>,
     dry_run: bool,
+    classes: Vec<(String, crate::Limit)>,
+    max_classes: Option<usize>,
 }
 
 impl Builder {
@@ -145,6 +147,23 @@ impl Builder {
     /// [`Guard::set_dry_run`](crate::Guard::set_dry_run).
     pub fn dry_run(mut self, on: bool) -> Self {
         self.dry_run = on;
+        self
+    }
+
+    /// Adds a class of limits: keys checked with
+    /// [`Guard::check_in`](crate::Guard::check_in) in the class `name` are
+    /// held to `limit` instead of [`limit`](Builder::limit). Named again,
+    /// a class takes the last limit given. Classes change on the fly too,
+    /// see [`Guard::set_class`](crate::Guard::set_class).
+    pub fn class(mut self, name: impl Into<String>, limit: crate::Limit) -> Self {
+        self.classes.push((name.into(), limit));
+        self
+    }
+
+    /// The most named classes the node keeps, the default class aside;
+    /// defaults to 64, at most 4096.
+    pub fn max_classes(mut self, n: usize) -> Self {
+        self.max_classes = Some(n);
         self
     }
 
@@ -227,7 +246,7 @@ impl Builder {
         let burst = match self.burst {
             Some(burst) if burst > MAX_BURST => return Err(Error::TooLargeBurst(burst)),
             Some(burst) => burst.max(1),
-            None => (limit / 20).clamp(1, MAX_BURST),
+            None => crate::Limit::per_second(limit).burst_size(),
         };
         let hot_keys = self.hot_keys.unwrap_or(rateguard_proto::MAX_DEMAND_KEYS);
         if hot_keys == 0 || hot_keys > rateguard_proto::MAX_DEMAND_KEYS {
@@ -240,6 +259,11 @@ impl Builder {
         if tracked_keys > MAX_TRACKED_KEYS {
             return Err(Error::TooManyTrackedKeys(tracked_keys));
         }
+        let max_classes = self.max_classes.unwrap_or(64);
+        if max_classes > crate::classes::MAX_CLASSES {
+            return Err(Error::TooManyClasses(max_classes));
+        }
+        let classes = crate::classes::checked(self.classes.clone(), max_classes)?;
         let period = nanos(self.period.unwrap_or(Duration::from_millis(200)));
         if period / 4 == 0 {
             return Err(Error::ZeroPeriod);
@@ -274,6 +298,8 @@ impl Builder {
             swim,
             policy: self.policy.unwrap_or_default().to_core(),
             dry_run: self.dry_run,
+            classes,
+            max_classes,
         })
     }
 }
@@ -331,14 +357,25 @@ fn start<T: crate::Transport>(
     }
 
     let (leave, leaving) = tokio::sync::mpsc::channel(1);
+    let classes = crate::classes::Classes::new(
+        settings.core.limit(),
+        settings.classes,
+        settings.max_classes,
+    );
+    // A free slot carries the strictest quota of any class, until whoever
+    // takes it gives it its own.
+    let free_quota = node.new_key_quota_in(classes.snapshot().strictest());
     let shared = Arc::new(crate::guard::Shared {
-        table: crate::table::KeyTable::new(settings.core.max_tracked_keys, node.new_key_quota()),
+        table: crate::table::KeyTable::new(settings.core.max_tracked_keys, free_quota),
         cluster_size: AtomicUsize::new(node.cluster_size()),
         epoch: tokio::time::Instant::now(),
         running: AtomicBool::new(true),
         leave,
         dry_run: AtomicBool::new(settings.dry_run),
         report: Default::default(),
+        classes,
+        fresh_factor: std::sync::atomic::AtomicU64::new(node.new_key_factor().to_bits()),
+        free_quota: std::sync::atomic::AtomicU64::new(free_quota.pack()),
         #[cfg(feature = "metrics")]
         metrics_label: settings.advertise.to_string(),
     });
@@ -413,9 +450,12 @@ pub(crate) struct Settings {
     pub swim: SwimConfig,
     pub policy: partition::PartitionPolicy,
     pub dry_run: bool,
+    /// The named classes, checked.
+    pub classes: Vec<(String, rateguard_core::limiter::Limit)>,
+    pub max_classes: usize,
 }
 
-/// Why a node could not start.
+/// Why a node could not start, or a class could not be set.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -454,6 +494,12 @@ pub enum Error {
     NoIo,
     /// The socket could not be bound.
     Bind(std::io::Error),
+    /// A class named `""`: that is the default class, set with
+    /// [`Builder::limit`] or [`Guard::set_limit`](crate::Guard::set_limit).
+    EmptyClassName,
+    /// More classes than [`Builder::max_classes`] allows, or a
+    /// `max_classes` over 4096.
+    TooManyClasses(usize),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -492,6 +538,12 @@ impl fmt::Display for Error {
             Error::NoTimer => write!(f, "the tokio runtime has no timers enabled"),
             Error::NoIo => write!(f, "the tokio runtime has no IO enabled"),
             Error::Bind(error) => write!(f, "cannot bind: {error}"),
+            Error::EmptyClassName => write!(f, "a class needs a name: \"\" is the default class"),
+            Error::TooManyClasses(n) => write!(
+                f,
+                "more classes than {n}, or more than {} allowed",
+                crate::classes::MAX_CLASSES
+            ),
         }
     }
 }

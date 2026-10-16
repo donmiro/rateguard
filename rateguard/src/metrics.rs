@@ -1,5 +1,7 @@
 //! What `Guard::stats` tells, through the `metrics` facade: published by the
 //! background task once a tick, so the request path pays nothing for it.
+//! All of it but `most_denied`: labels with key hashes would make a series
+//! per key, without bound.
 //! Every metric carries `guard`, the address the node advertises: a process
 //! may run several.
 
@@ -19,6 +21,11 @@ pub(crate) fn publish(stats: &Stats, guard: &str) {
     checks("deny").absolute(stats.denied);
     metrics::counter!("rateguard_overflowed_total", std::slice::from_ref(&label))
         .absolute(stats.overflowed);
+    metrics::counter!(
+        "rateguard_unknown_class_total",
+        std::slice::from_ref(&label)
+    )
+    .absolute(stats.unknown_class);
 
     let gauges = [
         ("rateguard_cluster_size", stats.cluster_size as f64),

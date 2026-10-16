@@ -52,6 +52,24 @@ pub struct Stats {
     /// Whether this is a dry run: see
     /// [`Guard::set_dry_run`](crate::Guard::set_dry_run).
     pub dry_run: bool,
+    /// Up to ten keys with the most denials here lately, most denied first:
+    /// who is being limited. Keys go by their hash; match them with
+    /// [`key_hash_in`](crate::key_hash_in).
+    pub most_denied: Vec<DeniedKey>,
+    /// Checks in a class this node does not know, held to the default limit
+    /// instead: a typo, or a class removed while still in use.
+    pub unknown_class: u64,
+}
+
+/// A key denied lately; see [`Stats::most_denied`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct DeniedKey {
+    /// The key, as [`key_hash_in`](crate::key_hash_in) hashes it with its
+    /// class.
+    pub key_hash: u64,
+    /// Denials a second here, averaged over the last ten seconds or so.
+    pub denied_per_sec: f64,
 }
 
 /// What the background task keeps for [`Stats`], under a lock only it and

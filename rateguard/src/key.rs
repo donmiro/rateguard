@@ -2,17 +2,41 @@
 
 use rateguard_core::boundary::PeerId;
 use rateguard_proto::Address;
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 /// The 64-bit hash a key travels and is stored under. xxh3: fixed by its
 /// specification, the same on every node and every Rust version. The key
 /// table reserves 0 (an empty slot) and `u64::MAX` (a slot being reset), so
 /// a key hashing to either is moved next door.
 pub fn key_hash(key: &str) -> u64 {
-    match xxh3_64(key.as_bytes()) {
+    key_hash_in("", key)
+}
+
+/// The hash of `key` in the class `class`: xxh3 with the class's hash as
+/// its seed, so that one key in two classes is two keys. The default class,
+/// `""`, has seed 0, and its hashes are [`key_hash`]'s. Public so that the
+/// hashes of [`Stats::most_denied`](crate::Stats::most_denied) can be
+/// matched to keys.
+pub fn key_hash_in(class: &str, key: &str) -> u64 {
+    hash_in(class_hash(class), key)
+}
+
+/// [`key_hash_in`] for a class already hashed.
+pub(crate) fn hash_in(class: u64, key: &str) -> u64 {
+    match xxh3_64_with_seed(key.as_bytes(), class) {
         0 => 1,
         u64::MAX => u64::MAX - 1,
         hash => hash,
+    }
+}
+
+/// A class's name as the key table stores it: 0 for the default class,
+/// never 0 for another.
+pub(crate) fn class_hash(class: &str) -> u64 {
+    if class.is_empty() {
+        0
+    } else {
+        xxh3_64(class.as_bytes()).max(1)
     }
 }
 

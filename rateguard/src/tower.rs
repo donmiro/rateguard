@@ -23,6 +23,9 @@
 //! ```
 //!
 //! With axum, `Router::new().route(..).layer(layer)`.
+//!
+//! To check in a class of limits, return the class with the key, as a pair:
+//! `Some((plan, format!("api:{tenant}")))`; see [`Key`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -35,6 +38,35 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{Decision, Guard};
+
+/// What the key function of a [`RateLimitLayer`] returns for a request: a
+/// key in the default class, any string; or a pair `(class, key)`, checked
+/// with [`Guard::check_in`].
+pub trait Key {
+    /// Checks the request through `guard`.
+    fn check(&self, guard: &Guard) -> Decision;
+}
+macro_rules! key_in_the_default_class {
+    ($($t:ty),*) => {$(
+        impl Key for $t {
+            fn check(&self, guard: &Guard) -> Decision {
+                guard.check(self)
+            }
+        }
+    )*};
+}
+key_in_the_default_class!(
+    String,
+    &str,
+    Box<str>,
+    std::sync::Arc<str>,
+    std::borrow::Cow<'_, str>
+);
+impl<C: AsRef<str>, K: AsRef<str>> Key for (C, K) {
+    fn check(&self, guard: &Guard) -> Decision {
+        guard.check_in(self.0.as_ref(), self.1.as_ref())
+    }
+}
 
 /// Limits each request by the key `key` takes from it: a denied request
 /// gets `429 Too Many Requests` with `Retry-After` in whole seconds,
@@ -78,7 +110,7 @@ impl<S, F, K, ReqBody, ResBody> Service<Request<ReqBody>> for RateLimit<S, F>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>>,
     F: Fn(&Request<ReqBody>) -> Option<K>,
-    K: AsRef<str>,
+    K: Key,
     ResBody: Default,
 {
     type Response = Response<ResBody>;
@@ -90,7 +122,7 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let denied = (self.key)(&req).and_then(|key| match self.guard.check(key.as_ref()) {
+        let denied = (self.key)(&req).and_then(|key| match key.check(&self.guard) {
             Decision::Allow => None,
             Decision::Deny { retry_after } => Some(retry_after),
         });

@@ -15,7 +15,7 @@ fn free_port() -> u16 {
 
 fn builder(limit: u32, burst: u32) -> rateguard::Builder {
     Guard::builder()
-        .bind(format!("127.0.0.1:{}", free_port()))
+        .bind("127.0.0.1:0")
         .limit(limit)
         .burst(burst)
 }
@@ -151,4 +151,15 @@ async fn a_dry_run_can_be_ended_on_the_fly_by_any_clone() {
     assert!(matches!(guard.check("k"), Decision::Deny { .. }));
     clone.set_dry_run(true);
     assert!(guard.check("k").is_allowed());
+}
+
+// A node that has left is no longer counted by its peers: a key it has
+// never seen must start at the floor too, not at a share nobody counts.
+#[tokio::test]
+async fn after_leaving_a_new_key_starts_at_the_floor() {
+    let guard = builder(1000, 5).spawn().unwrap();
+    guard.leave().await;
+    let _ = guard.check("new");
+    // R × β / 1: 1000 × 0.05.
+    assert_eq!(guard.share("new"), Some(50.0));
 }

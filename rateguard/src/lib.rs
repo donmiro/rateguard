@@ -30,10 +30,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod classes;
 mod config;
 mod driver;
 mod guard;
 mod key;
+mod limit;
 #[cfg(feature = "metrics")]
 mod metrics;
 mod stats;
@@ -45,6 +47,7 @@ mod transport;
 
 pub use config::{Builder, Error, PartitionPolicy};
 pub use guard::{Decision, Guard};
-pub use key::key_hash;
-pub use stats::Stats;
+pub use key::{key_hash, key_hash_in};
+pub use limit::Limit;
+pub use stats::{DeniedKey, Stats};
 pub use transport::Transport;

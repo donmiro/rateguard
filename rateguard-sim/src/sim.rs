@@ -1,11 +1,11 @@
 //! The event loop: a priority queue of events in virtual time.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 use rateguard_core::boundary::{Action, Event, PeerId};
 use rateguard_core::gcra::{Decision, Nanos};
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::node::{Node, SwimConfig};
 use rateguard_core::partition::PartitionPolicy;
 use rateguard_proto::Address;
@@ -29,12 +29,25 @@ pub fn address_of(index: NodeIndex) -> Address {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
-    Tick { generation: u64 },
-    Request { key: u64 },
-    Deliver { from: PeerId, bytes: Vec<u8> },
+    Tick {
+        generation: u64,
+    },
+    Request {
+        key: u64,
+    },
+    Deliver {
+        from: PeerId,
+        bytes: Vec<u8>,
+    },
     Crash,
     Restart,
     Leave,
+    /// The key's limit at this node from now on: a change of config, which
+    /// a node down or paused takes too.
+    SetLimit {
+        key: u64,
+        limit: Limit,
+    },
 }
 
 // What a node is asked to do.
@@ -110,6 +123,12 @@ pub struct Sim<L: Link> {
     events: u64,
     datagrams: Vec<u64>,
     largest_datagram: usize,
+    /// Each node's limits for the keys given one; the others have the
+    /// config's.
+    key_limits: Vec<HashMap<u64, Limit>>,
+    /// The widest limit any node has been given for each key, for the
+    /// invariants: a bound that holds through every change.
+    widest: HashMap<u64, Limit>,
 }
 
 impl<L: Link> Sim<L> {
@@ -160,6 +179,8 @@ impl<L: Link> Sim<L> {
             events: 0,
             datagrams: vec![0; node_count],
             largest_datagram: 0,
+            key_limits: vec![HashMap::new(); node_count],
+            widest: HashMap::new(),
         };
 
         for index in 0..node_count {
@@ -282,6 +303,44 @@ impl<L: Link> Sim<L> {
         self.invariants.push(Box::new(invariant));
     }
 
+    /// `key` has `limit` at every node, from now on.
+    pub fn set_key_limit(&mut self, key: u64, limit: Limit) {
+        for node in 0..self.nodes.len() {
+            self.key_limits[node].insert(key, limit);
+        }
+        self.widen(key, limit);
+    }
+
+    /// `key` has `limit` at `node` from `at` on: a change of config that
+    /// reaches the nodes one by one.
+    pub fn schedule_key_limit(&mut self, at: Nanos, node: NodeIndex, key: u64, limit: Limit) {
+        assert!(node < self.nodes.len(), "no such node: {node}");
+        self.widen(key, limit);
+        self.schedule(at, node, Kind::SetLimit { key, limit });
+    }
+
+    // The config's limit counts only while some node still holds the key
+    // to it: a key given a lower one everywhere from the start is checked
+    // against that.
+    fn widen(&mut self, key: u64, limit: Limit) {
+        let default_in_force = self
+            .key_limits
+            .iter()
+            .any(|limits| !limits.contains_key(&key));
+        let start = match self.widest.get(&key) {
+            Some(&widest) => widest,
+            None if default_in_force => self.config.limit(),
+            None => limit,
+        };
+        self.widest.insert(
+            key,
+            Limit {
+                per_second: start.per_second.max(limit.per_second),
+                burst: start.burst.max(limit.burst),
+            },
+        );
+    }
+
     pub fn schedule_request(&mut self, at: Nanos, node: NodeIndex, key: u64) {
         assert!(node < self.nodes.len(), "no such node: {node}");
         self.schedule(at, node, Kind::Request { key })
@@ -363,7 +422,10 @@ impl<L: Link> Sim<L> {
     }
 
     fn paused_until(&self, event: &Scheduled) -> Option<Nanos> {
-        if matches!(event.kind, Kind::Crash | Kind::Restart | Kind::Leave) {
+        if matches!(
+            event.kind,
+            Kind::Crash | Kind::Restart | Kind::Leave | Kind::SetLimit { .. }
+        ) {
             return None;
         }
         self.pauses
@@ -400,6 +462,10 @@ impl<L: Link> Sim<L> {
                 }
                 return;
             }
+            Kind::SetLimit { key, limit } => {
+                self.key_limits[target].insert(key, limit);
+                return;
+            }
             Kind::Tick { generation } if generation != self.generations[target] => return,
             _ if self.down[target] => return,
             _ => {}
@@ -407,7 +473,10 @@ impl<L: Link> Sim<L> {
 
         let happened = match event.kind {
             Kind::Request { key } => {
-                let decision = self.nodes[target].check(key, now);
+                let decision = match self.key_limits[target].get(&key) {
+                    Some(&limit) => self.nodes[target].check_in(key, limit, now),
+                    None => self.nodes[target].check(key, now),
+                };
                 let admission = Admission {
                     at: now,
                     node: target,
@@ -432,7 +501,9 @@ impl<L: Link> Sim<L> {
                 );
                 Happened::Delivery
             }
-            Kind::Crash | Kind::Restart | Kind::Leave => unreachable!("handled above"),
+            Kind::Crash | Kind::Restart | Kind::Leave | Kind::SetLimit { .. } => {
+                unreachable!("handled above")
+            }
         };
 
         self.check_invariants(target, &happened);
@@ -446,6 +517,7 @@ impl<L: Link> Sim<L> {
             config,
             now,
             events,
+            widest,
             ..
         } = self;
         let view = View {
@@ -455,6 +527,7 @@ impl<L: Link> Sim<L> {
             happened,
             nodes: nodes.as_slice(),
             config,
+            key_limits: widest,
         };
 
         for invariant in invariants.iter_mut() {
@@ -567,6 +640,32 @@ mod tests {
 
     fn sim(node_count: usize) -> Sim<PerfectLink> {
         Sim::new(node_count, config(), PerfectLink::new(ONE_MS))
+    }
+
+    fn limit(per_second: u32, burst: u32) -> Limit {
+        Limit { per_second, burst }
+    }
+
+    #[test]
+    fn a_key_given_a_lower_limit_everywhere_is_checked_against_it() {
+        let mut s = sim(3);
+        s.set_key_limit(KEY, limit(200, 4));
+        assert_eq!(s.widest[&KEY], limit(200, 4), "the default never applied");
+    }
+
+    #[test]
+    fn a_limit_reaching_the_nodes_one_by_one_is_checked_against_both() {
+        let mut s = sim(3);
+        s.schedule_key_limit(ONE_SEC, 0, KEY, limit(200, 4));
+        assert_eq!(
+            s.widest[&KEY],
+            config().limit(),
+            "the others keep the default"
+        );
+        let mut t = sim(3);
+        t.set_key_limit(KEY, limit(200, 4));
+        t.schedule_key_limit(ONE_SEC, 0, KEY, limit(300, 2));
+        assert_eq!(t.widest[&KEY], limit(300, 4));
     }
 
     #[test]

@@ -284,41 +284,67 @@ pub(crate) async fn watch(
 // leaves to each member: for a node its peers no longer count.
 fn hold_at_floor(shared: &Shared, config: &rateguard_core::limiter::Config) {
     let n = shared.cluster_size.load(Ordering::Relaxed).max(1);
-    let floor = config.limit_per_sec as f64 * config.floor_factor / n as f64;
-    let quota = rateguard_core::gcra::Quota::per_second(floor, config.burst);
+    let floor = |limit: rateguard_core::limiter::Limit| {
+        let rate = limit.per_second as f64 * config.floor_factor / n as f64;
+        rateguard_core::gcra::Quota::per_second(rate, limit.burst)
+    };
+    let classes = shared.classes.snapshot();
+    let strictest = floor(classes.strictest());
+    // Keys not seen yet too: a slot taken from now on is sized from these.
+    let factor = config.floor_factor / n as f64;
+    shared
+        .fresh_factor
+        .store(factor.to_bits(), Ordering::Relaxed);
+    shared.free_quota.store(strictest.pack(), Ordering::Relaxed);
     let now = shared.now();
+    shared.table.for_each(|_, slot| {
+        let (limit, _) = classes.lookup(slot.class.load(Ordering::Relaxed));
+        slot.gcra.set_quota(floor(limit), now);
+    });
     shared
         .table
-        .for_each(|_, slot| slot.gcra.set_quota(quota, now));
-    shared
-        .table
-        .for_each_free(|slot| slot.gcra.set_quota(quota, now));
-    shared.table.overflow().gcra.set_quota(quota, now);
+        .for_each_free(|slot| slot.gcra.set_quota(strictest, now));
+    shared.table.overflow().gcra.set_quota(strictest, now);
 }
 
 // One tick: attempts in, the core's round, quotas out (spec §5.3).
 fn sync(node: &mut Node, shared: &Arc<Shared>) -> Vec<Action> {
     let now = shared.now();
-    let (mut attempts, mut denied) = (0, 0);
+    let classes = shared.classes.snapshot();
+    let mut counts = Counts::default();
     shared.table.for_each(|key, slot| {
         let (n, d) = slot.take_counts();
+        let (limit, known) = classes.lookup(slot.class.load(Ordering::Relaxed));
         if n > 0 {
-            node.record_attempts(key, n, now);
+            node.record(key, n, d, limit, now);
         }
-        attempts += n;
-        denied += d;
+        counts.attempts += n;
+        counts.denied += d;
+        if !known {
+            counts.unknown_class += n;
+        }
     });
     // Not a key: counted, but no demand of anyone's.
     let (overflowed, d) = shared.table.overflow().take_counts();
-    attempts += overflowed;
-    denied += d;
+    counts.attempts += overflowed;
+    counts.denied += d;
+    counts.overflowed = overflowed;
     let actions = node.handle(Event::Tick, now).to_vec();
-    report(node, shared, attempts, denied, overflowed);
+    report(node, shared, counts);
 
-    let new_key = node.new_key_quota();
+    // A slot nobody holds carries the strictest new key's quota of any
+    // class; whoever takes it gives it its own class's.
+    let new_key = node.new_key_quota_in(classes.strictest());
+    shared
+        .fresh_factor
+        .store(node.new_key_factor().to_bits(), Ordering::Relaxed);
+    shared.free_quota.store(new_key.pack(), Ordering::Relaxed);
+    // A slot the node knows nothing of is freed, unless a check has come
+    // since the counts were taken: a key that took its slot meanwhile, in
+    // the middle of this tick, would lose it under its first check.
     shared.table.for_each(|key, slot| match node.quota(key) {
         Some(quota) => slot.gcra.set_quota(quota, now),
-        None if !slot.gcra.has_debt(now) => {
+        None if !slot.gcra.has_debt(now) && !slot.has_counts() => {
             shared.table.release(slot, key, new_key);
         }
         None => {}
@@ -333,9 +359,18 @@ fn sync(node: &mut Node, shared: &Arc<Shared>) -> Vec<Action> {
     actions
 }
 
+// One tick's checks, from the key table.
+#[derive(Debug, Default)]
+struct Counts {
+    attempts: u64,
+    denied: u64,
+    overflowed: u64,
+    unknown_class: u64,
+}
+
 // This tick's counts and the node's state into the report for
 // Guard::stats.
-fn report(node: &Node, shared: &Shared, attempts: u64, denied: u64, overflowed: u64) {
+fn report(node: &Node, shared: &Shared, counts: Counts) {
     use rateguard_core::membership::Membership;
     use rateguard_proto::Status;
 
@@ -347,11 +382,20 @@ fn report(node: &Node, shared: &Shared, attempts: u64, denied: u64, overflowed: 
         .count();
     let held = node.held();
     let mut report = shared.report();
-    report.attempts += attempts;
+    report.attempts += counts.attempts;
     report.last_round = node.last_round();
     let stats = &mut report.stats;
-    stats.denied += denied;
-    stats.overflowed += overflowed;
+    stats.denied += counts.denied;
+    stats.overflowed += counts.overflowed;
+    stats.unknown_class += counts.unknown_class;
+    stats.most_denied = node
+        .most_denied(10)
+        .into_iter()
+        .map(|(key_hash, denied_per_sec)| crate::stats::DeniedKey {
+            key_hash,
+            denied_per_sec,
+        })
+        .collect();
     stats.cluster_size = node.cluster_size();
     stats.counted_size = node.counted_size();
     stats.suspects = suspects;

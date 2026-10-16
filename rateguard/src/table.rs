@@ -18,11 +18,12 @@ const EMPTY: u64 = 0;
 /// A slot being reset: neither a key nor free.
 const BUSY: u64 = u64::MAX;
 
-/// One key's state: its GCRA, and the attempts and denials since the last
-/// tick, both in one word. 32 bytes, two slots to a cache line: the size
-/// the README's memory bound (guarantee 4) counts, which a word of its own
-/// for the denials would have broken.
+/// One key's state: its GCRA, the attempts and denials since the last tick,
+/// and its class. One cache line a slot, 64 bytes, as the README's memory
+/// bound (guarantee 4) counts: no two keys share a line, and there is room
+/// left for what may come.
 #[derive(Debug)]
+#[repr(align(64))]
 pub(crate) struct Slot {
     key: AtomicU64,
     pub gcra: AtomicGcra,
@@ -30,6 +31,9 @@ pub(crate) struct Slot {
     /// in one tick, as six million a second on one key, the most a node
     /// handles, makes 300,000 in 50 ms.
     counts: AtomicU64,
+    /// The hash of the key's class, 0 for the default; set by whoever takes
+    /// the slot for the key, just after taking it.
+    pub class: AtomicU64,
 }
 const ATTEMPT: u64 = 1;
 const DENIAL: u64 = 1 << 32;
@@ -39,12 +43,14 @@ impl Slot {
             key: AtomicU64::new(EMPTY),
             gcra: AtomicGcra::new(quota),
             counts: AtomicU64::new(0),
+            class: AtomicU64::new(0),
         }
     }
 
-    /// One more request, admitted or not.
-    pub fn count_attempt(&self) {
-        self.counts.fetch_add(ATTEMPT, Ordering::Relaxed);
+    /// One more request, admitted or not; `Release` to publish what the
+    /// caller wrote to the slot before, such as its class.
+    pub fn count_attempt(&self, ordering: Ordering) {
+        self.counts.fetch_add(ATTEMPT, ordering);
     }
 
     /// One more denial, besides its attempt.
@@ -52,9 +58,16 @@ impl Slot {
         self.counts.fetch_add(DENIAL, Ordering::Relaxed);
     }
 
+    /// Whether attempts or denials wait to be taken.
+    pub fn has_counts(&self) -> bool {
+        self.counts.load(Ordering::Relaxed) != 0
+    }
+
     /// The attempts and denials counted since the last call, cleared.
     pub fn take_counts(&self) -> (u64, u64) {
-        let counts = self.counts.swap(0, Ordering::Relaxed);
+        // Acquire: a slot's class, written before its first attempt, is
+        // seen with it.
+        let counts = self.counts.swap(0, Ordering::Acquire);
         (counts & (DENIAL - 1), counts >> 32)
     }
 }
@@ -125,17 +138,28 @@ impl KeyTable {
     /// buckets, or, both full, the shared overflow slot.
     ///
     /// Taking a slot leaves its GCRA alone: a free slot is fresh and carries
-    /// the quota a new key starts with, kept current by the background task.
-    /// Setting a quota here instead would rescale the debt of a key another
-    /// thread has already admitted through the slot, from the wrong moment.
+    /// the strictest quota a new key of any class starts with, kept current
+    /// by the background task. The caller that took the slot sets its
+    /// class's quota just after (see [`claim`](KeyTable::claim)); a thread
+    /// admitted through the slot in between has its debt rescaled from that
+    /// moment, at most one strict interval's worth: errs on the strict
+    /// side.
+    #[cfg(test)]
     pub fn slot(&self, key: u64) -> &Slot {
+        self.claim(key).0
+    }
+
+    /// Like [`slot`](KeyTable::slot), and whether this call took the slot
+    /// for the key: then it is the caller's to give the slot the key's
+    /// class and quota.
+    pub fn claim(&self, key: u64) -> (&Slot, bool) {
         debug_assert!(key != EMPTY && key != BUSY, "key_hash never yields those");
         let candidates = self.candidates(key);
         if let Some(slot) = candidates
             .clone()
             .find(|slot| slot.key.load(Ordering::Acquire) == key)
         {
-            return slot;
+            return (slot, false);
         }
 
         let [first, second] = self.buckets_of(key);
@@ -158,7 +182,7 @@ impl KeyTable {
                     .is_ok()
         });
         let Some(mine) = claimed else {
-            return &self.overflow;
+            return (&self.overflow, false);
         };
 
         // Our claim must be visible before we look for theirs, and theirs
@@ -193,7 +217,7 @@ impl KeyTable {
         if !std::ptr::eq(winner, mine) {
             self.release(mine, key, mine.gcra.quota());
         }
-        winner
+        (winner, std::ptr::eq(winner, mine))
     }
 
     /// The slot holding `key`, if one does; never takes one.
@@ -202,7 +226,11 @@ impl KeyTable {
             .find(|slot| slot.key.load(Ordering::Acquire) == key)
     }
 
-    #[cfg(test)]
+    /// Whether `slot` holds `key` now.
+    pub fn holds(&self, slot: &Slot, key: u64) -> bool {
+        slot.key.load(Ordering::Acquire) == key
+    }
+
     pub fn is_overflow(&self, slot: &Slot) -> bool {
         std::ptr::eq(slot, &self.overflow)
     }
@@ -248,6 +276,7 @@ impl KeyTable {
         }
         slot.gcra.reset(quota);
         slot.counts.store(0, Ordering::Relaxed);
+        slot.class.store(0, Ordering::Relaxed);
         slot.key.store(EMPTY, Ordering::Release);
         true
     }
@@ -274,11 +303,36 @@ mod tests {
         }
     }
 
-    // The README's memory bound counts 32 bytes a slot (guarantee 4), two
-    // to a 64-byte cache line.
+    // The README's memory bound counts 64 bytes a slot (guarantee 4), one
+    // cache line each.
     #[test]
-    fn a_slot_is_a_half_cache_line() {
-        assert_eq!(std::mem::size_of::<Slot>(), 32);
+    fn a_slot_is_a_cache_line() {
+        assert_eq!(std::mem::size_of::<Slot>(), 64);
+        assert_eq!(std::mem::align_of::<Slot>(), 64);
+    }
+
+    #[test]
+    fn only_the_call_that_takes_a_slot_is_told_so() {
+        let t = KeyTable::new(1, q()); // a single bucket of 8
+        assert!(t.claim(42).1, "taken");
+        assert!(!t.claim(42).1, "found");
+        for key in 1..BUCKET as u64 {
+            assert!(t.claim(key).1);
+        }
+        let (slot, taken) = t.claim(99);
+        assert!(
+            t.is_overflow(slot) && !taken,
+            "the overflow slot is nobody's"
+        );
+    }
+
+    #[test]
+    fn a_released_slot_forgets_its_class() {
+        let t = KeyTable::new(1, q());
+        let slot = t.slot(1);
+        slot.class.store(7, Ordering::Relaxed);
+        assert!(t.release(slot, 1, q()));
+        assert_eq!(t.slot(2).class.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -286,7 +340,7 @@ mod tests {
         let t = KeyTable::new(1, q());
         let slot = t.slot(1);
         for _ in 0..5 {
-            slot.count_attempt();
+            slot.count_attempt(Ordering::Relaxed);
         }
         slot.count_denial();
         slot.count_denial();
@@ -323,7 +377,7 @@ mod tests {
         for _ in 0..10 {
             t.slot(1).gcra.check(0);
         }
-        t.slot(1).count_attempt();
+        t.slot(1).count_attempt(Ordering::Relaxed);
         t.slot(1).count_denial();
         let slot = t.slot(1);
         assert!(t.release(slot, 1, q()));
@@ -401,7 +455,7 @@ mod tests {
             for _ in 0..8 {
                 s.spawn(|| {
                     for &key in &keys {
-                        t.slot(key).count_attempt();
+                        t.slot(key).count_attempt(Ordering::Relaxed);
                     }
                 });
             }

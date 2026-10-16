@@ -30,6 +30,8 @@ if guard.check("api:tenant-42").is_allowed() {
 
 - **One limit for the whole fleet.** Run ten instances of your service, keep a
   single limit of 1000 rps per key across all of them.
+- **Tariffs, changed live.** Classes of limits in one guard, Free, Pro or one
+  customer of its own, added and changed while the fleet runs.
 - **No datastore on the request path.** Decisions are made from local memory in
   about 25 nanoseconds. There is no Redis to deploy, scale, or lose.
 - **Immune to cluster failure.** If gossip stops, every node keeps enforcing with
@@ -57,7 +59,7 @@ if guard.check("api:tenant-42").is_allowed() {
 
 ```toml
 [dependencies]
-rateguard = "0.3"
+rateguard = "0.4"
 ```
 
 Requires Rust 1.88 or newer (2024 edition). Optional features:
@@ -135,6 +137,47 @@ them: a flood of distinct keys beyond that pushes new keys into the shared
 allowance. Picking keys that crowd out one particular key does not work: where
 a key lives in the table depends on a secret random to each instance.
 
+### Classes of limits
+
+Different keys can have different limits: tariffs, one customer with a deal
+of its own, a costly endpoint. A class is a name with a limit; a key is
+checked in a class, and `check(key)` is the default class, the one of
+`limit`.
+
+```rust
+use rateguard::{Guard, Limit};
+
+let guard = Guard::builder()
+    .bind("0.0.0.0:7946")
+    .advertise("10.0.0.3:7946")
+    .seeds(["10.0.0.1:7946"])
+    .limit(100) // the default class
+    .class("pro", Limit::per_second(1_000).burst(50))
+    .spawn()?;
+
+let by_ip = guard.check("ip:203.0.113.7"); // 100 a second
+let pro = guard.check_in("pro", "tenant:42"); // 1000 a second
+```
+
+The same key in two classes is two keys. A class this instance does not
+know, a typo or one since removed, takes the default limit, and its checks
+are counted in `stats().unknown_class`.
+
+Classes change while the fleet runs, from any clone of the guard:
+
+```rust
+guard.set_class("tenant:7", Limit::per_second(2_000))?; // added or changed
+guard.remove_class("pro");
+guard.set_limit(Limit::per_second(200))?; // the default class
+guard.set_classes([("free", Limit::per_second(10))])?; // all named, at once
+```
+
+New keys take a changed limit at once, known ones within a tick of the
+background task. Give every instance the same classes: while some have a
+class's new limit and others the old, the fleet admits no more than the
+higher of the two. A raised limit is never overshot; a lowered one holds
+once every instance has it (see [Accuracy](#accuracy)).
+
 ### With `axum`
 
 With the `tower` feature, `RateLimitLayer` takes the key from each request
@@ -157,6 +200,9 @@ let app = Router::new()
     .layer(limit);
 ```
 
+To check in a class, return it with the key, as a pair:
+`Some((plan, format!("api:{tenant}")))`.
+
 ### Configuration
 
 | Option | Default | Meaning |
@@ -171,6 +217,8 @@ let app = Router::new()
 | `hot_keys(n)` | `64` | How many keys may be coordinated at once, at most 64 |
 | `tracked_keys(n)` | `4096` | Keys one instance keeps state for at once, at least `hot_keys` and at most 1,048,576; the table holds twice as many |
 | `dry_run(on)` | `false` | Admit every request and count those that would be denied; see [Dry run](#dry-run) |
+| `class(name, limit)` | none | A class of limits, see [Classes of limits](#classes-of-limits) |
+| `max_classes(n)` | `64` | How many named classes an instance keeps, at most 4096 |
 
 ### Observability
 
@@ -194,18 +242,22 @@ println!("{} admitted, {} denied", stats.admitted, stats.denied);
 | `tracked_keys`, `hot_keys` | Keys with state here, and keys coordinated with the peers |
 | `since_last_round` | Far over the protocol period, the background task is stuck |
 | `running`, `dry_run` | Whether the node still runs, and whether this is a dry run |
+| `most_denied` | Up to ten keys denied most lately, with their denials a second: who is being limited. By hash: match them with `key_hash_in(class, key)` |
+| `unknown_class` | Checks in a class this instance does not know, held to the default limit |
 
 `guard.share(key)` is the rate one key is admitted at on this instance now:
-its share of the limit, before the burst.
+its share of the limit, before the burst; `share_in(class, key)` the same in a
+class.
 
 With the `metrics` feature the background task publishes the same, labelled
 `guard` with the address the instance advertises:
 `rateguard_checks_total{decision="allow"|"deny"}`,
-`rateguard_overflowed_total`, and the gauges `rateguard_cluster_size`,
+`rateguard_overflowed_total`, `rateguard_unknown_class_total`, and the gauges `rateguard_cluster_size`,
 `rateguard_counted_size`, `rateguard_suspects`, `rateguard_tracked_keys`,
 `rateguard_hot_keys`, `rateguard_held{reason="joining"|"learning"|"without_quorum"}`
-and `rateguard_dry_run`. Install any `metrics` recorder, Prometheus or
-another; nothing is published on the request path.
+and `rateguard_dry_run`: everything but `most_denied`, whose key hashes as
+labels would make a series per key. Install any `metrics` recorder,
+Prometheus or another; nothing is published on the request path.
 
 ### Dry run
 
@@ -378,9 +430,9 @@ sends to one instance in practice, but not free.
 2. A healthy cluster in steady state admits between `R × (1 − ε)` and `R`.
 3. Under partition, the bounds above, according to the selected policy.
 4. Memory is bounded by configuration: the coordination state is
-   `O(hot_keys × N)`, and the per-key table is allocated once: two 32-byte
-   slots per tracked key, rounded up to a power of two (256 KB at the default
-   4096).
+   `O(hot_keys × N)`, and the per-key table is allocated once: two 64-byte
+   slots per tracked key, one cache line each, rounded up to a power of two
+   (512 KB at the default 4096).
 5. Bandwidth in a healthy cluster is two datagrams per node per protocol
    period: the node's own probe and, on average, one answer to a probe of it.
 
@@ -411,6 +463,8 @@ and CI fails if it falls out of date.
 | Node 4 leaves for good (the other four) | R at once | 1.00 R | 1.00 R | 0 | 1 s |
 | Traffic jumps 100×, cold to hot | R | 1.00 R | 1.00 R | 0 | 3 s |
 | A node joins 10 s late | R | 1.00 R | 1.01 R | 0 | 1 s |
+| Limit lowered to R/2, one node a second | ≤ R in passing, R/2 after | 0.50 R | 1.00 R | 0 | 3 s |
+| Limit raised from R/2 to R, one node a second | ≤ R, then R | 1.00 R | 1.00 R | 0 | 3 s |
 <!-- accuracy: end -->
 
 *Admitted, steady* is the rate once the scenario has settled, over a window

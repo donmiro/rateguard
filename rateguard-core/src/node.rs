@@ -32,7 +32,7 @@ use crate::{
     boundary::{Action, Event, PeerId},
     gcra::{Decision, Nanos, Quota},
     gossip::{self, Gossip},
-    limiter::{Config, Limiter},
+    limiter::{Config, Limit, Limiter},
     member::{Applied, MemberTable},
     membership::{Change, Membership},
     partition::{self, PartitionPolicy, SizeHistory},
@@ -291,16 +291,19 @@ impl Node {
         self.refresh_cap(self.last_now);
     }
 
-    /// Counts attempts collected by a runtime that enforces in its own table;
+    /// Counts `attempts` collected by a runtime that enforces in its own
+    /// table, `denials` of them denied, for a key whose limit is `limit`;
     /// [`quota`](Node::quota) is the way back.
     ///
     /// # Panics
     ///
-    /// If `now` is earlier than a time already seen.
-    pub fn record_attempts(&mut self, key: u64, n: u64, now: Nanos) {
+    /// If `now` is earlier than a time already seen, or the limit is out of
+    /// range, as for [`Limiter::check_in`].
+    pub fn record(&mut self, key: u64, attempts: u64, denials: u64, limit: Limit, now: Nanos) {
         self.advance(now);
         let cluster_size = self.allocation_size();
-        self.limiter.record_attempts(key, n, now, cluster_size);
+        self.limiter
+            .record(key, attempts, denials, limit, now, cluster_size);
     }
 
     /// The quota `key` is held to after the last round, every cap included.
@@ -308,9 +311,26 @@ impl Node {
         self.limiter.quota(key)
     }
 
-    /// The quota a key not seen before starts with.
+    /// The quota a key not seen before starts with, at the config's limit.
     pub fn new_key_quota(&self) -> Quota {
-        self.limiter.new_key_quota(self.allocation_size())
+        self.new_key_quota_in(self.limiter.config().limit())
+    }
+
+    /// The quota a key not seen before starts with in `limit`.
+    pub fn new_key_quota_in(&self, limit: Limit) -> Quota {
+        self.limiter.new_key_quota(limit, self.allocation_size())
+    }
+
+    /// The rate a key not seen before starts with, as a part of its R, every
+    /// cap included: for a runtime that sizes a new key's quota itself.
+    pub fn new_key_factor(&self) -> f64 {
+        self.limiter.new_key_factor(self.allocation_size())
+    }
+
+    /// Up to `k` keys with the most denials lately, in denials a second,
+    /// most denied first; see [`Limiter::most_denied`].
+    pub fn most_denied(&self, k: usize) -> Vec<(u64, f64)> {
+        self.limiter.most_denied(k)
     }
 
     /// Whether the key has state on this node.
@@ -416,8 +436,19 @@ impl Node {
     /// If `now` is earlier than a time already seen: time running backwards
     /// would break GCRA silently.
     pub fn check(&mut self, key: u64, now: Nanos) -> Decision {
+        self.check_in(key, self.limiter.config().limit(), now)
+    }
+
+    /// Like [`check`](Node::check), for a key with a limit of its own.
+    ///
+    /// # Panics
+    ///
+    /// As [`check`](Node::check), and if the limit is out of range, as for
+    /// [`Limiter::check_in`].
+    pub fn check_in(&mut self, key: u64, limit: Limit, now: Nanos) -> Decision {
         self.advance(now);
-        self.limiter.check(key, now, self.allocation_size())
+        self.limiter
+            .check_in(key, limit, now, self.allocation_size())
     }
 
     /// Handles an event and returns the datagrams to send.
@@ -943,8 +974,9 @@ impl Node {
     //   Optimistic serves anyway, by definition.
     // - Quorum without a majority, see apply_policy.
     fn refresh_cap(&mut self, now: Nanos) {
-        let config = self.limiter.config();
-        let floor = |known: usize| config.limit_per_sec as f64 * config.floor_factor / known as f64;
+        // As a part of each key's own R.
+        let beta = self.limiter.config().floor_factor;
+        let floor = |known: usize| beta / known as f64;
 
         let waiting = self.joined_at.is_none() && (self.expects_peers || !self.seeds.is_empty());
         let held = Held {
@@ -1005,20 +1037,19 @@ impl Node {
         let as_of = self.as_of();
         let reported = &self.reported;
         let peers = &self.peer_demand;
-        let floor = config.limit_per_sec as f64 * config.floor_factor / cluster_size as f64;
         let previous = std::mem::take(&mut self.recent_shares);
         let mut recent = BTreeMap::new();
         self.limiter.tick_with_shares(
             now,
             cluster_size,
             |key| peers.hot_elsewhere(key),
-            |key, own| {
+            |key, own, limit| {
                 let share = if !alone && !informed.contains(&key) {
-                    floor
+                    limit * config.floor_factor / cluster_size as f64
                 } else {
                     let then = as_of.and_then(|at| reported_demand(reported, key, at));
                     allocation::share(View {
-                        limit: config.limit_per_sec as f64,
+                        limit,
                         cluster_size,
                         floor_factor: config.floor_factor,
                         own: then.map_or(own, |then| own.min(then)),
@@ -2372,6 +2403,61 @@ mod tests {
         assert!((rate - 950.0).abs() < 1.0, "{rate}");
     }
 
+    const PRO: Limit = Limit {
+        per_second: 200,
+        burst: 4,
+    };
+
+    fn rate_in(node: &mut Node, key: u64, limit: Limit, now: Nanos) -> f64 {
+        for _ in 0..limit.burst {
+            assert_eq!(node.check_in(key, limit, now), Decision::Allow);
+        }
+        let Decision::Deny { retry_at } = node.check_in(key, limit, now) else {
+            panic!("burst must be exhausted");
+        };
+        ONE_SEC as f64 / (retry_at - now) as f64
+    }
+
+    #[test]
+    fn a_hot_key_with_a_limit_of_its_own_is_shared_out_of_it() {
+        let mut n = hot_pair();
+        for _ in 0..500 {
+            n.check_in(KEY + 1, PRO, 0);
+        }
+        let up = stale_after_rounds(2) + 1 + RISE_DELAY_ROUNDS as u64;
+        rounds_with_peer(&mut n, 1, up, None);
+        assert!(n.limiter().is_hot(KEY + 1));
+        // 200 × 0.1 / 2 = 10 left as the peer's floor, not 1000's 50.
+        let rate = rate_in(&mut n, KEY + 1, PRO, up * PERIOD + 1);
+        assert!((rate - 190.0).abs() < 1.0, "{rate}");
+    }
+
+    #[test]
+    fn a_waiting_node_holds_a_key_to_the_floor_of_its_own_limit() {
+        let mut n = waiting_for(PartitionPolicy::default());
+        n.handle(Event::Tick, 0);
+        // R × β over itself and its one seed: 200 × 0.1 / 2.
+        assert_eq!(rate_in(&mut n, KEY + 1, PRO, 0), 10.0, "a new key");
+        // Once the debt of the first measure is paid off.
+        let later = ONE_SEC.next_multiple_of(PERIOD);
+        n.handle(Event::Tick, later);
+        assert_eq!(rate_in(&mut n, KEY + 1, PRO, later), 10.0, "known");
+        assert_eq!(n.new_key_quota_in(PRO).rate_per_sec(), 10.0);
+        assert_eq!(n.new_key_factor(), 0.05, "β / 2");
+    }
+
+    #[test]
+    fn denials_recorded_by_a_runtime_list_the_key() {
+        let mut n = node();
+        n.handle(Event::Tick, 0);
+        n.record(KEY, 100, 60, PRO, 0);
+        n.handle(Event::Tick, PERIOD);
+        let denied = n.most_denied(10);
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].0, KEY);
+        assert_eq!(n.limiter().limit(KEY), Some(PRO));
+    }
+
     #[test]
     fn a_busy_peer_leaves_a_node_little_more_than_its_floor() {
         let mut n = hot_pair();
@@ -2688,7 +2774,7 @@ mod tests {
     fn a_node_fed_attempts_hands_out_quotas() {
         let mut n = node();
         n.handle(Event::Tick, 0);
-        n.record_attempts(KEY, 2000, 0);
+        n.record(KEY, 2000, 0, config().limit(), 0);
         assert!(n.is_tracked(KEY));
         n.handle(Event::Tick, ONE_SEC);
         assert!(n.limiter().is_hot(KEY));

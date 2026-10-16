@@ -1,0 +1,19 @@
+{
+  "name": "rateguard-client",
+  "version": "0.5.0",
+  "description": "Client for rateguard-sidecar: one global rate limit across a fleet, enforced locally",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test" },
+  "license": "MIT OR Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/donmiro/rateguard", "directory": "sdk/typescript" }
+}

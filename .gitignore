@@ -3,3 +3,9 @@
 ROADMAP.md
 .DS_Store
 .superpowers
+# The SDKs' build and test leftovers.
+__pycache__/
+*.egg-info/
+sdk/python/build/
+sdk/python/dist/
+sdk/typescript/*.tgz

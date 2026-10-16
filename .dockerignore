@@ -1,0 +1,6 @@
+target
+docs
+ROADMAP.md
+sdk
+**/node_modules
+.git

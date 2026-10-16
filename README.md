@@ -59,7 +59,7 @@ if guard.check("api:tenant-42").is_allowed() {
 
 ```toml
 [dependencies]
-rateguard = "0.4"
+rateguard = "0.5"
 ```
 
 Requires Rust 1.88 or newer (2024 edition). Optional features:
@@ -202,6 +202,29 @@ let app = Router::new()
 
 To check in a class, return it with the key, as a pair:
 `Some((plan, format!("api:{tenant}")))`.
+
+### From other languages
+
+`rateguard-sidecar` runs next to each instance of a service in any language,
+and answers it over HTTP on loopback; the sidecars share the limit as Rust
+processes do. Clients for Python, Go and TypeScript are in
+[`sdk/`](https://github.com/donmiro/rateguard/tree/main/sdk), and any HTTP
+client will do:
+
+```sh
+rateguard-sidecar --limit 1000 --advertise 10.0.0.3:7946 --seeds 10.0.0.1:7946
+curl -s -X POST -d '{"key": "tenant:42"}' http://127.0.0.1:7947/v1/check
+# {"allowed":true}
+```
+
+```python
+from rateguard_client import Client  # pip install rateguard-client
+
+decision = Client().check("tenant:42", cls="pro")
+```
+
+See the [sidecar's README](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar)
+for its flags, its API, and a Kubernetes example.
 
 ### Configuration
 
@@ -557,8 +580,10 @@ MTU. A fifty-node cluster exchanges at most about 700 KB/s in total, no matter
 how much traffic it serves. Failures add indirect probes for as long as they
 last.
 
-**Can I use it from services that aren't in Rust?** Not yet. A sidecar speaking
-gRPC/HTTP is planned.
+**Can I use it from services that aren't in Rust?** Yes, through
+`rateguard-sidecar` and the clients in `sdk/`: see
+[From other languages](#from-other-languages). A check then costs a round
+trip on loopback, a fraction of a millisecond, rather than 25 ns.
 
 ## Crates
 
@@ -567,6 +592,7 @@ gRPC/HTTP is planned.
 | `rateguard` | The runtime: UDP, timers, the public API |
 | `rateguard-core` | Pure logic — GCRA, demand estimation, hot/cold sets, membership state machine. No I/O, no tokio, time as a parameter |
 | `rateguard-proto` | Wire format |
+| `rateguard-sidecar` | The runtime as a program, with an HTTP API on loopback, for services in any language |
 | `rateguard-sim` | Deterministic simulator on virtual time, used to develop and test the protocol. Not published |
 
 ## Contributing

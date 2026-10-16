@@ -1,0 +1,91 @@
+# A service with rateguard-sidecar next to it, every replica sharing one
+# limit. The replicas find each other through a headless service; the API
+# stays on each pod's loopback, where only the app reaches it.
+#
+#     kubectl apply -f kubernetes.yaml
+#
+# The app calls http://127.0.0.1:7947/v1/check, or uses an SDK from sdk/.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-rateguard
+spec:
+  # Headless: the name resolves to every pod, which is all a seed needs.
+  clusterIP: None
+  # Pods not ready yet are listed too: a new replica must find the others
+  # before it is ready, and holds every key at the floor until it has.
+  publishNotReadyAddresses: true
+  selector:
+    app: api
+  ports:
+    - name: gossip
+      port: 7946
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      # On SIGTERM the sidecar leaves the cluster, then answers for
+      # RATEGUARD_DRAIN, 10 s by default, while the app drains: keep the
+      # grace period above it. On Kubernetes 1.29 or newer, the sidecar can
+      # also be a native sidecar, an init container with
+      # restartPolicy: Always, which is stopped only after the app.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: app
+          image: your-service:latest
+          env:
+            - name: RATEGUARD_SIDECAR_URL
+              value: http://127.0.0.1:7947
+        - name: rateguard
+          image: rateguard-sidecar:0.5.0
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RATEGUARD_ADVERTISE
+              value: $(POD_IP):7946
+            - name: RATEGUARD_SEEDS
+              value: api-rateguard:7946
+            - name: RATEGUARD_LIMIT
+              value: "1000"
+            - name: RATEGUARD_CLASSES
+              value: pro=5000/250,free=50
+            - name: RATEGUARD_METRICS_LISTEN
+              value: 0.0.0.0:9090
+          ports:
+            - name: gossip
+              containerPort: 7946
+              protocol: UDP
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 64Mi

@@ -31,28 +31,33 @@ async function fake(t, answer, { status = 200, delay = 0 } = {}) {
 
 const allow = () => ({ allowed: true });
 
+// For the tests that are not about the timeout. The first fetch of the
+// process loads undici, inside the default 50 ms: on a busy CI runner
+// that alone can take longer.
+const ROOMY = 5000;
+
 test("an allowed check", async (t) => {
   const sidecar = await fake(t, allow);
-  const decision = await new Client({ url: sidecar.url }).check("tenant:42");
+  const decision = await new Client({ url: sidecar.url, timeoutMs: ROOMY }).check("tenant:42");
   assert.deepEqual(decision, { allowed: true, retryAfterMs: 0 });
   assert.deepEqual(sidecar.seen, [{ path: "/v1/check", body: { key: "tenant:42" } }]);
 });
 
 test("a denied check says when to retry", async (t) => {
   const sidecar = await fake(t, () => ({ allowed: false, retry_after_ms: 1500 }));
-  const decision = await new Client({ url: sidecar.url }).check("k");
+  const decision = await new Client({ url: sidecar.url, timeoutMs: ROOMY }).check("k");
   assert.deepEqual(decision, { allowed: false, retryAfterMs: 1500 });
 });
 
 test("a check in a class sends the class", async (t) => {
   const sidecar = await fake(t, allow);
-  await new Client({ url: sidecar.url }).check("tenant:42", { class: "pro" });
+  await new Client({ url: sidecar.url, timeoutMs: ROOMY }).check("tenant:42", { class: "pro" });
   assert.deepEqual(sidecar.seen[0].body, { key: "tenant:42", class: "pro" });
 });
 
 test("one connection serves many checks in turn", async (t) => {
   const sidecar = await fake(t, allow);
-  const client = new Client({ url: sidecar.url });
+  const client = new Client({ url: sidecar.url, timeoutMs: ROOMY });
   for (let i = 0; i < 50; i++) {
     assert.equal((await client.check("k")).allowed, true);
   }
@@ -80,8 +85,8 @@ test("onError deny denies when the sidecar is gone", async () => {
 
 test("a sidecar that answers badly counts as an error", async (t) => {
   const sidecar = await fake(t, () => ({ error: "no key" }), { status: 400 });
-  assert.equal((await new Client({ url: sidecar.url }).check("k")).allowed, true);
-  const strict = new Client({ url: sidecar.url, onError: "deny" });
+  assert.equal((await new Client({ url: sidecar.url, timeoutMs: ROOMY }).check("k")).allowed, true);
+  const strict = new Client({ url: sidecar.url, timeoutMs: ROOMY, onError: "deny" });
   assert.equal((await strict.check("k")).allowed, false);
 });
 
@@ -93,12 +98,12 @@ test("the url comes from the environment by default", async (t) => {
   const sidecar = await fake(t, allow);
   process.env.RATEGUARD_SIDECAR_URL = sidecar.url;
   t.after(() => delete process.env.RATEGUARD_SIDECAR_URL);
-  assert.equal((await new Client().check("k")).allowed, true);
+  assert.equal((await new Client({ timeoutMs: ROOMY }).check("k")).allowed, true);
   assert.equal(sidecar.seen.length, 1);
 });
 
 test("a path in the url is kept", async (t) => {
   const sidecar = await fake(t, allow);
-  await new Client({ url: `${sidecar.url}/rateguard/` }).check("k");
+  await new Client({ url: `${sidecar.url}/rateguard/`, timeoutMs: ROOMY }).check("k");
   assert.equal(sidecar.seen[0].path, "/rateguard/v1/check");
 });

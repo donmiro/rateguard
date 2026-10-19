@@ -2,6 +2,7 @@
 answers, and what it does when the sidecar is not there."""
 
 import json
+import sys
 import threading
 import time
 import unittest
@@ -37,7 +38,14 @@ class FakeSidecar:
             def log_message(self, *args):
                 pass
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class Server(ThreadingHTTPServer):
+            # A client that gave up on a slow answer has closed its end:
+            # writing to it then is the point of the test, not a failure.
+            def handle_error(self, request, client_address):
+                if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+                    super().handle_error(request, client_address)
+
+        self.server = Server(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -143,6 +151,19 @@ class ThreadsTest(unittest.TestCase):
         client.check("k")
         self.assertEqual(len(sidecar.peers), 5)
         client.close()
+        self.assertEqual(client._open(), 0)
+
+    def test_a_thread_that_is_gone_leaves_no_connection_open(self):
+        # A server with a thread per request would otherwise run out of
+        # file descriptors, and then allow every request.
+        sidecar = FakeSidecar(lambda body: {"allowed": True})
+        self.addCleanup(sidecar.close)
+        client = Client(sidecar.url)
+        self.addCleanup(client.close)
+        for _ in range(20):
+            thread = threading.Thread(target=client.check, args=("k",))
+            thread.start()
+            thread.join()
         self.assertEqual(client._open(), 0)
 
 

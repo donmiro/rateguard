@@ -80,10 +80,50 @@ pub fn public_app(app: App) -> Router {
     router.with_state(app)
 }
 
+/// Serves [`public_app`] on `listener` until the process stops.
+///
+/// Unlike `axum::serve`, a connection is closed once it has waited
+/// `header_timeout` for a request's head: whether idle or sending it a byte
+/// at a time. The port is open to the pod's network, and connections nobody
+/// closes would take the file descriptors and memory of the process that
+/// also answers the checks.
+pub async fn serve_public(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    header_timeout: std::time::Duration,
+) {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // Out of file descriptors, most likely: give the others a
+            // moment to close rather than spin.
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let service = TowerToHyperService::new(router.clone());
+        tokio::spawn(async move {
+            let _ = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_timeout)
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
 #[derive(Deserialize)]
 struct Check<'a> {
-    #[serde(borrow)]
-    key: Cow<'a, str>,
+    // As bytes: serde_json refuses a lone surrogate in a str but hands it
+    // over as WTF-8 here. Python and JavaScript send one as readily as any
+    // other key, and their clients take a 400 for an outage and fail open,
+    // so whoever chooses the key would go unlimited.
+    #[serde(borrow, with = "serde_bytes")]
+    key: Cow<'a, [u8]>,
     #[serde(borrow, default)]
     class: Option<Cow<'a, str>>,
 }
@@ -93,9 +133,12 @@ async fn check(State(app): State<App>, body: Bytes) -> Response {
         Ok(check) => check,
         Err(error) => return bad_request(error),
     };
+    // Lossy, as the Go client is: two keys that differ only in their
+    // surrogates share a limit, which is stricter, never looser.
+    let key = String::from_utf8_lossy(&check.key);
     let decision = match &check.class {
-        Some(class) => app.guard.check_in(class, &check.key),
-        None => app.guard.check(&check.key),
+        Some(class) => app.guard.check_in(class, &key),
+        None => app.guard.check(&key),
     };
     let json = [(header::CONTENT_TYPE, "application/json")];
     match decision {

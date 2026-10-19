@@ -406,7 +406,9 @@ impl Limiter {
             .keys
             .iter()
             .filter(|&(&key, _)| !self.hot_set.is_hot(key))
-            .map(|(&key, state)| (key, state.demand.rate()))
+            // Unbiased: a key seen only lately would otherwise show a
+            // fraction of its demand and go first, every round.
+            .map(|(&key, state)| (key, state.demand.unbiased_rate()))
             .collect();
 
         victims.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
@@ -981,6 +983,35 @@ mod tests {
         let mut survivors: Vec<u64> = (0..20u64).filter(|&k| l.tracked(k)).collect();
         survivors.sort_unstable();
         assert_eq!(survivors, vec![12, 13, 14, 15, 16, 17, 18, 19]);
+    }
+
+    // A key's average starts from zero: one round in, it shows a tenth of
+    // its demand. Ranked on that, a new key busier than every tracked one
+    // would be the first dropped, round after round, and never tracked.
+    #[test]
+    fn a_new_key_busier_than_the_tracked_ones_outranks_them() {
+        let mut l = limiter();
+        let round = ONE_SEC / 10;
+        let mut now = 0;
+        l.tick(now, N);
+        for _ in 0..50 {
+            for key in 0..8u64 {
+                l.record(key, 2, 0, config().limit(), now, N);
+            }
+            now += round;
+            l.tick(now, N);
+        }
+        assert_eq!(l.tracked_keys(), 8);
+
+        // Twice as busy as each of them, cold all the same.
+        for key in 0..8u64 {
+            l.record(key, 2, 0, config().limit(), now, N);
+        }
+        l.record(99, 4, 0, config().limit(), now, N);
+        now += round;
+        l.tick(now, N);
+        assert!(!l.is_hot(99));
+        assert!(l.tracked(99));
     }
 
     #[test]

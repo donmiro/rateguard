@@ -79,7 +79,7 @@ second container of each pod, a headless service for the seeds, probes and
 Prometheus on `--metrics-listen`. The image:
 
 ```sh
-docker build -f rateguard-sidecar/Dockerfile -t rateguard-sidecar:0.5.0 .
+docker build -f rateguard-sidecar/Dockerfile -t rateguard-sidecar:0.5.1 .
 ```
 
 ## License

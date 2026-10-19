@@ -22,6 +22,7 @@ import json
 import os
 import threading
 import urllib.parse
+import weakref
 from dataclasses import dataclass
 
 __all__ = ["Client", "Decision"]
@@ -66,8 +67,9 @@ class Client:
         self._timeout = timeout
         self._on_error = Decision(allowed=on_error == "allow")
         self._local = threading.local()
-        # Every thread's connection, for close().
-        self._connections: set[http.client.HTTPConnection] = set()
+        # Every live thread's connection, for close(). Weak: a thread that
+        # is gone takes its connection with it.
+        self._connections: weakref.WeakSet[_Held] = weakref.WeakSet()
         self._lock = threading.Lock()
 
     def check(self, key: str, cls: str | None = None) -> Decision:
@@ -110,9 +112,9 @@ class Client:
         """Closes every thread's connection to the sidecar; the next check
         opens another."""
         with self._lock:
-            connections, self._connections = self._connections, set()
-        for connection in connections:
-            connection.close()
+            held, self._connections = list(self._connections), weakref.WeakSet()
+        for one in held:
+            one.connection.close()
         self._local = threading.local()
 
     def _open(self) -> int:
@@ -127,18 +129,29 @@ class Client:
         self.close()
 
     def _connection(self) -> http.client.HTTPConnection:
-        connection = getattr(self._local, "connection", None)
-        if connection is None:
-            connection = self._connect(self._host, self._port, timeout=self._timeout)
-            self._local.connection = connection
+        held = getattr(self._local, "held", None)
+        if held is None:
+            held = _Held(self._connect(self._host, self._port, timeout=self._timeout))
+            self._local.held = held
             with self._lock:
-                self._connections.add(connection)
-        return connection
+                self._connections.add(held)
+        return held.connection
 
     def _drop(self) -> None:
-        connection = getattr(self._local, "connection", None)
-        if connection is not None:
-            connection.close()
-            self._local.connection = None
+        held = getattr(self._local, "held", None)
+        if held is not None:
+            held.connection.close()
+            self._local.held = None
             with self._lock:
-                self._connections.discard(connection)
+                self._connections.discard(held)
+
+
+class _Held:
+    """A thread's connection, in that thread's local storage alone: closed
+    once the thread is gone, rather than left open for good."""
+
+    def __init__(self, connection: http.client.HTTPConnection):
+        self.connection = connection
+
+    def __del__(self) -> None:
+        self.connection.close()

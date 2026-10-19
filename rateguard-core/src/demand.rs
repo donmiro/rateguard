@@ -14,6 +14,9 @@ pub struct Demand {
     current_rate: f64,
     attempts_since_tick: u64,
     last_tick: Option<Nanos>,
+    /// When measuring began: the first tick, or the moment given to
+    /// `starting_at`.
+    since: Option<Nanos>,
     time_constant: Nanos,
 }
 impl Demand {
@@ -23,6 +26,7 @@ impl Demand {
             current_rate: 0.0,
             attempts_since_tick: 0,
             last_tick: None,
+            since: None,
             time_constant,
         }
     }
@@ -32,6 +36,7 @@ impl Demand {
     pub fn starting_at(time_constant: Nanos, now: Nanos) -> Self {
         Self {
             last_tick: Some(now),
+            since: Some(now),
             ..Self::new(time_constant)
         }
     }
@@ -51,6 +56,7 @@ impl Demand {
     pub fn tick(&mut self, now: Nanos) {
         let Some(last) = self.last_tick else {
             self.last_tick = Some(now);
+            self.since = Some(now);
             return;
         };
 
@@ -78,6 +84,23 @@ impl Demand {
     /// The average, in attempts per second, as of the last tick.
     pub fn rate(&self) -> f64 {
         self.current_rate
+    }
+
+    /// The average without the zero it started from: [`rate`](Demand::rate)
+    /// divided by the weight the measured time has in it. The same as
+    /// `rate` once measured for a few time constants; for a key seen only
+    /// lately, its rate so far, where `rate` still shows a fraction of it.
+    /// For comparing keys of different ages.
+    pub fn unbiased_rate(&self) -> f64 {
+        let (Some(since), Some(last)) = (self.since, self.last_tick) else {
+            return 0.0;
+        };
+        let measured = last.saturating_sub(since);
+        if measured == 0 {
+            return 0.0;
+        }
+        let weight = 1.0 - (-(measured as f64) / self.time_constant as f64).exp();
+        self.current_rate / weight
     }
 }
 
@@ -108,6 +131,26 @@ mod tests {
             d.rate() > 0.0,
             "state created while traffic already flows cannot afford a warm-up tick"
         );
+    }
+
+    #[test]
+    fn the_unbiased_rate_of_a_new_key_is_its_rate_so_far() {
+        let mut d = Demand::starting_at(ONE_SEC, 0);
+        assert_eq!(d.unbiased_rate(), 0.0);
+        d.record_attempts(4);
+        d.tick(ONE_SEC / 10);
+        assert!(d.rate() < 5.0);
+        assert!((d.unbiased_rate() - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_unbiased_rate_of_an_old_key_is_its_rate() {
+        let mut d = Demand::starting_at(ONE_SEC, 0);
+        for second in 1..=30 {
+            d.record_attempts(10);
+            d.tick(second * ONE_SEC);
+        }
+        assert!((d.unbiased_rate() - d.rate()).abs() < 1e-9);
     }
 
     #[test]

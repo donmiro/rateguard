@@ -42,6 +42,10 @@ use crate::{
 
 const ONE_MS: Nanos = 1_000_000;
 
+/// How long a node without a majority keeps counting it against the size it
+/// last saw, by default: an hour. See [`PartitionPolicy::Quorum`].
+pub const DEFAULT_QUORUM_MEMORY: Nanos = 3_600_000 * ONE_MS;
+
 // How many rounds a share has to stay up before it is applied. A peer
 // recomputes its shares once a round, so up to a round after it has heard
 // this node's demand; until then it still holds the share it had. Were this
@@ -126,6 +130,8 @@ pub struct Node {
     sizes: SizeHistory,
     held_size: usize,
     quorum_size: usize,
+    quorum_memory: Nanos,
+    without_quorum_since: Option<Nanos>,
     floored_until: Nanos,
     joined_at: Option<Nanos>,
     expects_peers: bool,
@@ -229,6 +235,8 @@ impl Node {
             sizes: SizeHistory::new(hold_of(PartitionPolicy::default())),
             held_size: 0,
             quorum_size: 1,
+            quorum_memory: DEFAULT_QUORUM_MEMORY,
+            without_quorum_since: None,
             floored_until: 0,
             joined_at: None,
             expects_peers: false,
@@ -359,6 +367,13 @@ impl Node {
         self.sizes = SizeHistory::new(hold_of(policy));
         self.held_size = 0;
         self.refresh_cap(self.last_now);
+    }
+
+    /// How long a node without a majority keeps counting it against the
+    /// size it last saw ([`DEFAULT_QUORUM_MEMORY`] unless set); see
+    /// [`PartitionPolicy::Quorum`].
+    pub fn set_quorum_memory(&mut self, memory: Nanos) {
+        self.quorum_memory = memory;
     }
 
     /// The policy set with [`set_partition_policy`](Node::set_partition_policy).
@@ -951,8 +966,21 @@ impl Node {
             .filter(|&&peer| self.members.status(peer) == Some(Status::Alive))
             .count();
         let known = self.known_for_quorum();
-        let counted = known.max(self.quorum_size);
-        let quorum = partition::has_quorum(alive, counted);
+        let mut counted = known.max(self.quorum_size);
+        let mut quorum = partition::has_quorum(alive, counted);
+        // Not forever, though: nodes that crashed and came back under new
+        // addresses look the same as a split, and would hold the cluster at
+        // the floor for good. Members missing for the quorum memory are
+        // taken for gone.
+        if quorum {
+            self.without_quorum_since = None;
+        } else {
+            let since = *self.without_quorum_since.get_or_insert(now);
+            if now.saturating_sub(since) >= self.quorum_memory {
+                counted = known;
+                quorum = partition::has_quorum(alive, counted);
+            }
+        }
         self.quorum_size = if quorum { known } else { counted };
         if self.policy == PartitionPolicy::Quorum && !quorum {
             let heard_within = peer_demand::stale_after_rounds(counted) * self.swim.protocol_period;
@@ -2709,6 +2737,26 @@ mod tests {
             n.handle(Event::Tick, now);
         }
         assert_eq!(cold_rate_after_round(&mut n, now), 20.0, "R × β / 5");
+    }
+
+    // A split and a fleet whose nodes all crashed and came back under new
+    // addresses look the same from inside. The size a majority is counted
+    // against is held for the quorum memory, not forever: past it, the
+    // node counts what it knows.
+    #[test]
+    fn a_node_without_a_quorum_for_the_quorum_memory_counts_what_it_knows() {
+        let (mut n, buried) = abandoned(PartitionPolicy::Quorum);
+        let memory = SWIM.tombstone_ttl + 100 * PERIOD;
+        n.set_quorum_memory(memory);
+        // Held at the floor past the tombstones, as
+        // a_node_without_a_quorum_stays_at_the_floor_after_the_dead_are_forgotten
+        // shows; then let go, once the last floor has run out: 3 × 5 rounds.
+        let mut now = buried;
+        while now < buried + memory + 15 * PERIOD {
+            now += TICK;
+            n.handle(Event::Tick, now);
+        }
+        assert_eq!(cold_rate_after_round(&mut n, now), 500.0, "α × R / 1");
     }
 
     // Ticks until `until`, answering the probes to the `answering` peers;

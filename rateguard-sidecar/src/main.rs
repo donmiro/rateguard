@@ -1,11 +1,12 @@
 //! `rateguard-sidecar`: see `--help`, and the crate's README.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rateguard_sidecar::args::Args;
-use rateguard_sidecar::{App, app, public_app};
+use rateguard_sidecar::{App, app, public_app, serve_public};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -41,7 +42,11 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             public.local_addr()?
         );
         // Stops with the process: nothing there to drain.
-        tokio::spawn(axum::serve(public, public_app(served.clone())).into_future());
+        tokio::spawn(serve_public(
+            public,
+            public_app(served.clone()),
+            Duration::from_secs(10),
+        ));
     }
     let drain = args.drain.0;
     axum::serve(listener, app(served))

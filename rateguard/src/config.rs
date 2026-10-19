@@ -38,7 +38,8 @@ pub enum PartitionPolicy {
     HoldDown(Duration),
     /// A node that cannot see a majority of the cluster it knows drops every
     /// key to a small floor: the limit plus the minority's floors during a
-    /// split, and the minority all but stops serving.
+    /// split, and the minority all but stops serving. For as long as
+    /// [`Builder::quorum_memory`], an hour by default.
     Quorum,
 }
 impl Default for PartitionPolicy {
@@ -66,6 +67,7 @@ pub struct Builder {
     limit: Option<u32>,
     burst: Option<u32>,
     policy: Option<PartitionPolicy>,
+    quorum_memory: Option<Duration>,
     period: Option<Duration>,
     hot_keys: Option<usize>,
     tracked_keys: Option<usize>,
@@ -126,6 +128,17 @@ impl Builder {
     /// What to do when the cluster shrinks; defaults to a 10 s hold-down.
     pub fn partition_policy(mut self, policy: PartitionPolicy) -> Self {
         self.policy = Some(policy);
+        self
+    }
+
+    /// Under [`PartitionPolicy::Quorum`], how long a node without a majority
+    /// keeps counting it against the cluster it last saw; defaults to an
+    /// hour. Past it the members it misses are taken for gone: nodes that
+    /// crashed and came back under new addresses look the same as a split,
+    /// and would otherwise hold the cluster at the floor for good. A split
+    /// that lasts longer is served as under `Optimistic`.
+    pub fn quorum_memory(mut self, memory: Duration) -> Self {
+        self.quorum_memory = Some(memory);
         self
     }
 
@@ -297,6 +310,9 @@ impl Builder {
             core,
             swim,
             policy: self.policy.unwrap_or_default().to_core(),
+            quorum_memory: self
+                .quorum_memory
+                .map_or(rateguard_core::node::DEFAULT_QUORUM_MEMORY, nanos),
             dry_run: self.dry_run,
             classes,
             max_classes,
@@ -340,6 +356,7 @@ fn start<T: crate::Transport>(
         local.get() ^ entropy,
     );
     node.set_partition_policy(settings.policy);
+    node.set_quorum_memory(settings.quorum_memory);
     let mut names = crate::driver::Names::new(local);
     for seed in settings.seeds {
         let address = Address::from(seed);
@@ -449,6 +466,7 @@ pub(crate) struct Settings {
     pub core: Config,
     pub swim: SwimConfig,
     pub policy: partition::PartitionPolicy,
+    pub quorum_memory: u64,
     pub dry_run: bool,
     /// The named classes, checked.
     pub classes: Vec<(String, rateguard_core::limiter::Limit)>,
@@ -597,6 +615,17 @@ mod tests {
             .settings()
             .unwrap();
         assert_eq!(s.policy, partition::PartitionPolicy::HoldDown(u64::MAX));
+    }
+
+    #[test]
+    fn the_quorum_memory_is_an_hour_unless_set() {
+        let s = valid().settings().unwrap();
+        assert_eq!(s.quorum_memory, 3600 * ONE_SEC);
+        let s = valid()
+            .quorum_memory(Duration::from_secs(90))
+            .settings()
+            .unwrap();
+        assert_eq!(s.quorum_memory, 90 * ONE_SEC);
     }
 
     #[test]

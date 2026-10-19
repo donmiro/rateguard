@@ -27,7 +27,10 @@ pub enum PartitionPolicy {
     HoldDown(Nanos),
     /// A node that cannot see a majority of the cluster it knows drops every
     /// key, hot or cold, to the floor `R·β/N`. R plus the minority's floors
-    /// during a split; the minority all but stops serving.
+    /// during a split; the minority all but stops serving. The cluster it
+    /// knows includes the dead it has forgotten, for the quorum memory
+    /// ([`Node::set_quorum_memory`](crate::node::Node::set_quorum_memory)):
+    /// past it, a split is served as under `Optimistic`.
     Quorum,
 }
 impl Default for PartitionPolicy {

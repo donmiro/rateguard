@@ -25,7 +25,7 @@ if not decision.allowed:
 | `on_error` | `"allow"` | `"allow"` or `"deny"` the request when the sidecar cannot answer |
 
 A broken limiter should not take the service down with it, hence `allow` by
-default. One keep-alive connection per thread; `client.close()`, or `with
-Client() as limiter:`, closes the current thread's.
+default. One keep-alive connection per thread, closed when the thread ends;
+`client.close()`, or `with Client() as limiter:`, closes every thread's.
 
 Tests: `PYTHONPATH=src python3 -m unittest discover -s tests`.

@@ -100,6 +100,30 @@ async fn a_malformed_check_is_a_bad_request() {
     );
 }
 
+// What Python's json.dumps and JavaScript's JSON.stringify send for a
+// string with a lone surrogate. A 400 there would have the clients fail
+// open: anyone choosing the key would go unlimited.
+#[tokio::test]
+async fn a_key_with_a_lone_surrogate_is_limited_like_any_other() {
+    let guard = guard();
+    let router = router(&guard, false);
+    let mut decisions = Vec::new();
+    for _ in 0..4 {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/check")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"key": "evil\ud800"}"#))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        decisions.push(value["allowed"].as_bool().unwrap());
+    }
+    assert_eq!(decisions, [true, true, true, false]);
+}
+
 #[tokio::test]
 async fn stats_tell_what_was_decided() {
     let guard = guard();

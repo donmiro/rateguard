@@ -342,12 +342,18 @@ fn sync(node: &mut Node, shared: &Arc<Shared>) -> Vec<Action> {
     // A slot the node knows nothing of is freed, unless a check has come
     // since the counts were taken: a key that took its slot meanwhile, in
     // the middle of this tick, would lose it under its first check.
+    // One kept for its debt, or for a check since, gets what a new key of
+    // its class gets now, as the core treats a key it does not track: left
+    // alone, a key the core dropped would keep the quota it had then.
     shared.table.for_each(|key, slot| match node.quota(key) {
         Some(quota) => slot.gcra.set_quota(quota, now),
         None if !slot.gcra.has_debt(now) && !slot.has_counts() => {
             shared.table.release(slot, key, new_key);
         }
-        None => {}
+        None => {
+            let (limit, _) = classes.lookup(slot.class.load(Ordering::Relaxed));
+            slot.gcra.set_quota(node.new_key_quota_in(limit), now);
+        }
     });
     shared
         .table
@@ -481,6 +487,52 @@ mod tests {
         let start = tokio::time::Instant::now();
         send(&node, &HungSend, actions, budget).await;
         assert_eq!(start.elapsed(), budget);
+    }
+
+    // What the builder shares with the request path, for a node driven by
+    // hand: no background task to tick it meanwhile.
+    fn shared_for(node: &Node) -> Arc<Shared> {
+        let default = crate::Limit::per_second(100).burst(5).to_core().unwrap();
+        let classes = crate::classes::Classes::new(default, Vec::new(), 16);
+        let free = node.new_key_quota_in(classes.snapshot().strictest());
+        Arc::new(Shared {
+            table: crate::table::KeyTable::new(8, free),
+            cluster_size: Default::default(),
+            epoch: tokio::time::Instant::now(),
+            running: std::sync::atomic::AtomicBool::new(true),
+            leave: mpsc::channel(1).0,
+            dry_run: Default::default(),
+            report: Default::default(),
+            classes,
+            fresh_factor: std::sync::atomic::AtomicU64::new(node.new_key_factor().to_bits()),
+            free_quota: std::sync::atomic::AtomicU64::new(free.pack()),
+            #[cfg(feature = "metrics")]
+            metrics_label: String::new(),
+        })
+    }
+
+    // A slot whose key the node does not track, held while it is in debt,
+    // is kept at the quota a new key of its class gets now: a key the node
+    // dropped would otherwise keep the one it had, whatever the class's
+    // limit, the cluster's size or the node's cap since.
+    #[tokio::test]
+    async fn a_slot_the_node_does_not_track_follows_the_quota_of_a_new_key() {
+        let mut node = node_at(1);
+        let shared = shared_for(&node);
+        let (slot, _) = shared.table.claim(1000);
+        for _ in 0..20 {
+            slot.gcra.check(shared.now());
+        }
+        assert!(slot.gcra.has_debt(shared.now()));
+
+        let stricter = crate::Limit::per_second(10).burst(5);
+        shared.classes.set_default(stricter).unwrap();
+        sync(&mut node, &shared);
+        assert!(shared.table.holds(slot, 1000));
+        assert_eq!(
+            slot.gcra.quota(),
+            node.new_key_quota_in(stricter.to_core().unwrap())
+        );
     }
 
     fn node_at(host: u8) -> Node {

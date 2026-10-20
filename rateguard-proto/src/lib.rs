@@ -5,7 +5,16 @@
 //! the worst case, IPv6 addresses included; the rest is left to the demand
 //! of the allocation layer, capped at [`MAX_REPORTS`] report of at most
 //! [`MAX_DEMAND_KEYS`] keys.
+//!
+//! With the `auth` feature, a message may travel signed, in a frame of 18
+//! bytes more: see the `auth` module. Framing is separate from encoding, so
+//! the bytes of an unsigned message are those of 0.5. The feature is off by
+//! default: `rateguard-core` encodes and decodes bare messages only, and
+//! keeps the hash crates out of its dependencies.
 #![warn(missing_docs)]
+
+#[cfg(feature = "auth")]
+pub mod auth;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

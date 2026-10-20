@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use rateguard::{Decision, Guard, Stats};
+use rateguard::{Decision, Guard, Stats, key_hash};
 
 fn free_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
@@ -162,4 +162,26 @@ async fn after_leaving_a_new_key_starts_at_the_floor() {
     let _ = guard.check("new");
     // R × β / 1: 1000 × 0.05.
     assert_eq!(guard.share("new"), Some(50.0));
+}
+
+// A salted node's hashes are its own: the free key_hash cannot name its
+// keys, Guard::key_hash_in can.
+#[tokio::test]
+async fn most_denied_matches_guard_key_hash_in_with_a_salt() {
+    let guard = builder(100, 5).key_salt([7; 16]).spawn().unwrap();
+    assert_eq!(checks(&guard, "busy", 30), 5);
+    let stats = until(&guard, |s| !s.most_denied.is_empty()).await;
+    assert_eq!(stats.most_denied[0].key_hash, guard.key_hash_in("", "busy"));
+    assert_ne!(stats.most_denied[0].key_hash, key_hash("busy"));
+}
+
+// Without a salt the node's hashes are the free functions'.
+#[tokio::test]
+async fn an_unsalted_guard_hashes_as_key_hash_in() {
+    let guard = builder(100, 5).spawn().unwrap();
+    assert_eq!(guard.key_hash_in("", "busy"), key_hash("busy"));
+    assert_eq!(
+        guard.key_hash_in("pro", "busy"),
+        rateguard::key_hash_in("pro", "busy")
+    );
 }

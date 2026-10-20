@@ -52,9 +52,18 @@ pub fn stale_after_rounds(cluster_size: usize) -> u64 {
     (3 * cluster_size as u64).max(10)
 }
 
+/// How many past epochs of a peer are remembered. A datagram outlives a
+/// restart or two at most; four leaves room for a flapping peer without
+/// letting the memory per peer grow.
+const PAST_EPOCHS: usize = 4;
+
 #[derive(Debug, Clone)]
 struct Snapshot {
     epoch: u32,
+    /// The epochs the peer ran before this one, newest first, as far as we
+    /// saw it change. A late or replayed report of one of them must not
+    /// replace the current snapshot.
+    past_epochs: Vec<u32>,
     round: u16,
     heard_at: Nanos,
     keys: HashMap<u64, (f32, bool)>,
@@ -75,17 +84,28 @@ impl PeerDemand {
 
     /// Applies a report `from` a peer. A report the peer made about someone
     /// else is ignored, and so is one no newer than what the peer already
-    /// said in the same epoch, however late it comes. A report of another
-    /// epoch is taken whatever its round: the peer restarted.
+    /// said in the same epoch, however late it comes. A report of a new
+    /// epoch is taken whatever its round: the peer restarted. One of
+    /// the last few epochs before the current one is a straggler and is
+    /// ignored.
     pub fn apply(&mut self, from: PeerId, report: &DemandReport, now: Nanos) {
         if report.origin != from.get() {
             return;
         }
-        if let Some(old) = self.peers.get(&from)
-            && old.epoch == report.epoch
-            && !round_is_newer(report.round, old.round)
-        {
-            return;
+        let mut past_epochs = Vec::new();
+        if let Some(old) = self.peers.get(&from) {
+            if old.past_epochs.contains(&report.epoch) {
+                return;
+            }
+            if old.epoch == report.epoch {
+                if !round_is_newer(report.round, old.round) {
+                    return;
+                }
+                past_epochs = old.past_epochs.clone();
+            } else {
+                past_epochs.push(old.epoch);
+                past_epochs.extend(old.past_epochs.iter().take(PAST_EPOCHS - 1));
+            }
         }
         let keys = report
             .keys
@@ -96,6 +116,7 @@ impl PeerDemand {
             from,
             Snapshot {
                 epoch: report.epoch,
+                past_epochs,
                 round: report.round,
                 heard_at: now,
                 keys,
@@ -295,6 +316,59 @@ mod tests {
         };
         t.apply(PEER, &restarted, 1);
         assert_eq!(demand(&t), Some(30.0));
+    }
+
+    #[test]
+    fn a_late_report_from_before_a_restart_is_ignored() {
+        let mut t = PeerDemand::new();
+        t.apply(PEER, &report_of(5, &[(KEY, 80.0)]), 0);
+        let restarted = DemandReport {
+            epoch: EPOCH + 1,
+            ..report_of(1, &[(KEY + 1, 30.0)])
+        };
+        t.apply(PEER, &restarted, 1);
+        t.apply(PEER, &report_of(6, &[(KEY, 120.0)]), 2);
+        assert_eq!(demand(&t), None, "the old epoch's keys must not return");
+        assert_eq!(t.get(PEER, KEY + 1).map(|heard| heard.demand), Some(30.0));
+
+        let again = DemandReport {
+            epoch: EPOCH + 2,
+            ..report_of(1, &[(KEY, 50.0)])
+        };
+        t.apply(PEER, &again, 3);
+        assert_eq!(demand(&t), Some(50.0), "a third epoch is a new restart");
+    }
+
+    fn in_epoch(epoch: u32, round: u16, key: u64, demand: f32) -> DemandReport {
+        DemandReport {
+            epoch,
+            ..report_of(round, &[(key, demand)])
+        }
+    }
+
+    #[test]
+    fn stragglers_of_every_recent_epoch_are_ignored() {
+        let mut t = PeerDemand::new();
+        t.apply(PEER, &in_epoch(1, 5, 1, 10.0), 0);
+        t.apply(PEER, &in_epoch(2, 1, 2, 20.0), 1);
+        t.apply(PEER, &in_epoch(3, 1, 3, 30.0), 2);
+        t.apply(PEER, &in_epoch(1, 6, 1, 11.0), 3);
+        t.apply(PEER, &in_epoch(2, 2, 2, 21.0), 4);
+        assert_eq!(t.get(PEER, 3).map(|heard| heard.demand), Some(30.0));
+        assert!(t.get(PEER, 1).is_none() && t.get(PEER, 2).is_none());
+        t.apply(PEER, &in_epoch(3, 2, 3, 31.0), 5);
+        assert_eq!(t.get(PEER, 3).map(|heard| heard.demand), Some(31.0));
+    }
+
+    #[test]
+    fn a_straggler_after_a_same_epoch_update_is_still_ignored() {
+        let mut t = PeerDemand::new();
+        t.apply(PEER, &in_epoch(1, 5, 1, 10.0), 0);
+        t.apply(PEER, &in_epoch(2, 1, 2, 20.0), 1);
+        t.apply(PEER, &in_epoch(2, 2, 2, 22.0), 2);
+        t.apply(PEER, &in_epoch(1, 6, 1, 11.0), 3);
+        assert_eq!(t.get(PEER, 2).map(|heard| heard.demand), Some(22.0));
+        assert!(t.get(PEER, 1).is_none());
     }
 
     #[test]

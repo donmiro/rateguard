@@ -1,12 +1,16 @@
 //! The sidecar's flags, each also a `RATEGUARD_*` variable for Kubernetes.
 
+use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
 use clap::builder::BoolishValueParser;
 use clap::{ArgAction, Parser};
-use rateguard::{Builder, Guard, Limit, PartitionPolicy};
+use rateguard::{Builder, GossipAuth, Guard, Limit, PartitionPolicy};
+
+use crate::secrets::{SecretsError, read_secrets};
 
 /// rateguard as a sidecar: one global rate limit across a fleet, for a
 /// service in any language, over HTTP on loopback.
@@ -68,10 +72,38 @@ pub struct Args {
     /// termination grace period.
     #[arg(long, env = "RATEGUARD_DRAIN", default_value = "10s")]
     pub drain: Wait,
+    /// A file of gossip secrets, one per line in base64, at most two: the
+    /// first signs, either verifies. Reread every 10 s, so that a rotated
+    /// Kubernetes Secret takes effect without a restart. Make one with
+    /// `openssl rand -base64 32`. Read, and reread, under `--gossip-auth
+    /// off` too: a file that is refused stops the start all the same.
+    #[arg(long, env = "RATEGUARD_GOSSIP_SECRET_FILE")]
+    pub gossip_secret_file: Option<PathBuf>,
+    /// `off`, `transitional` or `required`: whether gossip is signed, and
+    /// what unsigned gossip is let in. `required` with a secret file,
+    /// `off` without, by default.
+    #[arg(long = "gossip-auth", env = "RATEGUARD_GOSSIP_AUTH")]
+    pub gossip_auth_mode: Option<Mode>,
+    /// A file whose bytes, as they are, salt the hashes of keys: at least
+    /// 16. The same at every instance; changed only by restarting them all
+    /// at once.
+    #[arg(long, env = "RATEGUARD_KEY_SALT_FILE")]
+    pub key_salt_file: Option<PathBuf>,
 }
 impl Args {
-    /// A [`Guard`] builder set up as the flags say.
-    pub fn builder(&self) -> Builder {
+    /// The mode gossip is signed in: as given, or else `required` with a
+    /// secret file and `off` without.
+    pub fn gossip_auth(&self) -> GossipAuth {
+        match (self.gossip_auth_mode, &self.gossip_secret_file) {
+            (Some(Mode(mode)), _) => mode,
+            (None, Some(_)) => GossipAuth::Required,
+            (None, None) => GossipAuth::Off,
+        }
+    }
+
+    /// A [`Guard`] builder set up as the flags say, with the secret and
+    /// salt files read.
+    pub fn builder(&self) -> Result<Builder, ArgsError> {
         let mut builder = Guard::builder()
             .limit(self.limit)
             .bind(&self.bind)
@@ -98,7 +130,97 @@ impl Args {
         for ClassSpec(name, limit) in &self.classes {
             builder = builder.class(name, *limit);
         }
-        builder
+        let mode = self.gossip_auth();
+        match &self.gossip_secret_file {
+            Some(path) => {
+                let secrets = read_secrets(path).map_err(ArgsError::Secrets)?;
+                // The library would refuse it too, but without naming the
+                // file that is empty.
+                if secrets.is_empty() && mode != GossipAuth::Off {
+                    return Err(ArgsError::NoSecrets);
+                }
+                builder = builder.gossip_auth(mode, secrets);
+            }
+            None if mode != GossipAuth::Off => return Err(ArgsError::NoSecretFile(mode)),
+            None => {}
+        }
+        if let Some(path) = &self.key_salt_file {
+            let salt = std::fs::read(path).map_err(ArgsError::SaltUnreadable)?;
+            // Checked here as well as by the library, so that the error
+            // names the flag.
+            if salt.len() < MIN_SALT {
+                return Err(ArgsError::ShortSalt(salt.len()));
+            }
+            builder = builder.key_salt(salt);
+        }
+        Ok(builder)
+    }
+}
+
+// What `Builder::key_salt` asks for at least.
+const MIN_SALT: usize = 16;
+
+/// Why the flags make no builder. Never carries a secret or the salt.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ArgsError {
+    /// A mode that signs, and no secret file.
+    NoSecretFile(GossipAuth),
+    /// The secret file refused.
+    Secrets(SecretsError),
+    /// A mode that signs, and a secret file with no secret in it.
+    NoSecrets,
+    /// The salt file could not be read.
+    SaltUnreadable(std::io::Error),
+    /// A salt file of this many bytes, fewer than 16.
+    ShortSalt(usize),
+}
+impl fmt::Display for ArgsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArgsError::NoSecretFile(mode) => write!(
+                f,
+                "--gossip-auth {} signs gossip, and needs --gossip-secret-file",
+                mode_name(*mode)
+            ),
+            ArgsError::Secrets(error) => write!(f, "--gossip-secret-file: {error}"),
+            ArgsError::NoSecrets => write!(f, "--gossip-secret-file: no secret in it"),
+            ArgsError::SaltUnreadable(error) => {
+                write!(f, "--key-salt-file: cannot read it: {error}")
+            }
+            ArgsError::ShortSalt(n) => write!(
+                f,
+                "--key-salt-file: {n} bytes, at least {MIN_SALT} are needed"
+            ),
+        }
+    }
+}
+impl std::error::Error for ArgsError {}
+
+/// A [`GossipAuth`] by name: `off`, `transitional` or `required`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mode(pub GossipAuth);
+impl FromStr for Mode {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        match text {
+            "off" => Ok(Self(GossipAuth::Off)),
+            "transitional" => Ok(Self(GossipAuth::Transitional)),
+            "required" => Ok(Self(GossipAuth::Required)),
+            _ => Err(format!("not off, transitional or required: {text}")),
+        }
+    }
+}
+
+/// The name of a mode, as the flag and `/v1/stats` say it.
+pub fn mode_name(mode: GossipAuth) -> &'static str {
+    match mode {
+        GossipAuth::Off => "off",
+        GossipAuth::Transitional => "transitional",
+        GossipAuth::Required => "required",
+        // A mode added to the library before the sidecar learns its name.
+        _ => "unknown",
     }
 }
 

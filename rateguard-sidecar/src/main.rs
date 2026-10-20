@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rateguard_sidecar::args::Args;
-use rateguard_sidecar::{App, app, public_app, serve_public};
+use rateguard_sidecar::{App, app, public_app, reload_secrets, serve_public};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,18 +23,23 @@ async fn main() -> ExitCode {
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Installed before the node starts, so that its first tick is counted.
     let metrics = PrometheusBuilder::new().install_recorder()?;
-    let guard = args.builder().spawn()?;
+    let guard = args.builder()?.spawn()?;
+    if let Some(path) = &args.gossip_secret_file {
+        // Stops with the node.
+        tokio::spawn(reload_secrets(
+            guard.clone(),
+            path.clone(),
+            args.gossip_auth(),
+            Duration::from_secs(10),
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     eprintln!(
         "rateguard-sidecar: listening on http://{}, gossip on {}",
         listener.local_addr()?,
         args.bind
     );
-    let served = App {
-        guard: guard.clone(),
-        admin: args.admin,
-        metrics: Some(metrics),
-    };
+    let served = App::new(guard.clone(), args.admin, Some(metrics));
     if let Some(address) = args.metrics_listen {
         let public = tokio::net::TcpListener::bind(address).await?;
         eprintln!(

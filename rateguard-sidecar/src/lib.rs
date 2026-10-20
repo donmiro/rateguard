@@ -8,7 +8,7 @@
 //! | Method | Path | Body | Answer |
 //! |---|---|---|---|
 //! | POST | `/v1/check` | `{"key": "tenant:42", "class": "pro"}`, `class` optional | `200 {"allowed": true}` or `200 {"allowed": false, "retry_after_ms": 120}` |
-//! | GET | `/v1/stats` | | [`Guard::stats`] as JSON |
+//! | GET | `/v1/stats` | | [`Guard::stats`] as JSON, `most_denied` named by `key` and `class` while the key is in [`DeniedKeys`] |
 //! | GET | `/healthz` | | `200` while the node runs, `503` once it has left or its task died |
 //! | GET | `/metrics` | | Prometheus metrics, when an exporter is given |
 //! | PUT | `/v1/classes` | `{"pro": {"per_second": 1000, "burst": 50}}` | `204`; admin only |
@@ -27,9 +27,14 @@
 #![warn(missing_docs)]
 
 pub mod args;
+pub mod denied;
+pub mod secrets;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -38,9 +43,12 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use metrics_exporter_prometheus::PrometheusHandle;
-use rateguard::{Decision, Guard, Limit};
+use rateguard::{Decision, GossipAuth, Guard, Limit};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use crate::denied::DeniedKeys;
+use crate::secrets::read_secrets;
 
 /// What the API serves.
 #[derive(Clone)]
@@ -51,6 +59,22 @@ pub struct App {
     pub admin: bool,
     /// Renders `/metrics`; none, no such route.
     pub metrics: Option<PrometheusHandle>,
+    /// The keys denied lately, for naming `/v1/stats` `most_denied`. Key
+    /// strings may be personal data: they are served there, on loopback,
+    /// and nowhere else, never in metrics.
+    pub denied: Arc<Mutex<DeniedKeys>>,
+}
+
+impl App {
+    /// An API over `guard`, remembering the last 1024 keys denied.
+    pub fn new(guard: Guard, admin: bool, metrics: Option<PrometheusHandle>) -> Self {
+        App {
+            guard,
+            admin,
+            metrics,
+            denied: Arc::default(),
+        }
+    }
 }
 
 /// The API as a router.
@@ -116,6 +140,45 @@ pub async fn serve_public(
     }
 }
 
+/// Rereads the gossip secrets in `path` every `every`, and hands them to
+/// `guard` in `mode`, until the node stops. A file that cannot be read or
+/// is refused leaves the secrets in force alone: it is said on stderr, by
+/// line number and never by content, and counted in
+/// `rateguard_gossip_secret_reload_errors_total`.
+///
+/// Kubernetes updates a mounted Secret in place a minute or two after it
+/// changes, so a rotation needs no restart. The mode stays as it was.
+///
+/// It holds a clone of `guard`, so the node keeps running until
+/// `guard.leave()`: dropping your own `Guard`s does not stop it.
+pub async fn reload_secrets(guard: Guard, path: PathBuf, mode: GossipAuth, every: Duration) {
+    // Zero from the start, rather than absent until the first failure.
+    reload_errors().increment(0);
+    loop {
+        tokio::time::sleep(every).await;
+        if !guard.is_running() {
+            return;
+        }
+        let reloaded = read_secrets(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|secrets| {
+                guard
+                    .set_gossip_auth(mode, secrets)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = reloaded {
+            eprintln!("rateguard-sidecar: keeping the previous gossip secrets: {error}");
+            reload_errors().increment(1);
+        }
+    }
+}
+
+// No `guard` label, unlike the library's metrics: a sidecar runs one node,
+// and its advertised address is not known here.
+fn reload_errors() -> metrics::Counter {
+    metrics::counter!("rateguard_gossip_secret_reload_errors_total")
+}
+
 #[derive(Deserialize)]
 struct Check<'a> {
     // As bytes: serde_json refuses a lone surrogate in a str but hands it
@@ -136,6 +199,7 @@ async fn check(State(app): State<App>, body: Bytes) -> Response {
     // Lossy, as the Go client is: two keys that differ only in their
     // surrogates share a limit, which is stricter, never looser.
     let key = String::from_utf8_lossy(&check.key);
+    let class = check.class.as_deref().unwrap_or("");
     let decision = match &check.class {
         Some(class) => app.guard.check_in(class, &key),
         None => app.guard.check(&key),
@@ -144,6 +208,14 @@ async fn check(State(app): State<App>, body: Bytes) -> Response {
     match decision {
         Decision::Allow => (json, r#"{"allowed":true}"#).into_response(),
         Decision::Deny { retry_after } => {
+            // Only here: an allowed check takes no lock and hashes once. A
+            // dry run's would-be denial is answered as allowed, so it is not
+            // recorded either.
+            let hash = app.guard.key_hash_in(class, &key);
+            app.denied
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record(hash, class, &key);
             // Whole milliseconds, rounded up: rounding down invites an early
             // retry.
             let ms = retry_after.as_nanos().div_ceil(1_000_000);
@@ -158,13 +230,26 @@ async fn check(State(app): State<App>, body: Bytes) -> Response {
 
 async fn stats(State(app): State<App>) -> Response {
     let s = app.guard.stats();
+    let named = app.denied.lock().unwrap_or_else(PoisonError::into_inner);
     let most_denied: Vec<Value> = s
         .most_denied
         .iter()
-        // As strings: a JSON number loses a u64's last digits in most
-        // languages.
-        .map(|d| json!({"key_hash": d.key_hash.to_string(), "denied_per_sec": d.denied_per_sec}))
+        .map(|d| {
+            // As strings: a JSON number loses a u64's last digits in most
+            // languages.
+            let mut entry =
+                json!({"key_hash": d.key_hash.to_string(), "denied_per_sec": d.denied_per_sec});
+            if let Some(named) = named.get(d.key_hash) {
+                entry["key"] = named.key.as_str().into();
+                entry["class"] = named.class.as_str().into();
+                if named.truncated {
+                    entry["key_truncated"] = true.into();
+                }
+            }
+            entry
+        })
         .collect();
+    drop(named);
     axum::Json(json!({
         "admitted": s.admitted,
         "denied": s.denied,
@@ -182,6 +267,12 @@ async fn stats(State(app): State<App>) -> Response {
         "running": s.running,
         "dry_run": s.dry_run,
         "most_denied": most_denied,
+        "gossip_auth": args::mode_name(s.gossip_auth),
+        "rejected_datagrams": {
+            "unsigned": s.rejected_datagrams.unsigned,
+            "bad_tag": s.rejected_datagrams.bad_tag,
+            "malformed": s.rejected_datagrams.malformed,
+        },
     }))
     .into_response()
 }

@@ -8,6 +8,9 @@ use rateguard_core::gcra::MAX_BURST;
 use rateguard_core::limiter::Config;
 use rateguard_core::node::SwimConfig;
 use rateguard_core::partition;
+use rateguard_proto::auth::{Auth, AuthError, GossipAuth, Secret};
+
+use crate::key::KeySalt;
 
 /// α: the part of the per-node rate a cold key gets, and the hot threshold.
 const ALPHA: f64 = 0.5;
@@ -74,6 +77,13 @@ pub struct Builder {
     dry_run: bool,
     classes: Vec<(String, crate::Limit)>,
     max_classes: Option<usize>,
+    // Secret's Debug shows none of its bytes, so the derived Debug of the
+    // builder shows none either.
+    gossip_auth: GossipAuth,
+    secrets: Vec<Secret>,
+    // Taken in at once, the bytes not kept: KeySalt's Debug shows none of
+    // its own, and a salt too short is only its length until it is refused.
+    salt: Option<Result<KeySalt, usize>>,
 }
 
 impl Builder {
@@ -180,6 +190,55 @@ impl Builder {
         self
     }
 
+    /// Signs the gossip with a secret every node of the cluster shares, so
+    /// that under [`GossipAuth::Required`] a node holding none can neither
+    /// join nor speak for its members: how in `mode`, with `secrets`, at
+    /// most two. The first signs, any of
+    /// them verifies a peer's; a rotation from secret A to B goes `[A, B]`,
+    /// `[B, A]`, `[B]`, each step on every node before the next. The gossip
+    /// is not encrypted all the same: whoever sees the traffic reads it.
+    ///
+    /// [`GossipAuth::Off`], the default, sends the bytes of 0.5 and keeps
+    /// no secret it is given. A cluster starts signing in two steps, every
+    /// node on 0.6 first: [`GossipAuth::Transitional`], then
+    /// [`GossipAuth::Required`]. What is refused is counted in
+    /// [`Stats::rejected_datagrams`](crate::Stats::rejected_datagrams).
+    /// Changed on the fly with
+    /// [`Guard::set_gossip_auth`](crate::Guard::set_gossip_auth).
+    ///
+    /// A mode other than `Off` with no secret, or more than two secrets, is
+    /// [`Error::GossipAuth`] when the node starts. Make each secret with
+    /// [`Secret::new`]: at least 32 bytes, random ones.
+    pub fn gossip_auth(mut self, mode: GossipAuth, secrets: Vec<Secret>) -> Self {
+        self.gossip_auth = mode;
+        self.secrets = secrets;
+        self
+    }
+
+    /// Hashes keys with a salt, so that a client who picks the keys, an IP
+    /// address or a tenant ID, cannot find one that shares another's slot,
+    /// and its limit, here and in the gossip: SipHash-1-3 keyed by the
+    /// salt instead of xxh3. At least 16 bytes, random ones, the same on
+    /// every node; a longer salt is cut down to 128 bits through SHA-256.
+    /// Without one, the hashes are those of 0.5. Match the hashes of
+    /// [`Stats::most_denied`](crate::Stats::most_denied) with
+    /// [`Guard::key_hash_in`](crate::Guard::key_hash_in) then, not
+    /// [`key_hash_in`](crate::key_hash_in).
+    ///
+    /// Set it when the cluster is created. Nodes whose salts differ do not
+    /// know each other's keys, and nothing tells: each takes its share as
+    /// if the others' demand were for other keys, up to N times the limit
+    /// for N nodes. A salt is set or changed by restarting every node at
+    /// once, never by a rolling update: one would admit up to that much for
+    /// as long as it lasts. Not changed on the fly.
+    ///
+    /// Fewer than 16 bytes are [`Error::ShortSalt`] when the node starts.
+    pub fn key_salt(mut self, salt: impl Into<Vec<u8>>) -> Self {
+        let salt = salt.into();
+        self.salt = Some(KeySalt::new(&salt).map_err(|_| salt.len()));
+        self
+    }
+
     /// The ceiling on keys one node keeps state for; defaults to 4096.
     pub fn tracked_keys(mut self, n: usize) -> Self {
         self.tracked_keys = Some(n);
@@ -281,6 +340,8 @@ impl Builder {
         if period / 4 == 0 {
             return Err(Error::ZeroPeriod);
         }
+        let auth = Auth::new(self.gossip_auth, self.secrets.clone()).map_err(Error::GossipAuth)?;
+        let salt = self.salt.clone().transpose().map_err(Error::ShortSalt)?;
 
         let core = Config {
             limit_per_sec: limit,
@@ -316,6 +377,8 @@ impl Builder {
             dry_run: self.dry_run,
             classes,
             max_classes,
+            auth,
+            salt,
         })
     }
 }
@@ -393,6 +456,8 @@ fn start<T: crate::Transport>(
         classes,
         fresh_factor: std::sync::atomic::AtomicU64::new(node.new_key_factor().to_bits()),
         free_quota: std::sync::atomic::AtomicU64::new(free_quota.pack()),
+        auth: std::sync::RwLock::new(Arc::new(settings.auth)),
+        salt: settings.salt,
         #[cfg(feature = "metrics")]
         metrics_label: settings.advertise.to_string(),
     });
@@ -471,6 +536,10 @@ pub(crate) struct Settings {
     /// The named classes, checked.
     pub classes: Vec<(String, rateguard_core::limiter::Limit)>,
     pub max_classes: usize,
+    /// How the gossip is signed and checked.
+    pub auth: Auth,
+    /// The salt of the key hashes, if any.
+    pub salt: Option<KeySalt>,
 }
 
 /// Why a node could not start, or a class could not be set.
@@ -518,6 +587,13 @@ pub enum Error {
     /// More classes than [`Builder::max_classes`] allows, or a
     /// `max_classes` over 4096.
     TooManyClasses(usize),
+    /// The mode or the secrets of
+    /// [`Builder::gossip_auth`] or
+    /// [`Guard::set_gossip_auth`](crate::Guard::set_gossip_auth) refused.
+    GossipAuth(AuthError),
+    /// A [`Builder::key_salt`] of this many bytes, fewer than the 16 a
+    /// salt takes.
+    ShortSalt(usize),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -562,6 +638,12 @@ impl fmt::Display for Error {
                 "more classes than {n}, or more than {} allowed",
                 crate::classes::MAX_CLASSES
             ),
+            Error::GossipAuth(error) => fmt::Display::fmt(error, f),
+            Error::ShortSalt(n) => write!(
+                f,
+                "a key salt of {n} bytes, at least {} are needed",
+                KeySalt::MIN_LEN
+            ),
         }
     }
 }
@@ -580,6 +662,52 @@ mod tests {
 
     fn valid() -> Builder {
         Builder::new().bind("10.0.0.1:7946").limit(1000)
+    }
+
+    fn secret() -> Secret {
+        Secret::new([0xA1; 32]).unwrap()
+    }
+
+    #[test]
+    fn a_key_salt_is_checked_and_kept() {
+        assert!(valid().settings().unwrap().salt.is_none());
+        assert!(valid().key_salt([1; 16]).settings().unwrap().salt.is_some());
+        assert!(matches!(
+            valid().key_salt([1; 15]).settings(),
+            Err(Error::ShortSalt(15))
+        ));
+    }
+
+    #[test]
+    fn builder_and_settings_debug_show_no_salt() {
+        // Bytes that read as text, so that a leak shows in every form.
+        let builder = valid().key_salt(b"hunter2-hunter2-hunter2".to_vec());
+        let settings = builder.settings().unwrap();
+        let short = valid().key_salt(b"hunter2".to_vec());
+        let error = short.settings().unwrap_err();
+        let debug = format!(
+            "{builder:?} {builder:#?} {settings:?} {settings:#?} {short:?} {error:?} {error}"
+        );
+        assert!(!debug.contains("hunter"), "{debug}");
+        assert!(!debug.contains("68756e746572"), "{debug}");
+        assert!(!debug.contains("104, 117"), "{debug}");
+        assert!(!debug.contains("104,\n"), "{debug}");
+    }
+
+    #[test]
+    fn gossip_is_unsigned_unless_asked() {
+        assert_eq!(valid().settings().unwrap().auth.mode(), GossipAuth::Off);
+        let s = valid()
+            .gossip_auth(GossipAuth::Required, vec![secret()])
+            .settings()
+            .unwrap();
+        assert_eq!(s.auth.mode(), GossipAuth::Required);
+        // Off keeps no secret, and asks for none.
+        let s = valid()
+            .gossip_auth(GossipAuth::Off, vec![secret()])
+            .settings()
+            .unwrap();
+        assert_eq!(s.auth.mode(), GossipAuth::Off);
     }
 
     #[test]
@@ -749,6 +877,14 @@ mod tests {
             (valid().tracked_keys(usize::MAX), |e| {
                 matches!(e, TooManyTrackedKeys(_))
             }),
+            (
+                valid().gossip_auth(super::GossipAuth::Transitional, vec![]),
+                |e| matches!(e, GossipAuth(AuthError::NoSecrets)),
+            ),
+            (
+                valid().gossip_auth(super::GossipAuth::Required, vec![secret(); 3]),
+                |e| matches!(e, GossipAuth(AuthError::TooManySecrets(3))),
+            ),
         ];
         for (builder, expected) in cases {
             let error = builder.settings().unwrap_err();

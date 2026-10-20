@@ -49,6 +49,9 @@ async fn the_background_task_publishes_counts_and_state() {
         .unwrap();
     let admitted = (0..8).filter(|_| guard.check("k").is_allowed()).count();
     assert_eq!(admitted, 5);
+    // One datagram that is no message, for a refusal to count.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.send_to(&[0xff; 40], ("127.0.0.1", port)).unwrap();
 
     let wanted = [
         ("rateguard_checks_total", vec![("decision", "allow")], 5.0),
@@ -63,6 +66,24 @@ async fn the_background_task_publishes_counts_and_state() {
         ("rateguard_held", vec![("reason", "learning")], 0.0),
         ("rateguard_held", vec![("reason", "without_quorum")], 0.0),
         ("rateguard_dry_run", vec![], 0.0),
+        (
+            "rateguard_rejected_datagrams_total",
+            vec![("reason", "unsigned")],
+            0.0,
+        ),
+        (
+            "rateguard_rejected_datagrams_total",
+            vec![("reason", "bad_tag")],
+            0.0,
+        ),
+        (
+            "rateguard_rejected_datagrams_total",
+            vec![("reason", "malformed")],
+            1.0,
+        ),
+        ("rateguard_gossip_auth", vec![("mode", "off")], 1.0),
+        ("rateguard_gossip_auth", vec![("mode", "transitional")], 0.0),
+        ("rateguard_gossip_auth", vec![("mode", "required")], 0.0),
     ];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {

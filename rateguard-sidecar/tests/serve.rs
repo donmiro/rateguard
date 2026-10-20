@@ -14,11 +14,7 @@ async fn served(header_timeout: Duration) -> std::net::SocketAddr {
         .limit(10)
         .spawn()
         .unwrap();
-    let router = public_app(App {
-        guard,
-        admin: false,
-        metrics: None,
-    });
+    let router = public_app(App::new(guard, false, None));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(serve_public(listener, router, header_timeout));

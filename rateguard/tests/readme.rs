@@ -31,6 +31,26 @@ async fn getting_started() -> Result<(), rateguard::Error> {
     Ok(())
 }
 
+// The Security section's, as above.
+#[allow(dead_code)]
+async fn signed_gossip() -> Result<(), Box<dyn std::error::Error>> {
+    // README: begin
+    use rateguard::{GossipAuth, Secret};
+
+    let secret = Secret::new(std::fs::read("/etc/rateguard/gossip-secret")?)?;
+    let guard = Guard::builder()
+        .bind("0.0.0.0:7946")
+        .advertise("10.0.0.3:7946")
+        .seeds(["10.0.0.1:7946", "10.0.0.2:7946"])
+        .limit(1_000)
+        .gossip_auth(GossipAuth::Required, vec![secret])
+        .key_salt(std::fs::read("/etc/rateguard/key-salt")?)
+        .spawn()?;
+    // README: end
+    drop(guard);
+    Ok(())
+}
+
 #[tokio::test]
 async fn getting_started_runs_on_loopback() {
     let guard = Guard::builder()
@@ -61,26 +81,36 @@ fn the_readme_says_what_the_tested_examples_do() {
         "rateguard-core/tests/readme.rs",
     ] {
         let text = std::fs::read_to_string(root.join(source)).unwrap();
-        let begin = text.find("// README: begin\n").expect(source) + "// README: begin\n".len();
-        let end = text.find("// README: end").expect(source);
-        // Up to the end of the last line: the marker's own indentation is
-        // not part of the snippet.
-        let body = &text[begin..end];
-        let body = &body[..body.rfind('\n').map_or(0, |i| i + 1)];
-        let lines: Vec<&str> = body.lines().collect();
-        let indent = lines
-            .iter()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| line.len() - line.trim_start().len())
-            .min()
-            .unwrap_or(0);
-        let snippet: String = lines
-            .iter()
-            .map(|line| format!("{}\n", line.get(indent..).unwrap_or("")))
-            .collect();
-        assert!(
-            readme.contains(&snippet),
-            "{source}: the README no longer shows\n{snippet}"
-        );
+        let mut rest = text.as_str();
+        let mut found = 0;
+        while let Some(at) = rest.find("// README: begin\n") {
+            found += 1;
+            let begin = at + "// README: begin\n".len();
+            let end = begin + rest[begin..].find("// README: end").expect(source);
+            check_snippet(&readme, source, &rest[begin..end]);
+            rest = &rest[end..];
+        }
+        assert!(found > 0, "{source}: no README snippet");
     }
+}
+
+fn check_snippet(readme: &str, source: &str, body: &str) {
+    // Up to the end of the last line: the marker's own indentation is
+    // not part of the snippet.
+    let body = &body[..body.rfind('\n').map_or(0, |i| i + 1)];
+    let lines: Vec<&str> = body.lines().collect();
+    let indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let snippet: String = lines
+        .iter()
+        .map(|line| format!("{}\n", line.get(indent..).unwrap_or("")))
+        .collect();
+    assert!(
+        readme.contains(&snippet),
+        "{source}: the README no longer shows\n{snippet}"
+    );
 }

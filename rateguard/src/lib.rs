@@ -25,8 +25,9 @@
 //! # }
 //! ```
 //!
-//! The gossip is neither encrypted nor authenticated: run the nodes on a
-//! network you trust.
+//! The gossip is not encrypted, and by default not authenticated either:
+//! run the nodes on a network you trust, or have them sign it with a
+//! shared secret, see [`Builder::gossip_auth`].
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -49,5 +50,6 @@ pub use config::{Builder, Error, PartitionPolicy};
 pub use guard::{Decision, Guard};
 pub use key::{key_hash, key_hash_in};
 pub use limit::Limit;
-pub use stats::{DeniedKey, Stats};
+pub use rateguard_proto::auth::{AuthError, GossipAuth, Secret};
+pub use stats::{DeniedKey, RejectedDatagrams, Stats};
 pub use transport::Transport;

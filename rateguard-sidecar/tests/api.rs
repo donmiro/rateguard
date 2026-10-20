@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use http_body_util::BodyExt;
-use rateguard::{Guard, Limit};
+use rateguard::{GossipAuth, Guard, Limit, Secret};
 use rateguard_sidecar::{App, app, public_app};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -24,11 +24,7 @@ fn guard() -> Guard {
 }
 
 fn router(guard: &Guard, admin: bool) -> Router {
-    app(App {
-        guard: guard.clone(),
-        admin,
-        metrics: None,
-    })
+    app(App::new(guard.clone(), admin, None))
 }
 
 async fn send(router: &Router, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
@@ -147,6 +143,134 @@ async fn stats_tell_what_was_decided() {
     }
 }
 
+// Polls `/v1/stats` until `most_denied` has an entry for `hash`.
+async fn denied_entry(router: &Router, hash: u64) -> Value {
+    let hash = hash.to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, stats) = send(router, "GET", "/v1/stats", None).await;
+        let found = stats["most_denied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["key_hash"] == hash.as_str())
+            .cloned();
+        if let Some(entry) = found {
+            return entry;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{stats}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// Clients in other languages cannot compute a key's hash, and with a key
+// salt nobody outside the node can: the sidecar names the key.
+#[tokio::test]
+async fn most_denied_names_the_key_and_its_class() {
+    let guard = guard();
+    let router = router(&guard, false);
+    for _ in 0..8 {
+        check(&router, json!({"key": "tenant:42", "class": "pro"})).await;
+    }
+    let entry = denied_entry(&router, guard.key_hash_in("pro", "tenant:42")).await;
+    assert_eq!(entry["key"], "tenant:42", "{entry}");
+    assert_eq!(entry["class"], "pro", "{entry}");
+    assert!(entry.get("key_truncated").is_none(), "{entry}");
+}
+
+#[tokio::test]
+async fn the_default_class_is_named_empty_and_a_long_key_is_cut() {
+    let guard = guard();
+    let router = router(&guard, false);
+    let key = "k".repeat(300);
+    for _ in 0..5 {
+        check(&router, json!({"key": key})).await;
+    }
+    let entry = denied_entry(&router, guard.key_hash_in("", &key)).await;
+    assert_eq!(entry["class"], "", "{entry}");
+    assert_eq!(entry["key"], "k".repeat(256), "{entry}");
+    assert_eq!(entry["key_truncated"], true, "{entry}");
+}
+
+#[tokio::test]
+async fn an_allowed_key_is_never_recorded() {
+    let guard = guard();
+    let served = App::new(guard.clone(), false, None);
+    let router = app(served.clone());
+    assert_eq!(
+        check(&router, json!({"key": "quiet"})).await["allowed"],
+        true
+    );
+    for _ in 0..5 {
+        check(&router, json!({"key": "noisy"})).await;
+    }
+    denied_entry(&router, guard.key_hash_in("", "noisy")).await;
+    let denied = served.denied.lock().unwrap();
+    assert_eq!(denied.len(), 1, "noisy only");
+    assert!(denied.get(guard.key_hash_in("", "quiet")).is_none());
+}
+
+// A key denied before a restart, or pushed out of the table, keeps its
+// hash and nothing else.
+#[tokio::test]
+async fn an_unknown_hash_has_no_key_or_class() {
+    let guard = guard();
+    let router = router(&guard, false);
+    for _ in 0..5 {
+        let _ = guard.check("unseen");
+    }
+    let entry = denied_entry(&router, guard.key_hash_in("", "unseen")).await;
+    assert!(entry.get("key").is_none(), "{entry}");
+    assert!(entry.get("class").is_none(), "{entry}");
+    assert!(entry.get("key_truncated").is_none(), "{entry}");
+}
+
+#[tokio::test]
+async fn stats_tell_the_gossip_auth_and_the_rejected_datagrams() {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let guard = Guard::builder()
+        .bind(format!("127.0.0.1:{port}"))
+        .limit(40)
+        .spawn()
+        .unwrap();
+    let router = router(&guard, false);
+    let (_, stats) = send(&router, "GET", "/v1/stats", None).await;
+    assert_eq!(stats["gossip_auth"], "off", "{stats}");
+    assert_eq!(
+        stats["rejected_datagrams"],
+        json!({"unsigned": 0, "bad_tag": 0, "malformed": 0})
+    );
+    // A datagram that is no message, counted in every mode.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.send_to(&[0xff; 40], ("127.0.0.1", port)).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, stats) = send(&router, "GET", "/v1/stats", None).await;
+        if stats["rejected_datagrams"]["malformed"] == 1 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{stats}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let signing = Guard::builder()
+        .bind("127.0.0.1:0")
+        .limit(40)
+        .gossip_auth(
+            GossipAuth::Transitional,
+            vec![Secret::new([0xA1; 32].to_vec()).unwrap()],
+        )
+        .spawn()
+        .unwrap();
+    let signing = app(App::new(signing, false, None));
+    let (_, stats) = send(&signing, "GET", "/v1/stats", None).await;
+    assert_eq!(stats["gossip_auth"], "transitional", "{stats}");
+}
+
 #[tokio::test]
 async fn health_turns_unavailable_once_the_node_has_left() {
     let guard = guard();
@@ -256,11 +380,7 @@ async fn metrics_are_not_there_without_an_exporter() {
 #[tokio::test]
 async fn the_public_router_serves_health_only_without_an_exporter() {
     let guard = guard();
-    let public = public_app(App {
-        guard: guard.clone(),
-        admin: true,
-        metrics: None,
-    });
+    let public = public_app(App::new(guard.clone(), true, None));
     assert_eq!(send(&public, "GET", "/healthz", None).await.0, 200);
     assert_eq!(
         send(&public, "POST", "/v1/check", Some(json!({"key": "k"})))
@@ -284,11 +404,7 @@ async fn metrics_are_served_with_an_exporter_on_both_routers() {
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .build_recorder()
         .handle();
-    let served = App {
-        guard: guard.clone(),
-        admin: false,
-        metrics: Some(handle),
-    };
+    let served = App::new(guard.clone(), false, Some(handle));
     for router in [app(served.clone()), public_app(served)] {
         assert_eq!(send(&router, "GET", "/metrics", None).await.0, 200);
     }

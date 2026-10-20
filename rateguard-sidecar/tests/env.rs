@@ -46,4 +46,23 @@ fn switches_take_the_usual_ways_of_saying_yes_and_no() {
     assert_eq!(args.seeds, ["a:7946", "b:7946"]);
     assert_eq!(args.classes.len(), 2);
     assert_eq!(args.drain.0, std::time::Duration::from_secs(3));
+
+    // Paths only: a secret's value is never a flag or a variable, so that
+    // `ps` and /proc/*/cmdline do not show it.
+    let args = with(&[
+        ("RATEGUARD_LIMIT", "10"),
+        ("RATEGUARD_GOSSIP_SECRET_FILE", "/run/secrets/gossip"),
+        ("RATEGUARD_GOSSIP_AUTH", "transitional"),
+        ("RATEGUARD_KEY_SALT_FILE", "/run/secrets/salt"),
+    ])
+    .unwrap();
+    assert_eq!(
+        args.gossip_secret_file.as_deref(),
+        Some(std::path::Path::new("/run/secrets/gossip"))
+    );
+    assert_eq!(args.gossip_auth(), rateguard::GossipAuth::Transitional);
+    assert_eq!(
+        args.key_salt_file.as_deref(),
+        Some(std::path::Path::new("/run/secrets/salt"))
+    );
 }

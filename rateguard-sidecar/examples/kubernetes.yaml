@@ -5,6 +5,22 @@
 #     kubectl apply -f kubernetes.yaml
 #
 # The app calls http://127.0.0.1:7947/v1/check, or uses an SDK from sdk/.
+#
+# The gossip is signed with a secret every replica shares, and keys are
+# hashed with a salt, both from the Secret api-rateguard, mounted below.
+# Create it before applying this file, rather than writing it here:
+#
+#     openssl rand -base64 32 > gossip-secrets
+#     openssl rand 16 > key-salt
+#     kubectl create secret generic api-rateguard \
+#       --from-file=gossip-secrets --from-file=key-salt
+#
+# gossip-secrets holds base64 lines, at most two, the first signing; the
+# sidecar rereads it every 10 s. A rotation from A to B writes "A" and "B",
+# then "B" and "A", then "B", each once every pod has the one before.
+# key-salt is raw bytes, 16 or more, changed only by restarting every pod
+# at once. A cluster already running unsigned turns signing on in steps,
+# RATEGUARD_GOSSIP_AUTH=transitional first: see the sidecar's README.
 apiVersion: v1
 kind: Service
 metadata:
@@ -52,7 +68,7 @@ spec:
             - name: RATEGUARD_SIDECAR_URL
               value: http://127.0.0.1:7947
         - name: rateguard
-          image: rateguard-sidecar:0.5.1
+          image: rateguard-sidecar:0.6.0
           env:
             - name: POD_IP
               valueFrom:
@@ -68,6 +84,19 @@ spec:
               value: pro=5000/250,free=50
             - name: RATEGUARD_METRICS_LISTEN
               value: 0.0.0.0:9090
+            # From the volume below: the files never show in the
+            # environment or in ps. With a secret file, the mode is
+            # `required` unless RATEGUARD_GOSSIP_AUTH says otherwise.
+            - name: RATEGUARD_GOSSIP_SECRET_FILE
+              value: /etc/rateguard/gossip-secrets
+            - name: RATEGUARD_KEY_SALT_FILE
+              value: /etc/rateguard/key-salt
+          volumeMounts:
+            # The whole directory, not a subPath: Kubernetes updates it in
+            # place when the Secret changes, and the sidecar rereads it.
+            - name: rateguard-secrets
+              mountPath: /etc/rateguard
+              readOnly: true
           ports:
             - name: gossip
               containerPort: 7946
@@ -89,3 +118,7 @@ spec:
               memory: 32Mi
             limits:
               memory: 64Mi
+      volumes:
+        - name: rateguard-secrets
+          secret:
+            secretName: api-rateguard

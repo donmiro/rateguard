@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use clap::Parser;
-use rateguard::{Limit, PartitionPolicy};
+use rateguard::{GossipAuth, Guard, Limit, PartitionPolicy};
 use rateguard_sidecar::args::{Args, ClassSpec, Policy};
 
 fn parse(flags: &[&str]) -> Result<Args, clap::Error> {
@@ -97,7 +97,7 @@ async fn the_flags_make_a_guard() {
         "--dry-run",
     ])
     .unwrap();
-    let guard = args.builder().spawn().unwrap();
+    let guard = args.builder().unwrap().spawn().unwrap();
     assert_eq!(
         guard.classes(),
         [("pro".to_owned(), Limit::per_second(1000).burst(50))]
@@ -111,7 +111,7 @@ async fn the_flags_make_a_guard() {
 async fn flags_the_library_refuses_are_refused_at_start() {
     let args = parse(&["--limit", "0", "--bind", "127.0.0.1:0"]).unwrap();
     assert!(matches!(
-        args.builder().spawn(),
+        args.builder().unwrap().spawn(),
         Err(rateguard::Error::ZeroLimit)
     ));
 }
@@ -120,4 +120,153 @@ async fn flags_the_library_refuses_are_refused_at_start() {
 fn health_and_metrics_may_listen_apart() {
     let args = parse(&["--limit", "1", "--metrics-listen", "0.0.0.0:9090"]).unwrap();
     assert_eq!(args.metrics_listen, Some("0.0.0.0:9090".parse().unwrap()));
+}
+
+// A file of its own per test, removed when dropped.
+struct File(std::path::PathBuf);
+impl File {
+    fn with(name: &str, content: &[u8]) -> File {
+        let path = std::env::temp_dir().join(format!(
+            "rateguard-sidecar-args-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, content).unwrap();
+        File(path)
+    }
+    fn path(&self) -> &str {
+        self.0.to_str().unwrap()
+    }
+}
+impl Drop for File {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+// 32 bytes of 0xA1, in base64.
+const SECRET: &str = "oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE=\n";
+
+#[test]
+fn the_auth_mode_defaults_to_required_with_a_secret_file_and_off_without() {
+    let args = parse(&["--limit", "1"]).unwrap();
+    assert_eq!(args.gossip_auth(), GossipAuth::Off);
+    let args = parse(&["--limit", "1", "--gossip-secret-file", "/run/secrets"]).unwrap();
+    assert_eq!(args.gossip_auth(), GossipAuth::Required);
+    let args = parse(&[
+        "--limit",
+        "1",
+        "--gossip-secret-file",
+        "/run/secrets",
+        "--gossip-auth",
+        "transitional",
+    ])
+    .unwrap();
+    assert_eq!(args.gossip_auth(), GossipAuth::Transitional);
+    assert!(parse(&["--limit", "1", "--gossip-auth", "sometimes"]).is_err());
+}
+
+#[test]
+fn transitional_without_a_secret_file_is_refused() {
+    for mode in ["transitional", "required"] {
+        let args = parse(&["--limit", "1", "--gossip-auth", mode]).unwrap();
+        let error = args.builder().unwrap_err().to_string();
+        assert!(error.contains("--gossip-secret-file"), "{error}");
+    }
+}
+
+#[test]
+fn off_with_a_secret_file_is_allowed() {
+    let file = File::with("off", SECRET.as_bytes());
+    let args = parse(&[
+        "--limit",
+        "1",
+        "--gossip-secret-file",
+        file.path(),
+        "--gossip-auth",
+        "off",
+    ])
+    .unwrap();
+    assert_eq!(args.gossip_auth(), GossipAuth::Off);
+    assert!(args.builder().is_ok());
+}
+
+#[tokio::test]
+async fn a_secret_file_signs_the_gossip() {
+    let file = File::with("signs", SECRET.as_bytes());
+    let args = parse(&[
+        "--limit",
+        "1",
+        "--bind",
+        "127.0.0.1:0",
+        "--gossip-secret-file",
+        file.path(),
+    ])
+    .unwrap();
+    let guard = args.builder().unwrap().spawn().unwrap();
+    assert_eq!(guard.stats().gossip_auth, GossipAuth::Required);
+}
+
+#[test]
+fn a_bad_secret_file_is_refused_by_name_without_its_content() {
+    let file = File::with("bad", b"not*base64\n");
+    let args = parse(&["--limit", "1", "--gossip-secret-file", file.path()]).unwrap();
+    let error = args.builder().unwrap_err().to_string();
+    assert!(error.contains("--gossip-secret-file"), "{error}");
+    assert!(error.contains("line 1") && !error.contains('*'), "{error}");
+    let missing = parse(&[
+        "--limit",
+        "1",
+        "--gossip-secret-file",
+        "/nonexistent/rateguard",
+    ])
+    .unwrap();
+    let error = missing.builder().unwrap_err().to_string();
+    assert!(error.contains("--gossip-secret-file"), "{error}");
+}
+
+#[test]
+fn an_empty_secret_file_is_refused_when_signing() {
+    let file = File::with("empty", b"\n\n");
+    let args = parse(&["--limit", "1", "--gossip-secret-file", file.path()]).unwrap();
+    let error = args.builder().unwrap_err().to_string();
+    assert!(error.contains("--gossip-secret-file"), "{error}");
+}
+
+#[test]
+fn a_salt_file_shorter_than_16_bytes_is_refused() {
+    let file = File::with("short-salt", b"fifteen bytes!!");
+    let args = parse(&["--limit", "1", "--key-salt-file", file.path()]).unwrap();
+    let error = args.builder().unwrap_err().to_string();
+    assert!(error.contains("--key-salt-file"), "{error}");
+    assert!(
+        error.contains("15") && !error.contains("fifteen"),
+        "{error}"
+    );
+    let missing = parse(&["--limit", "1", "--key-salt-file", "/nonexistent/rateguard"]).unwrap();
+    let error = missing.builder().unwrap_err().to_string();
+    assert!(error.contains("--key-salt-file"), "{error}");
+}
+
+// Taken as it is, newline and all: 15 bytes and a newline are 16.
+#[tokio::test]
+async fn a_salt_file_is_taken_as_it_is() {
+    let file = File::with("salt", b"fifteen bytes!!\n");
+    let args = parse(&[
+        "--limit",
+        "1",
+        "--bind",
+        "127.0.0.1:0",
+        "--key-salt-file",
+        file.path(),
+    ])
+    .unwrap();
+    let guard = args.builder().unwrap().spawn().unwrap();
+    let salted = Guard::builder()
+        .bind("127.0.0.1:0")
+        .limit(1)
+        .key_salt(&b"fifteen bytes!!\n"[..])
+        .spawn()
+        .unwrap();
+    assert_eq!(guard.key_hash_in("", "k"), salted.key_hash_in("", "k"));
+    assert_ne!(guard.key_hash_in("", "k"), rateguard::key_hash_in("", "k"));
 }

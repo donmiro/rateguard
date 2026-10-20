@@ -9,10 +9,12 @@ use std::time::Duration;
 use rateguard_core::boundary::{Action, Event, PeerId};
 use rateguard_core::node::Node;
 use rateguard_proto::Address;
+use rateguard_proto::auth::{Auth, Rejected};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::guard::Shared;
+use crate::stats::RejectedDatagrams;
 use crate::transport::Transport;
 
 /// The sender of a datagram: the member of its first record, which every
@@ -36,7 +38,8 @@ pub(crate) async fn run<T: Transport>(
     mut ticker: tokio::time::Interval,
     mut leave: mpsc::Receiver<oneshot::Sender<()>>,
 ) {
-    let Some(epoch) = shared.upgrade().map(|shared| shared.epoch) else {
+    let Some((epoch, mut auth)) = shared.upgrade().map(|shared| (shared.epoch, shared.auth()))
+    else {
         return;
     };
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -44,8 +47,14 @@ pub(crate) async fn run<T: Transport>(
     // must not freeze the node, nor keep it alive once the last Guard is
     // gone.
     let budget = ticker.period();
+    // A signed frame is FRAME_OVERHEAD bytes over its message, and the
+    // largest message still fits framed in MAX_DATAGRAM (rateguard-proto's
+    // `the_largest_message_fits_framed`): this buffer takes any datagram a
+    // peer sends. A longer one is cut short, and refused.
     let mut buf = vec![0u8; rateguard_proto::MAX_DATAGRAM];
     let mut done = None;
+    // Refusals since the last tick, for the report.
+    let mut rejected = RejectedDatagrams::default();
     loop {
         // The shared state is held only while the node works, never across
         // an await: the last Guard dropped must be noticed.
@@ -53,19 +62,16 @@ pub(crate) async fn run<T: Transport>(
             received = transport.recv_from(&mut buf) => {
                 let Some(shared) = shared.upgrade() else { break };
                 match received {
-                    Ok((len, _)) => match sender(&buf[..len]) {
-                        Some(from) => {
-                            let event = Event::MessageReceived { from, bytes: &buf[..len] };
-                            node.handle(event, shared.now()).to_vec()
-                        }
-                        None => Vec::new(),
-                    },
+                    Ok((len, _)) => {
+                        let auth = shared.auth();
+                        receive(&mut node, &auth, &buf[..len], shared.now(), &mut rejected)
+                    }
                     Err(_) => Vec::new(),
                 }
             }
             _ = ticker.tick() => {
                 let Some(shared) = shared.upgrade() else { break };
-                sync(&mut node, &shared)
+                sync(&mut node, &shared, std::mem::take(&mut rejected))
             }
             found = names.next() => {
                 names.update(&mut node, found);
@@ -77,7 +83,12 @@ pub(crate) async fn run<T: Transport>(
                 break;
             }
         };
-        send(&node, &*transport, actions, budget).await;
+        // The last setting seen is kept for leaving: the news must reach
+        // the peers signed even once the last Guard is gone.
+        if let Some(shared) = shared.upgrade() {
+            auth = shared.auth();
+        }
+        send(&node, &*transport, actions, &auth, budget).await;
     }
 
     // The quotas drop to the floor before the peers hear: from the moment
@@ -88,7 +99,7 @@ pub(crate) async fn run<T: Transport>(
     }
     let now = epoch.elapsed().as_nanos() as u64;
     let actions = node.leave(now).to_vec();
-    send(&node, &*transport, actions, budget).await;
+    send(&node, &*transport, actions, &auth, budget).await;
     if let Some(done) = done {
         let _ = done.send(());
     }
@@ -308,10 +319,13 @@ fn hold_at_floor(shared: &Shared, config: &rateguard_core::limiter::Config) {
 }
 
 // One tick: attempts in, the core's round, quotas out (spec §5.3).
-fn sync(node: &mut Node, shared: &Arc<Shared>) -> Vec<Action> {
+fn sync(node: &mut Node, shared: &Arc<Shared>, rejected: RejectedDatagrams) -> Vec<Action> {
     let now = shared.now();
     let classes = shared.classes.snapshot();
-    let mut counts = Counts::default();
+    let mut counts = Counts {
+        rejected,
+        ..Counts::default()
+    };
     shared.table.for_each(|key, slot| {
         let (n, d) = slot.take_counts();
         let (limit, known) = classes.lookup(slot.class.load(Ordering::Relaxed));
@@ -372,6 +386,8 @@ struct Counts {
     denied: u64,
     overflowed: u64,
     unknown_class: u64,
+    /// Datagrams refused since the last tick.
+    rejected: RejectedDatagrams,
 }
 
 // This tick's counts and the node's state into the report for
@@ -394,6 +410,10 @@ fn report(node: &Node, shared: &Shared, counts: Counts) {
     stats.denied += counts.denied;
     stats.overflowed += counts.overflowed;
     stats.unknown_class += counts.unknown_class;
+    let rejected = &mut stats.rejected_datagrams;
+    rejected.unsigned += counts.rejected.unsigned;
+    rejected.bad_tag += counts.rejected.bad_tag;
+    rejected.malformed += counts.rejected.malformed;
     stats.most_denied = node
         .most_denied(10)
         .into_iter()
@@ -417,14 +437,66 @@ fn report(node: &Node, shared: &Shared, counts: Counts) {
         stats.admitted = report.attempts.saturating_sub(stats.denied);
         stats.dry_run = shared.dry_run.load(Ordering::Relaxed);
         drop(report);
+        stats.gossip_auth = shared.auth().mode();
         crate::metrics::publish(&stats, &shared.metrics_label);
+    }
+}
+
+// One datagram in: opened first, so that nothing unsigned or forged
+// reaches `sender` or the core, which see the message inside the frame
+// only. What is refused is counted by reason and dropped.
+fn receive(
+    node: &mut Node,
+    auth: &Auth,
+    datagram: &[u8],
+    now: u64,
+    rejected: &mut RejectedDatagrams,
+) -> Vec<Action> {
+    let message = match auth.open(datagram) {
+        Ok(message) => message,
+        Err(Rejected::Unsigned) => {
+            rejected.unsigned += 1;
+            return Vec::new();
+        }
+        Err(Rejected::BadTag) => {
+            rejected.bad_tag += 1;
+            return Vec::new();
+        }
+        // Malformed, and whatever reason a later version adds: no message
+        // came through either way.
+        Err(_) => {
+            rejected.malformed += 1;
+            return Vec::new();
+        }
+    };
+    match sender(message) {
+        Some(from) => node
+            .handle(
+                Event::MessageReceived {
+                    from,
+                    bytes: message,
+                },
+                now,
+            )
+            .to_vec(),
+        None => {
+            rejected.malformed += 1;
+            Vec::new()
+        }
     }
 }
 
 // The whole batch gets the budget, not each datagram: three PING-REQs on a
 // hung transport would hold the node three ticks. A lost datagram, or one
-// that took too long to leave, is the protocol's normal case.
-async fn send<T: Transport>(node: &Node, transport: &T, actions: Vec<Action>, budget: Duration) {
+// that took too long to leave, is the protocol's normal case. Every
+// datagram is sealed with `auth`, read once for the batch.
+async fn send<T: Transport>(
+    node: &Node,
+    transport: &T,
+    actions: Vec<Action>,
+    auth: &Auth,
+    budget: Duration,
+) {
     let batch = async {
         for action in actions {
             // Sending is the only action this runtime knows.
@@ -432,7 +504,8 @@ async fn send<T: Transport>(node: &Node, transport: &T, actions: Vec<Action>, bu
                 continue;
             };
             if let Some(address) = node.address(peer) {
-                let _ = transport.send_to(&bytes, address.into()).await;
+                let datagram = auth.seal(&bytes);
+                let _ = transport.send_to(&datagram, address.into()).await;
             }
         }
     };
@@ -442,6 +515,7 @@ async fn send<T: Transport>(node: &Node, transport: &T, actions: Vec<Action>, bu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rateguard_proto::auth::{FRAME_OVERHEAD, GossipAuth, Secret};
     use rateguard_proto::{Address, Message, Status, Update, encode};
 
     struct HungSend;
@@ -485,7 +559,7 @@ mod tests {
 
         let budget = Duration::from_millis(50);
         let start = tokio::time::Instant::now();
-        send(&node, &HungSend, actions, budget).await;
+        send(&node, &HungSend, actions, &Auth::off(), budget).await;
         assert_eq!(start.elapsed(), budget);
     }
 
@@ -506,6 +580,8 @@ mod tests {
             classes,
             fresh_factor: std::sync::atomic::AtomicU64::new(node.new_key_factor().to_bits()),
             free_quota: std::sync::atomic::AtomicU64::new(free.pack()),
+            auth: std::sync::RwLock::new(Arc::new(Auth::off())),
+            salt: None,
             #[cfg(feature = "metrics")]
             metrics_label: String::new(),
         })
@@ -527,7 +603,7 @@ mod tests {
 
         let stricter = crate::Limit::per_second(10).burst(5);
         shared.classes.set_default(stricter).unwrap();
-        sync(&mut node, &shared);
+        sync(&mut node, &shared, RejectedDatagrams::default());
         assert!(shared.table.holds(slot, 1000));
         assert_eq!(
             slot.gcra.quota(),
@@ -688,6 +764,113 @@ mod tests {
         }
         names.update(&mut node, vec![Some(vec![at(1)])]);
         assert_eq!(node.new_key_quota(), alone, "a fleet of one");
+    }
+
+    fn auth(mode: GossipAuth, secret: [u8; 32]) -> Auth {
+        Auth::new(mode, vec![Secret::new(secret).unwrap()]).unwrap()
+    }
+
+    // A ping from the node at `host`, as its core would encode it.
+    fn ping_from(host: u8) -> Vec<u8> {
+        let me = Address::from(at(host));
+        encode(&Message::Ping {
+            seq: 1,
+            updates: vec![Update {
+                member: crate::key::peer_id(me).get(),
+                addr: me,
+                incarnation: 0,
+                status: Status::Alive,
+            }],
+            demand: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    // Every datagram goes through `open` before anything reads it: a
+    // refused one never reaches the core, and is counted by its reason.
+    #[test]
+    fn a_datagram_is_opened_before_the_core_sees_it() {
+        let required = auth(GossipAuth::Required, [0xA1; 32]);
+        let foreign = auth(GossipAuth::Required, [0xB2; 32]);
+        let mut node = node_at(1);
+        let mut rejected = RejectedDatagrams::default();
+
+        let refused: [&[u8]; 4] = [
+            &ping_from(2),
+            &foreign.seal(&ping_from(2)),
+            &[0xA6],
+            &required.seal(&[0xde, 0xad]),
+        ];
+        for datagram in refused {
+            let actions = receive(&mut node, &required, datagram, 0, &mut rejected);
+            assert!(actions.is_empty(), "{datagram:?}");
+        }
+        assert_eq!(node.address(id(2)), None, "the core heard nobody");
+        assert_eq!(
+            (rejected.unsigned, rejected.bad_tag, rejected.malformed),
+            (1, 1, 2)
+        );
+
+        let actions = receive(
+            &mut node,
+            &required,
+            &required.seal(&ping_from(2)),
+            0,
+            &mut rejected,
+        );
+        assert!(!actions.is_empty(), "a valid ping is answered");
+        assert_eq!(node.address(id(2)), Some(at(2).into()));
+        assert_eq!(
+            (rejected.unsigned, rejected.bad_tag, rejected.malformed),
+            (1, 1, 2)
+        );
+    }
+
+    // In Off a signed frame is stripped unchecked and not counted: a node
+    // not signing yet keeps hearing the nodes that already do.
+    #[test]
+    fn off_takes_a_signed_frame_and_counts_nothing() {
+        let mut node = node_at(1);
+        let mut rejected = RejectedDatagrams::default();
+        let frame = auth(GossipAuth::Required, [0xB2; 32]).seal(&ping_from(2));
+        let actions = receive(&mut node, &Auth::off(), &frame, 0, &mut rejected);
+        assert!(!actions.is_empty());
+        assert_eq!(rejected, RejectedDatagrams::default());
+    }
+
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<Vec<u8>>>);
+    impl Transport for Recording {
+        async fn send_to(&self, bytes: &[u8], _: SocketAddr) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+        async fn recv_from(&self, _: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn what_is_sent_is_sealed_with_the_current_auth() {
+        let mut node = node_at(1);
+        node.introduce(id(2), at(2).into());
+        let message = ping_from(1);
+        let actions = || {
+            vec![Action::SendTo {
+                peer: id(2),
+                bytes: message.clone(),
+            }]
+        };
+        let budget = Duration::from_secs(1);
+        let required = auth(GossipAuth::Required, [0xA1; 32]);
+
+        let sent = Recording::default();
+        send(&node, &sent, actions(), &Auth::off(), budget).await;
+        send(&node, &sent, actions(), &required, budget).await;
+        let sent = sent.0.into_inner().unwrap();
+        assert_eq!(sent[0], message, "Off sends the bytes of 0.5");
+        assert_eq!(required.open(&sent[1]), Ok(&message[..]));
+        assert_eq!(sent[1].len(), message.len() + FRAME_OVERHEAD);
     }
 
     #[test]

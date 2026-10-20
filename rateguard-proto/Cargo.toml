@@ -10,8 +10,18 @@ keywords = ["rate-limit", "swim", "gossip", "protocol"]
 categories = ["encoding", "network-programming"]
 
 [dependencies]
+hmac = { version = "0.12", optional = true }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
+sha2 = { version = "0.10", optional = true }
+
+[features]
+# Signed gossip frames. Off by default, so that rateguard-core, which knows
+# nothing of signing, does not pull in the hash crates.
+auth = ["dep:hmac", "dep:sha2"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dev-dependencies]
 proptest = "1.11.0"

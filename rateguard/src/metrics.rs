@@ -5,6 +5,8 @@
 //! Every metric carries `guard`, the address the node advertises: a process
 //! may run several.
 
+use rateguard_proto::auth::GossipAuth;
+
 use crate::stats::Stats;
 
 pub(crate) fn publish(stats: &Stats, guard: &str) {
@@ -26,6 +28,18 @@ pub(crate) fn publish(stats: &Stats, guard: &str) {
         std::slice::from_ref(&label)
     )
     .absolute(stats.unknown_class);
+    let rejected = [
+        ("unsigned", stats.rejected_datagrams.unsigned),
+        ("bad_tag", stats.rejected_datagrams.bad_tag),
+        ("malformed", stats.rejected_datagrams.malformed),
+    ];
+    for (reason, count) in rejected {
+        metrics::counter!(
+            "rateguard_rejected_datagrams_total",
+            &[label.clone(), ("reason", reason.to_owned())]
+        )
+        .absolute(count);
+    }
 
     let gauges = [
         ("rateguard_cluster_size", stats.cluster_size as f64),
@@ -49,5 +63,19 @@ pub(crate) fn publish(stats: &Stats, guard: &str) {
             &[label.clone(), ("reason", reason.to_owned())]
         )
         .set(flag(on));
+    }
+    // One series per mode, 1 for the node's own: a fleet half switched
+    // shows as two modes summed over the nodes.
+    let modes = [
+        ("off", GossipAuth::Off),
+        ("transitional", GossipAuth::Transitional),
+        ("required", GossipAuth::Required),
+    ];
+    for (name, mode) in modes {
+        metrics::gauge!(
+            "rateguard_gossip_auth",
+            &[label.clone(), ("mode", name.to_owned())]
+        )
+        .set(flag(stats.gossip_auth == mode));
     }
 }

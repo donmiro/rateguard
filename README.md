@@ -47,6 +47,9 @@ if guard.check("api:tenant-42").is_allowed() {
   many distinct keys your traffic actually contains.
 - **Network partitions are a configuration choice**, with proven overshoot bounds
   for each policy, rather than undefined behaviour.
+- **Signed gossip.** A secret the fleet shares keeps strangers out of the
+  cluster, turned on and rotated by rolling updates; a key salt keeps clients
+  from choosing keys that collide with someone else's.
 - **Observable, and safe to roll out.** `stats()` and optional `metrics` say
   what each instance admits and denies and why; a dry run counts what would
   be denied without denying it, and enforcement turns on with no restart.
@@ -59,7 +62,7 @@ if guard.check("api:tenant-42").is_allowed() {
 
 ```toml
 [dependencies]
-rateguard = "0.5"
+rateguard = "0.6"
 ```
 
 Requires Rust 1.88 or newer (2024 edition). Optional features:
@@ -242,6 +245,8 @@ for its flags, its API, and a Kubernetes example.
 | `dry_run(on)` | `false` | Admit every request and count those that would be denied; see [Dry run](#dry-run) |
 | `class(name, limit)` | none | A class of limits, see [Classes of limits](#classes-of-limits) |
 | `max_classes(n)` | `64` | How many named classes an instance keeps, at most 4096 |
+| `gossip_auth(mode, secrets)` | `Off`, no secret | Whether gossip is signed, with at most two secrets of 32 bytes or more; see [Security](#security) |
+| `key_salt(bytes)` | none | A salt of 16 bytes or more for the hashes of keys, the same on every node; see [Security](#security) |
 
 ### Observability
 
@@ -265,8 +270,9 @@ println!("{} admitted, {} denied", stats.admitted, stats.denied);
 | `tracked_keys`, `hot_keys` | Keys with state here, and keys coordinated with the peers |
 | `since_last_round` | Far over the protocol period, the background task is stuck |
 | `running`, `dry_run` | Whether the node still runs, and whether this is a dry run |
-| `most_denied` | Up to ten keys denied most lately, with their denials a second: who is being limited. By hash: match them with `key_hash_in(class, key)` |
+| `most_denied` | Up to ten keys denied most lately, with their denials a second: who is being limited. By hash: match them with `guard.key_hash_in(class, key)` |
 | `unknown_class` | Checks in a class this instance does not know, held to the default limit |
+| `gossip_auth`, `rejected_datagrams` | How this instance signs its gossip, and the datagrams it refused, by reason: `unsigned`, `bad_tag`, `malformed`. A growing `bad_tag`, secrets that do not match the peers'; a growing `unsigned`, a peer not signing yet, or a stranger |
 
 `guard.share(key)` is the rate one key is admitted at on this instance now:
 its share of the limit, before the burst; `share_in(class, key)` the same in a
@@ -277,8 +283,11 @@ With the `metrics` feature the background task publishes the same, labelled
 `rateguard_checks_total{decision="allow"|"deny"}`,
 `rateguard_overflowed_total`, `rateguard_unknown_class_total`, and the gauges `rateguard_cluster_size`,
 `rateguard_counted_size`, `rateguard_suspects`, `rateguard_tracked_keys`,
-`rateguard_hot_keys`, `rateguard_held{reason="joining"|"learning"|"without_quorum"}`
-and `rateguard_dry_run`: everything but `most_denied`, whose key hashes as
+`rateguard_hot_keys`, `rateguard_held{reason="joining"|"learning"|"without_quorum"}`,
+`rateguard_dry_run`, the counter
+`rateguard_rejected_datagrams_total{reason="unsigned"|"bad_tag"|"malformed"}`
+and `rateguard_gossip_auth{mode="off"|"transitional"|"required"}`, 1 for
+the instance's mode: everything but `most_denied`, whose key hashes as
 labels would make a series per key. Install any `metrics` recorder,
 Prometheus or another; nothing is published on the request path.
 
@@ -526,16 +535,111 @@ admitted request has a real price — billing, prepaid quotas, regulatory caps.
 Use a centralized counter. If you run a single instance,
 [`governor`](https://crates.io/crates/governor) is simpler and gives you the
 same enforcement. And if your gossip traffic would cross an untrusted network,
-note that the protocol assumes a trusted one: it is neither encrypted nor
-authenticated.
+note that it can be signed but is never encrypted; see [Security](#security).
 
 ## Security
 
-The gossip protocol assumes a trusted network. Datagrams are neither encrypted
-nor authenticated: anyone who can reach the UDP port can join the cluster,
-announce demand that shifts the shares, or declare members dead or gone. Keep the port
-on a private network, or behind a firewall that lets in only your own
-instances. Authenticated gossip is planned.
+By default the gossip protocol trusts its network. Datagrams are neither
+encrypted nor authenticated: anyone who can reach the UDP port can join the
+cluster, announce demand that shifts the shares, or declare members dead or
+gone. Keep the port on a private network, or behind a firewall that lets in
+only your own instances, and sign the gossip.
+
+Two values only the cluster's nodes know close what is open:
+
+- **A gossip secret**, the same on every node. Each datagram carries an
+  HMAC-SHA256 tag made with it, cut to 16 bytes: 18 bytes more per
+  datagram. Under `GossipAuth::Required` a node drops every datagram
+  without a valid tag, so a stranger can neither join nor forge news of
+  members or demand.
+- **A key salt**, against chosen keys. Where clients pick the keys, an IP
+  address or a user name, one of them could search for a string that
+  hashes like someone else's key and spend that key's limit. With a salt,
+  keys are hashed with SipHash-1-3 keyed by it rather than xxh3, and
+  nobody without the salt can.
+
+```rust
+use rateguard::{GossipAuth, Secret};
+
+let secret = Secret::new(std::fs::read("/etc/rateguard/gossip-secret")?)?;
+let guard = Guard::builder()
+    .bind("0.0.0.0:7946")
+    .advertise("10.0.0.3:7946")
+    .seeds(["10.0.0.1:7946", "10.0.0.2:7946"])
+    .limit(1_000)
+    .gossip_auth(GossipAuth::Required, vec![secret])
+    .key_salt(std::fs::read("/etc/rateguard/key-salt")?)
+    .spawn()?;
+```
+
+A secret is at least 32 bytes and a salt at least 16, random ones, such as
+`openssl rand 32 > gossip-secret` and `openssl rand 16 > key-salt`. Neither
+shows in `Debug`, errors, stats or metrics. The sidecar takes both from
+files, a Kubernetes Secret: see its
+[README](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar#signed-gossip).
+Its secret file holds each secret as a line of base64, not raw bytes: in a
+fleet of Rust nodes and sidecars, give `Secret::new` the decoded line, or
+the secrets differ and the cluster splits.
+
+What this does not protect against:
+
+- **Eavesdropping.** Nothing is encrypted: whoever sees the traffic reads
+  the nodes' addresses, the hashes of keys and their rates.
+- **Replay.** A datagram recorded on the way can be sent again, and is
+  taken. Today that does no harm: news of a member loses to newer news,
+  by incarnation; a demand report no newer than what its sender already
+  said is dropped, and so is one from a run of the sender before a recent
+  restart; a ping's reply must match the probe in flight, so a replayed one
+  cannot keep a dead node alive. Guarding against replay would take synchronised
+  clocks, or counters per sender that survive restarts, for no gain yet.
+- **A node gone rogue.** There is one secret per cluster, and whoever holds
+  it can speak for any node.
+- **Salts that differ between nodes.** Nothing detects them; see below.
+
+**Turning signing on** in a running cluster takes three rolling updates,
+each on every node before the next starts:
+
+1. Every node on 0.6 with no secret, `GossipAuth::Off`. On the wire that is
+   0.5, so old and new nodes run side by side. Go on only once no 0.5 node
+   is left: 0.5 cannot read a signed datagram.
+2. The secret, in `GossipAuth::Transitional`: such a node signs, and takes
+   signed datagrams with a valid tag and unsigned ones; a node still `Off`
+   takes signed ones without checking them. Old and new hear each other.
+   For the minutes of a rollout only: a forgery passes by going unsigned.
+3. `GossipAuth::Required`.
+
+**Turning signing off** walks the same steps backwards: `Transitional` on
+every node first, then `Off`. Never go from `Required` straight to `Off`:
+for the length of that rollout the `Off` nodes send unsigned datagrams,
+which the `Required` ones refuse as `unsigned`, and the cluster splits.
+
+**Rotating** from secret A to secret B, in the same way:
+
+1. `[A, B]`: A signs, either verifies.
+2. `[B, A]`: B signs, either verifies.
+3. `[B]`.
+
+To undo a rotation, walk its steps backwards in the same way.
+
+A node at step 1 and one at step 3 at once do not hear each other, and the
+cluster splits: start a step only when the one before has reached every
+node. A node whose secrets match nobody's hears nobody, and shows it in
+`stats().rejected_datagrams` and in `rateguard_rejected_datagrams_total`:
+`bad_tag` grows on secrets that do not match, `unsigned` under `Required`
+on a peer not signing yet, still `Off`, or on a stranger. `guard.set_gossip_auth(mode,
+secrets)` takes a step with no restart; the sidecar rereads its secret
+file.
+
+**The salt** is set when the cluster is created, and is not rotated with
+the secret. Nodes exchange demand by the hash of each key: while some hash
+with one salt and others with another, or none, they do not know each
+other's keys, and each takes its share as if the others' demand were for
+other keys, up to N times the limit for N nodes. Nothing tells: the gossip
+carries no trace of the salt. So set or change a salt by restarting every
+node at once, never by a rolling update, which would admit up to that much
+for as long as it lasts. With a salt, match the hashes of `most_denied` with
+`guard.key_hash_in(class, key)`, which knows it, not the free function
+`key_hash_in`.
 
 ## FAQ
 

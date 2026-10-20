@@ -9,6 +9,7 @@ use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::node::{Node, SwimConfig};
 use rateguard_core::partition::PartitionPolicy;
 use rateguard_proto::Address;
+use rateguard_proto::auth::Auth;
 
 use crate::invariant::{self, Happened, Invariant, View};
 use crate::link::{Link, NodeIndex};
@@ -27,7 +28,7 @@ pub fn address_of(index: NodeIndex) -> Address {
     Address::V4([10, 0, (index >> 8) as u8, index as u8], 7946)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum Kind {
     Tick {
         generation: u64,
@@ -47,6 +48,11 @@ enum Kind {
     SetLimit {
         key: u64,
         limit: Limit,
+    },
+    /// How the node signs and checks gossip from now on: a change of
+    /// config, which a node down or paused takes too.
+    SetGossipAuth {
+        auth: Auth,
     },
 }
 
@@ -129,6 +135,11 @@ pub struct Sim<L: Link> {
     /// The widest limit any node has been given for each key, for the
     /// invariants: a bound that holds through every change.
     widest: HashMap<u64, Limit>,
+    /// How each node signs what it sends and checks what it receives. A
+    /// restart keeps it, as a pod restarts with the same mounted secret.
+    auths: Vec<Auth>,
+    /// Datagrams each node refused before decoding.
+    rejected: Vec<u64>,
 }
 
 impl<L: Link> Sim<L> {
@@ -181,6 +192,8 @@ impl<L: Link> Sim<L> {
             largest_datagram: 0,
             key_limits: vec![HashMap::new(); node_count],
             widest: HashMap::new(),
+            auths: vec![Auth::off(); node_count],
+            rejected: vec![0; node_count],
         };
 
         for index in 0..node_count {
@@ -341,6 +354,25 @@ impl<L: Link> Sim<L> {
         );
     }
 
+    /// `node` signs and checks gossip with `auth` from now on.
+    pub fn set_gossip_auth(&mut self, node: NodeIndex, auth: Auth) {
+        assert!(node < self.nodes.len(), "no such node: {node}");
+        self.auths[node] = auth;
+    }
+
+    /// `node` signs and checks gossip with `auth` from `at` on: one step of
+    /// a rolling update.
+    pub fn schedule_gossip_auth(&mut self, at: Nanos, node: NodeIndex, auth: Auth) {
+        assert!(node < self.nodes.len(), "no such node: {node}");
+        self.schedule(at, node, Kind::SetGossipAuth { auth });
+    }
+
+    /// Datagrams `node` refused before decoding: unsigned, signed with a
+    /// secret it does not hold, or malformed frames.
+    pub fn rejected(&self, node: NodeIndex) -> u64 {
+        self.rejected[node]
+    }
+
     pub fn schedule_request(&mut self, at: Nanos, node: NodeIndex, key: u64) {
         assert!(node < self.nodes.len(), "no such node: {node}");
         self.schedule(at, node, Kind::Request { key })
@@ -364,6 +396,8 @@ impl<L: Link> Sim<L> {
         }
     }
 
+    /// `bytes` arrive at `to` as sent from `from`, and pass `to`'s check
+    /// like any datagram: a forger is scheduled this way.
     pub fn schedule_message(&mut self, at: Nanos, from: NodeIndex, to: NodeIndex, bytes: Vec<u8>) {
         assert!(to < self.nodes.len(), "no such node: {to}");
         self.schedule(
@@ -424,7 +458,11 @@ impl<L: Link> Sim<L> {
     fn paused_until(&self, event: &Scheduled) -> Option<Nanos> {
         if matches!(
             event.kind,
-            Kind::Crash | Kind::Restart | Kind::Leave | Kind::SetLimit { .. }
+            Kind::Crash
+                | Kind::Restart
+                | Kind::Leave
+                | Kind::SetLimit { .. }
+                | Kind::SetGossipAuth { .. }
         ) {
             return None;
         }
@@ -466,6 +504,10 @@ impl<L: Link> Sim<L> {
                 self.key_limits[target].insert(key, limit);
                 return;
             }
+            Kind::SetGossipAuth { auth } => {
+                self.auths[target] = auth;
+                return;
+            }
             Kind::Tick { generation } if generation != self.generations[target] => return,
             _ if self.down[target] => return,
             _ => {}
@@ -492,16 +534,26 @@ impl<L: Link> Sim<L> {
                 Happened::Tick
             }
             Kind::Deliver { from, bytes } => {
+                // As the runtime does: a refused datagram never reaches the
+                // core, so for the node it never came.
+                let Ok(message) = self.auths[target].open(&bytes) else {
+                    self.rejected[target] += 1;
+                    return;
+                };
                 self.dispatch(
                     target,
                     Do::Handle(Event::MessageReceived {
                         from,
-                        bytes: &bytes,
+                        bytes: message,
                     }),
                 );
                 Happened::Delivery
             }
-            Kind::Crash | Kind::Restart | Kind::Leave | Kind::SetLimit { .. } => {
+            Kind::Crash
+            | Kind::Restart
+            | Kind::Leave
+            | Kind::SetLimit { .. }
+            | Kind::SetGossipAuth { .. } => {
                 unreachable!("handled above")
             }
         };
@@ -551,6 +603,7 @@ impl<L: Link> Sim<L> {
             next_seq,
             datagrams,
             largest_datagram,
+            auths,
             ..
         } = self;
         let now = *now;
@@ -563,6 +616,7 @@ impl<L: Link> Sim<L> {
         for action in actions {
             match action {
                 Action::SendTo { peer, bytes } => {
+                    let bytes = auths[source].seal(bytes);
                     datagrams[source] += 1;
                     *largest_datagram = (*largest_datagram).max(bytes.len());
                     let target = peer.get() as usize;

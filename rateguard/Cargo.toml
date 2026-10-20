@@ -11,10 +11,13 @@ keywords = ["rate-limit", "rate-limiter", "distributed", "gossip", "tokio"]
 categories = ["network-programming", "web-programming", "concurrency"]
 
 [dependencies]
-rateguard-core = { version = "0.5.1", path = "../rateguard-core" }
-rateguard-proto = { version = "0.5.1", path = "../rateguard-proto" }
+rateguard-core = { version = "0.6.0", path = "../rateguard-core" }
+rateguard-proto = { version = "0.6.0", path = "../rateguard-proto", features = ["auth"] }
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# A salted key hash: SipHash-1-3 keyed by the salt, a long salt cut down by SHA-256.
+siphasher = "1"
+sha2 = "0.10"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 turmoil = { version = "0.7", optional = true }
 metrics = { version = "0.24", optional = true }

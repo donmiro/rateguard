@@ -1,16 +1,17 @@
 //! The request path.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use rateguard_core::gcra;
+use rateguard_proto::auth::{Auth, GossipAuth, Secret};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::classes::Classes;
 use crate::config::Error;
-use crate::key::{class_hash, hash_in};
+use crate::key::{KeySalt, class_hash, salted_hash_in};
 use crate::limit::Limit;
 use crate::stats::{Report, Stats};
 use crate::table::KeyTable;
@@ -57,6 +58,13 @@ pub(crate) struct Shared {
     pub fresh_factor: AtomicU64,
     /// The quota free slots carry, packed: the strictest of any class.
     pub free_quota: AtomicU64,
+    /// How the gossip is signed and checked: read by the background task
+    /// for every datagram, replaced by `Guard::set_gossip_auth` only. Never
+    /// taken on the request path.
+    pub auth: RwLock<Arc<Auth>>,
+    /// The salt of the key hashes, set at the start for good; its `Debug`
+    /// shows none of it.
+    pub salt: Option<KeySalt>,
     /// The `guard` label of the metrics: the address the node advertises.
     #[cfg(feature = "metrics")]
     pub metrics_label: String,
@@ -80,6 +88,15 @@ impl Shared {
     /// it left is still worth showing.
     pub fn report(&self) -> MutexGuard<'_, Report> {
         self.report.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The current signing and checking, for the datagrams at hand: a
+    /// change waits for the next ones.
+    pub fn auth(&self) -> Arc<Auth> {
+        self.auth
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -108,7 +125,7 @@ impl Guard {
     /// The key is hashed here, at a cost that grows with its length: keep
     /// keys short, or hash long ones yourself.
     pub fn check(&self, key: &str) -> Decision {
-        self.check_hashed(0, hash_in(0, key))
+        self.check_hashed(0, self.hash(0, key))
     }
 
     /// Like [`check`](Guard::check), for a key of the class `class`: at
@@ -124,7 +141,20 @@ impl Guard {
     /// ```
     pub fn check_in(&self, class: &str, key: &str) -> Decision {
         let class = class_hash(class);
-        self.check_hashed(class, hash_in(class, key))
+        self.check_hashed(class, self.hash(class, key))
+    }
+
+    /// The hash this node stores and gossips `key` of the class `class`
+    /// under, its [`Builder::key_salt`](crate::Builder::key_salt) included:
+    /// for matching the hashes of
+    /// [`Stats::most_denied`](crate::Stats::most_denied) to keys. Without a
+    /// salt, the same as [`key_hash_in`](crate::key_hash_in).
+    pub fn key_hash_in(&self, class: &str, key: &str) -> u64 {
+        self.hash(class_hash(class), key)
+    }
+
+    fn hash(&self, class: u64, key: &str) -> u64 {
+        salted_hash_in(self.shared.salt.as_ref(), class, key)
     }
 
     fn check_hashed(&self, class: u64, key: u64) -> Decision {
@@ -188,6 +218,8 @@ impl Guard {
             .map(|at| Duration::from_nanos(shared.now().saturating_sub(at)));
         stats.running = self.is_running();
         stats.dry_run = shared.dry_run.load(Ordering::Relaxed);
+        drop(report);
+        stats.gossip_auth = shared.auth().mode();
         stats
     }
 
@@ -201,7 +233,7 @@ impl Guard {
 
     /// Like [`share`](Guard::share), for a key of the class `class`.
     pub fn share_in(&self, class: &str, key: &str) -> Option<f64> {
-        let slot = self.shared.table.find(hash_in(class_hash(class), key))?;
+        let slot = self.shared.table.find(self.key_hash_in(class, key))?;
         Some(slot.gcra.quota().rate_per_sec())
     }
 
@@ -268,6 +300,26 @@ impl Guard {
         self.shared.dry_run.store(on, Ordering::Relaxed);
     }
 
+    /// Changes how the gossip is signed and checked, as
+    /// [`Builder::gossip_auth`](crate::Builder::gossip_auth) sets it, for
+    /// every clone of this `Guard`: from the next datagram sent or
+    /// received on. Checks go on unaffected meanwhile. For rotating a
+    /// secret, or turning signing on, with no restart.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::GossipAuth`] for a mode other than `Off` with no secret,
+    /// or more than two secrets; the setting stays as it was.
+    pub fn set_gossip_auth(&self, mode: GossipAuth, secrets: Vec<Secret>) -> Result<(), Error> {
+        let auth = Auth::new(mode, secrets).map_err(Error::GossipAuth)?;
+        *self
+            .shared
+            .auth
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(auth);
+        Ok(())
+    }
+
     /// The nodes this one counts in the cluster, itself included.
     pub fn cluster_size(&self) -> usize {
         self.shared.cluster_size.load(Ordering::Relaxed)
@@ -329,7 +381,7 @@ mod tests {
         let slot = guard
             .shared
             .table
-            .find(hash_in(class_hash("pro"), "k"))
+            .find(guard.key_hash_in("pro", "k"))
             .unwrap();
         assert_eq!(slot.class.load(Ordering::Relaxed), class_hash("pro"));
         slot.class.store(class_hash("free"), Ordering::Relaxed);

@@ -8,4 +8,4 @@ publish = false
 
 [dependencies]
 rateguard-core = { path = "../rateguard-core" }
-rateguard-proto = { path = "../rateguard-proto" }
+rateguard-proto = { path = "../rateguard-proto", features = ["auth"] }

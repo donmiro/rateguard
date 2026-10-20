@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use rateguard_proto::auth::GossipAuth;
+
 /// A node's state, as of the last tick of its background task: a quarter
 /// of the protocol period ago at most, 50 ms by default. See
 /// [`Guard::stats`](crate::Guard::stats).
@@ -54,19 +56,47 @@ pub struct Stats {
     pub dry_run: bool,
     /// Up to ten keys with the most denials here lately, most denied first:
     /// who is being limited. Keys go by their hash; match them with
-    /// [`key_hash_in`](crate::key_hash_in).
+    /// [`Guard::key_hash_in`](crate::Guard::key_hash_in), which knows this
+    /// node's [`Builder::key_salt`](crate::Builder::key_salt).
     pub most_denied: Vec<DeniedKey>,
     /// Checks in a class this node does not know, held to the default limit
     /// instead: a typo, or a class removed while still in use.
     pub unknown_class: u64,
+    /// How this node signs its gossip and checks its peers': see
+    /// [`Builder::gossip_auth`](crate::Builder::gossip_auth).
+    pub gossip_auth: GossipAuth,
+    /// Datagrams refused before the protocol saw them, by reason. A node
+    /// whose secrets do not match its peers' shows here: it hears nobody,
+    /// and nobody hears it.
+    pub rejected_datagrams: RejectedDatagrams,
+}
+
+/// Datagrams refused since the node started; see
+/// [`Stats::rejected_datagrams`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RejectedDatagrams {
+    /// Not signed, under [`GossipAuth::Required`]: a peer not signing yet,
+    /// or a stranger.
+    pub unsigned: u64,
+    /// Signed with no secret this node holds, or altered on the way: a peer
+    /// with other secrets, mid-rotation or misconfigured, or a forgery.
+    /// A datagram longer than `MAX_DATAGRAM`, 1400 bytes, which a
+    /// conforming peer never sends, arrives cut short and is counted here
+    /// if signed.
+    pub bad_tag: u64,
+    /// No message at all: a frame cut short or of an unknown version,
+    /// bytes that do not decode, or a message that names no sender.
+    /// Counted in every mode, `Off` included.
+    pub malformed: u64,
 }
 
 /// A key denied lately; see [`Stats::most_denied`].
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DeniedKey {
-    /// The key, as [`key_hash_in`](crate::key_hash_in) hashes it with its
-    /// class.
+    /// The key, as [`Guard::key_hash_in`](crate::Guard::key_hash_in)
+    /// hashes it with its class.
     pub key_hash: u64,
     /// Denials a second here, averaged over the last ten seconds or so.
     pub denied_per_sec: f64,

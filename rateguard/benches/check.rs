@@ -28,13 +28,17 @@ impl Transport for Hung {
 }
 
 // A guard with a limit high enough that the measured path is the common
-// one, an admission; its background task runs on `runtime`.
-fn guard(runtime: &tokio::runtime::Runtime, hung: bool) -> Guard {
+// one, an admission; its background task runs on `runtime`. A salted one
+// hashes with SipHash-1-3 instead of xxh3.
+fn guard(runtime: &tokio::runtime::Runtime, hung: bool, salted: bool) -> Guard {
     runtime.block_on(async {
-        let builder = Guard::builder()
+        let mut builder = Guard::builder()
             .bind("127.0.0.1:0")
             .limit(u32::MAX)
             .tracked_keys(4096);
+        if salted {
+            builder = builder.key_salt([0x5A; 16]);
+        }
         if hung {
             builder
                 .bind("10.0.0.1:7946")
@@ -57,8 +61,9 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn single_thread(c: &mut Criterion) {
     let rt = runtime();
-    let lone = guard(&rt, false);
-    let hung = guard(&rt, true);
+    let lone = guard(&rt, false, false);
+    let hung = guard(&rt, true, false);
+    let salted = guard(&rt, false, true);
     let keys: Vec<String> = (0..4096).map(|i| format!("tenant:{i}")).collect();
 
     let mut group = c.benchmark_group("check");
@@ -75,6 +80,16 @@ fn single_thread(c: &mut Criterion) {
     group.bench_function("one hot key, network hung", |b| {
         b.iter(|| black_box(hung.check(black_box("api:tenant-42"))))
     });
+    group.bench_function("one hot key, salted", |b| {
+        b.iter(|| black_box(salted.check(black_box("api:tenant-42"))))
+    });
+    let mut i = 0;
+    group.bench_function("4096 keys in turn, salted", |b| {
+        b.iter(|| {
+            i = (i + 1) % keys.len();
+            black_box(salted.check(black_box(&keys[i])))
+        })
+    });
     group.finish();
 }
 
@@ -82,7 +97,7 @@ fn single_thread(c: &mut Criterion) {
 // key each.
 fn contended(c: &mut Criterion) {
     let rt = runtime();
-    let guard = guard(&rt, false);
+    let guard = guard(&rt, false, false);
     let mut group = c.benchmark_group("check, 8 threads");
     for (name, shared) in [("one key for all", true), ("a key each", false)] {
         group.bench_function(name, |b| {

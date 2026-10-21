@@ -50,7 +50,9 @@ jobs:
 
   # The clients of rateguard-sidecar, each on its own toolchain.
   sdk-python:
-    runs-on: ubuntu-latest
+    # Pinned: setup-python has no 3.9, the oldest Python the client
+    # supports, for the Ubuntu 26.04 that ubuntu-latest now is.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5

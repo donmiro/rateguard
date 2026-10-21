@@ -3,7 +3,7 @@
 // heals before the deadline still reshuffles everyone's shares.
 
 use rateguard_core::gcra::Nanos;
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::membership::Membership;
 use rateguard_core::node::SwimConfig;
 use rateguard_proto::Status;
@@ -18,8 +18,10 @@ const LATENCY: Nanos = ONE_MS;
 
 fn config() -> Config {
     Config {
-        limit_per_sec: 1000,
-        burst: 10,
+        limit: Limit {
+            rate: 1000.0,
+            burst: 10,
+        },
         alpha: 0.5,
         floor_factor: 0.1,
         cooldown: 5 * ONE_SEC,

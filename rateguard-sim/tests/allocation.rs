@@ -2,7 +2,7 @@
 // SWIM messages themselves (spec §4.2, §10.8).
 
 use rateguard_core::gcra::Nanos;
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::peer_demand::stale_after_rounds;
 use rateguard_sim::link::{Link, NetConfig, PerfectLink, SeededLink};
 use rateguard_sim::sim::{Sim, peer_of};
@@ -16,8 +16,10 @@ const RATE: u32 = 800;
 
 fn config() -> Config {
     Config {
-        limit_per_sec: 1000,
-        burst: 10,
+        limit: Limit {
+            rate: 1000.0,
+            burst: 10,
+        },
         alpha: 0.5,
         floor_factor: 0.1,
         cooldown: 5 * ONE_SEC,
@@ -253,8 +255,10 @@ fn a_key_that_turns_hot_on_several_nodes_at_once_stays_within_the_limit() {
 fn a_small_limit_over_a_big_fleet_is_not_multiplied() {
     let nodes = 20;
     let config = Config {
-        limit_per_sec: 10,
-        burst: 1,
+        limit: Limit {
+            rate: 10.0,
+            burst: 1,
+        },
         ..config()
     };
     let mut s = Sim::new(nodes, config, PerfectLink::new(ONE_MS));

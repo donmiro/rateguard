@@ -13,6 +13,10 @@ const ALLOWED_CRATES: &[&str] = &[
     "serde_core",
     "thiserror",
 ];
+/// Allowed only behind `cfg(rateguard_loom)`, for rateguard's loom tests:
+/// with its own dependencies, it is left out of the graph checked above, and
+/// the graph of a normal build must not have it at all.
+const CFG_ONLY: &str = "loom";
 const FORBIDDEN: &[(&str, &str)] = &[
     (
         "Instant",
@@ -47,6 +51,8 @@ fn the_runtime_dependency_graph_holds_only_what_we_allow() {
             "all",
             "--prefix",
             "none",
+            "--prune",
+            CFG_ONLY,
         ])
         .output()
         .expect("cargo tree must run: without it this test vouches for nothing");
@@ -77,6 +83,45 @@ fn the_runtime_dependency_graph_holds_only_what_we_allow() {
     assert!(
         unexpected.is_empty(),
         "rateguard-core now links {unexpected:?} at runtime. If the crate logic, add it ot ALLOWED_CRATES; if it brings a socket, a runtime or a clock, it belongs in rateguard, not in the core."
+    );
+}
+
+// The one dependency pruned above is in no build but the loom tests': on
+// the host, without the cfg, the graph has no trace of it.
+#[test]
+fn loom_is_a_dependency_under_its_cfg_only() {
+    let output = Command::new(env!("CARGO"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .args([
+            "tree",
+            "--package",
+            "rateguard-core",
+            "--edges",
+            "normal,no-proc-macro",
+            "--prefix",
+            "none",
+        ])
+        .output()
+        .expect("cargo tree must run: without it this test vouches for nothing");
+    assert!(
+        output.status.success(),
+        "cargo tree failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("cargo tree emits utf-8");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("rateguard-core ")),
+        "the output was not understood:\n{stdout}"
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.starts_with(&format!("{CFG_ONLY} "))),
+        "{CFG_ONLY} is in a normal build of rateguard-core:\n{stdout}"
     );
 }
 

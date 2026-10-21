@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use rateguard::{Decision, Guard, Stats, key_hash};
+use rateguard::{Decision, Error, Guard, KeyLimit, Limit, Stats, key_hash};
 
 fn free_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
@@ -184,4 +184,111 @@ async fn an_unsalted_guard_hashes_as_key_hash_in() {
         guard.key_hash_in("pro", "busy"),
         rateguard::key_hash_in("pro", "busy")
     );
+}
+
+#[tokio::test]
+async fn most_denied_tells_requests_too() {
+    let guard = builder(100, 5).spawn().unwrap();
+    assert_eq!(checks(&guard, "busy", 30), 5);
+    let stats = until(&guard, |s| !s.most_denied.is_empty()).await;
+    let busy = &stats.most_denied[0];
+    assert!(busy.denied_per_sec > 0.0);
+    // 30 asked, 25 denied: the denials are the larger part of the requests.
+    assert!(busy.requests_per_sec > busy.denied_per_sec, "{busy:?}");
+    assert!(
+        busy.requests_per_sec < busy.denied_per_sec * 2.0,
+        "{busy:?}"
+    );
+    assert_eq!(busy.shadow_denied_per_sec, 0.0);
+}
+
+#[tokio::test]
+async fn most_denied_takes_k() {
+    let guard = builder(100, 1).most_denied(20).spawn().unwrap();
+    for i in 0..30 {
+        // The more a key asks, the more it is denied.
+        let _ = checks(&guard, &format!("key{i}"), 5 + i);
+    }
+    let stats = until(&guard, |s| s.most_denied.len() == 20).await;
+    let rates: Vec<f64> = stats.most_denied.iter().map(|d| d.denied_per_sec).collect();
+    assert!(rates.windows(2).all(|w| w[0] >= w[1]), "{rates:?}");
+    assert_eq!(guard.stats().most_denied.len(), 20);
+
+    let none = builder(100, 1).most_denied(0).spawn().unwrap();
+    let _ = checks(&none, "k", 10);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(none.stats().most_denied.is_empty());
+    assert!(builder(100, 1).most_denied(1024).spawn().is_ok());
+    assert!(matches!(
+        builder(100, 1).most_denied(1025).spawn(),
+        Err(Error::TooManyMostDenied(1025))
+    ));
+}
+
+#[tokio::test]
+async fn most_shadow_denied_lists_the_shadowed_keys() {
+    let guard = builder(1000, 100).spawn().unwrap();
+    guard
+        .set_shadow("", Some(Limit::per_second(1).burst(1)))
+        .unwrap();
+    assert_eq!(checks(&guard, "shadowed", 20), 20);
+    let stats = until(&guard, |s| !s.most_shadow_denied.is_empty()).await;
+    assert_eq!(stats.most_shadow_denied.len(), 1);
+    let key = &stats.most_shadow_denied[0];
+    assert_eq!(key.key_hash, guard.key_hash_in("", "shadowed"));
+    assert!(key.shadow_denied_per_sec > 0.0);
+    assert!(key.requests_per_sec > 0.0);
+    assert!(stats.most_denied.is_empty(), "the limit denied nothing");
+}
+
+#[tokio::test]
+async fn key_stats_answers_for_a_tracked_key_only() {
+    let guard = Guard::builder()
+        .bind("127.0.0.1:0")
+        .default_limit(Limit::per_minute(600))
+        .spawn()
+        .unwrap();
+    assert!(guard.key_stats("", "never").await.is_none());
+    for _ in 0..50 {
+        let _ = guard.check("seen");
+    }
+    let mut stats = None;
+    for _ in 0..500 {
+        stats = guard.key_stats("", "seen").await;
+        // Tracked from the tick that takes its attempts, rated from the
+        // next, which has a time to measure them over.
+        if stats.as_ref().is_some_and(|s| s.denied_per_sec > 0.0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stats = stats.expect("tracked after a tick");
+    assert_eq!(stats.limit, Limit::per_minute(600));
+    assert_eq!(stats.shadow, None);
+    assert!(stats.requests_per_sec > 0.0);
+    assert!(stats.denied_per_sec > 0.0, "burst 30, then denials");
+    assert_eq!(stats.share, guard.share("seen").unwrap());
+    assert!(guard.key_stats("", "never").await.is_none());
+
+    // An override's limit, and a class's shadow, as given.
+    guard
+        .set_key_limit("", "seen", KeyLimit::Limit(Limit::per_hour(100)))
+        .unwrap();
+    assert_eq!(
+        guard.key_stats("", "seen").await.unwrap().limit,
+        Limit::per_hour(100)
+    );
+    guard.remove_key_limit("", "seen");
+    guard.set_shadow("", Some(Limit::per_second(3))).unwrap();
+    let stats = guard.key_stats("", "seen").await.unwrap();
+    assert_eq!(stats.shadow, Some(Limit::per_second(3)));
+}
+
+#[tokio::test]
+async fn key_stats_gives_up_with_the_task() {
+    let guard = builder(100, 5).spawn().unwrap();
+    let _ = guard.check("k");
+    guard.leave().await;
+    let answered = tokio::time::timeout(Duration::from_secs(5), guard.key_stats("", "k")).await;
+    assert_eq!(answered, Ok(None), "no task left to ask");
 }

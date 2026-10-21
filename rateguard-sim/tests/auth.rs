@@ -6,7 +6,7 @@
 // against a limit of 1000. The standard invariants hold throughout.
 
 use rateguard_core::gcra::{Decision, Nanos, Quota};
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_proto::auth::{Auth, GossipAuth, Secret};
 use rateguard_proto::{Address, Message, Status, Update, encode};
 use rateguard_sim::invariant::AdmissionWindow;
@@ -25,8 +25,10 @@ const FORGED: [u8; 32] = [0xF0; 32];
 
 fn config() -> Config {
     Config {
-        limit_per_sec: 1000,
-        burst: 10,
+        limit: Limit {
+            rate: 1000.0,
+            burst: 10,
+        },
         alpha: 0.5,
         floor_factor: 0.1,
         cooldown: 5 * ONE_SEC,

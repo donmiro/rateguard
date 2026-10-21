@@ -14,3 +14,12 @@ rateguard-proto = { version = "0.6.0", path = "../rateguard-proto" }
 
 [dev-dependencies]
 proptest = "1.11.0"
+
+# Only under `--cfg rateguard_loom`, never in a normal build: loom's atomics
+# in place of std's in `AtomicGcra` and `ShadowGcra`, for the loom tests of
+# rateguard's key table, whose slots hold them.
+[target.'cfg(rateguard_loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rateguard_loom)"] }

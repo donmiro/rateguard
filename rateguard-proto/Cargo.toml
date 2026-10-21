@@ -1,7 +1,7 @@
 [package]
 name = "rateguard-proto"
 description = "The wire format of rateguard: SWIM membership and demand reports over UDP"
-version.workspace = true
+version = "0.6.0" # unchanged in 0.7: the wire format did not change
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

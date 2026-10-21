@@ -2,18 +2,20 @@
 //!
 //! Read in two places: by the background task once a tick, and on the
 //! request path when a key takes a slot of its own for the first time, to
-//! give the slot its class's quota. The default class's limit is an atomic,
+//! give the slot its class's quota. The default class's limit is two atomics,
 //! so a flood of new keys in the default class, the usual flood, takes no
 //! lock; a new key in a named class takes a read lock, once.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
+use rateguard_core::gcra::Quota;
 use rateguard_core::limiter::Limit as CoreLimit;
 
 use crate::config::Error;
 use crate::key::class_hash;
+use crate::key_limits::{Entry, KeyLimit};
 use crate::limit::Limit;
 
 /// The most classes one node keeps.
@@ -25,15 +27,15 @@ pub(crate) const MAX_CLASSES: usize = 4096;
 pub(crate) fn checked<S: Into<String>>(
     classes: impl IntoIterator<Item = (S, Limit)>,
     max: usize,
-) -> Result<Vec<(String, CoreLimit)>, Error> {
-    let mut named: HashMap<u64, (String, CoreLimit)> = HashMap::new();
+) -> Result<Vec<(String, Limit, CoreLimit)>, Error> {
+    let mut named: HashMap<u64, (String, Limit, CoreLimit)> = HashMap::new();
     for (name, limit) in classes {
         let name = name.into();
         if name.is_empty() {
             return Err(Error::EmptyClassName);
         }
-        let limit = limit.to_core()?;
-        named.insert(class_hash(&name), (name, limit));
+        let core = limit.to_core()?;
+        named.insert(class_hash(&name), (name, limit, core));
         if named.len() > max {
             return Err(Error::TooManyClasses(max));
         }
@@ -41,11 +43,46 @@ pub(crate) fn checked<S: Into<String>>(
     Ok(named.into_values().collect())
 }
 
+/// The limit of one slot as the tick or a new key finds it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Resolved {
+    pub limit: CoreLimit,
+    /// Whether the class the limit came from exists: an unknown one took
+    /// the default.
+    pub known: bool,
+    /// The shadow of the class whose limit it is, if that class has one;
+    /// never for a key with a limit of its own.
+    pub shadow: Option<CoreLimit>,
+}
+
+/// The quota of a shadow next to the quota `main` a slot was just given for
+/// `limit`: `main` scaled by the ratio of the two limits, with the shadow's
+/// burst. The node's own share and every hold on it, `joining`, `learning`,
+/// `without_quorum`, are factors of `main`, and so they act on the shadow
+/// alike. See [`Guard::set_shadow`](crate::Guard::set_shadow) for the side
+/// this errs on.
+pub(crate) fn shadow_quota(
+    main: Quota,
+    limit: CoreLimit,
+    shadow: Option<CoreLimit>,
+) -> Option<Quota> {
+    shadow.map(|shadow| {
+        Quota::per_second(main.rate_per_sec() * shadow.rate / limit.rate, shadow.burst)
+    })
+}
+
 /// The classes as of one moment.
 #[derive(Debug, Clone)]
 pub(crate) struct Table {
     pub default: CoreLimit,
-    named: HashMap<u64, (String, CoreLimit)>,
+    /// The default as given, for reading back.
+    default_given: Limit,
+    /// Each class as given, for reading back, and as the core takes it.
+    named: HashMap<u64, (String, Limit, CoreLimit)>,
+    /// The shadows by the hash of their class, 0 for the default; as
+    /// given, and as the core takes them. Only of classes in `named`, or
+    /// the default.
+    shadows: HashMap<u64, (Limit, CoreLimit)>,
 }
 impl Table {
     /// The limit of the class with this hash, and whether there is such a
@@ -56,19 +93,103 @@ impl Table {
             return (self.default, true);
         }
         match self.named.get(&class) {
-            Some(&(_, limit)) => (limit, true),
+            Some(&(_, _, limit)) => (limit, true),
             None => (self.default, false),
+        }
+    }
+
+    /// The limit of a slot of the class `class` holding the key `key`: its
+    /// key limit if it has one, else its class's. A key given a class takes
+    /// that class's limit as it is in this table.
+    ///
+    /// The shadow is that of the class the limit came from: a key given a
+    /// class follows that class's shadow, one given a limit of its own has
+    /// none, and one held to the default for want of its class follows the
+    /// default's.
+    pub fn resolve(&self, overrides: &HashMap<u64, Entry>, class: u64, key: u64) -> Resolved {
+        let class = match overrides.get(&key) {
+            Some((_, _, KeyLimit::Limit(limit))) => match limit.to_core() {
+                Ok(limit) => {
+                    return Resolved {
+                        limit,
+                        known: true,
+                        shadow: None,
+                    };
+                }
+                // Checked when set; the class's, were it ever not.
+                Err(_) => class,
+            },
+            Some((_, _, KeyLimit::Class(name))) => class_hash(name),
+            None => class,
+        };
+        let (limit, known) = self.lookup(class);
+        let shadow_of = if known { class } else { 0 };
+        Resolved {
+            limit,
+            known,
+            shadow: self.shadows.get(&shadow_of).map(|&(_, core)| core),
+        }
+    }
+
+    /// What [`resolve`](Table::resolve) says, with the limits as given
+    /// rather than as the core takes them: the limit of a slot and its
+    /// shadow, for reading back.
+    pub fn resolve_given(
+        &self,
+        overrides: &HashMap<u64, Entry>,
+        class: u64,
+        key: u64,
+    ) -> (Limit, Option<Limit>) {
+        let class = match overrides.get(&key) {
+            Some((_, _, KeyLimit::Limit(limit))) if limit.to_core().is_ok() => {
+                return (*limit, None);
+            }
+            Some((_, _, KeyLimit::Class(name))) => class_hash(name),
+            _ => class,
+        };
+        let (limit, shadow_of) = match self.named.get(&class) {
+            Some(&(_, given, _)) => (given, class),
+            None => (self.default_given, 0),
+        };
+        (limit, self.shadows.get(&shadow_of).map(|&(given, _)| given))
+    }
+
+    /// Whether any class has a shadow.
+    pub fn has_shadows(&self) -> bool {
+        !self.shadows.is_empty()
+    }
+
+    /// The hash of the class `name`, `""` for the default, if there is such
+    /// a class.
+    fn class_named(&self, name: &str) -> Result<u64, Error> {
+        if name.is_empty() {
+            return Ok(0);
+        }
+        let class = class_hash(name);
+        if self.named.contains_key(&class) {
+            Ok(class)
+        } else {
+            Err(Error::UnknownClass(name.to_owned()))
         }
     }
 
     /// The strictest of every class's rate and every class's burst: the
     /// quota a slot no key holds yet carries, so that a key whose class is
     /// not yet set errs on the strict side.
+    ///
+    /// The limits of single keys are not in it, on purpose: one penalty,
+    /// "this abuser gets 1 a second", would lower the cold quota of every
+    /// new key of the node. A key with a limit stricter than any class may
+    /// thus pass at a looser quota: a check on another thread in the
+    /// nanoseconds between the key's taking a slot and the slot getting its
+    /// own quota, at this one; a key whose first check finds no key limit
+    /// at all as the first is being set, at its class's until the next
+    /// tick; and a key in the overflow slot, while there.
     pub fn strictest(&self) -> CoreLimit {
         self.named
             .values()
-            .fold(self.default, |strictest, &(_, limit)| CoreLimit {
-                per_second: strictest.per_second.min(limit.per_second),
+            .fold(self.default, |strictest, &(_, _, limit)| CoreLimit {
+                rate: strictest.rate.min(limit.rate),
                 burst: strictest.burst.min(limit.burst),
             })
     }
@@ -77,21 +198,42 @@ impl Table {
 #[derive(Debug)]
 pub(crate) struct Classes {
     max: usize,
-    /// The default class's limit, packed: rate above, burst below.
-    default: AtomicU64,
+    /// The default class's limit: the rate as the bits of an `f64`, and the
+    /// burst. Two atomics, not one packed word, for a rate takes 64 bits
+    /// now. A `set_limit` racing a first request of a new key may hand that
+    /// key a mix of the old and the new limit, the rate of one and the
+    /// burst of the other, until the next tick gives it its own. A flood of
+    /// new keys takes no lock, which is the point.
+    default_rate: AtomicU64,
+    default_burst: AtomicU32,
+    /// Whether any class has a shadow: when none has, the usual case, a new
+    /// key of the default class still takes no lock.
+    has_shadows: AtomicBool,
     table: RwLock<Arc<Table>>,
 }
 impl Classes {
     /// Checked by the builder: names not empty, no more than `max`.
-    pub fn new(default: CoreLimit, named: Vec<(String, CoreLimit)>, max: usize) -> Self {
+    pub fn new(
+        given: Limit,
+        default: CoreLimit,
+        named: Vec<(String, Limit, CoreLimit)>,
+        max: usize,
+    ) -> Self {
         let named = named
             .into_iter()
-            .map(|(name, limit)| (class_hash(&name), (name, limit)))
+            .map(|(name, given, limit)| (class_hash(&name), (name, given, limit)))
             .collect();
         Self {
             max,
-            default: AtomicU64::new(pack(default)),
-            table: RwLock::new(Arc::new(Table { default, named })),
+            default_rate: AtomicU64::new(default.rate.to_bits()),
+            default_burst: AtomicU32::new(default.burst),
+            has_shadows: AtomicBool::new(false),
+            table: RwLock::new(Arc::new(Table {
+                default,
+                default_given: given,
+                named,
+                shadows: HashMap::new(),
+            })),
         }
     }
 
@@ -107,7 +249,10 @@ impl Classes {
     /// slot; see [`Table::lookup`].
     pub fn limit_of(&self, class: u64) -> CoreLimit {
         if class == 0 {
-            return unpack(self.default.load(Ordering::Relaxed));
+            return CoreLimit {
+                rate: f64::from_bits(self.default_rate.load(Ordering::Relaxed)),
+                burst: self.default_burst.load(Ordering::Relaxed),
+            };
         }
         self.table
             .read()
@@ -116,52 +261,140 @@ impl Classes {
             .0
     }
 
+    /// The limit of a key taking its first slot, and its shadow: its key
+    /// limit, if it has one, else its class's, as
+    /// [`limit_of`](Classes::limit_of) says, without a lock for the default
+    /// class while no class has a shadow. The key limits come as they are
+    /// in the map the caller holds.
+    pub fn limit_for(
+        &self,
+        overrides: &HashMap<u64, Entry>,
+        class: u64,
+        key: u64,
+    ) -> (CoreLimit, Option<CoreLimit>) {
+        if self.has_shadows() || overrides.contains_key(&key) {
+            let resolved = self.snapshot().resolve(overrides, class, key);
+            (resolved.limit, resolved.shadow)
+        } else {
+            (self.limit_of(class), None)
+        }
+    }
+
+    /// Whether any class has a shadow, without a lock.
+    pub fn has_shadows(&self) -> bool {
+        self.has_shadows.load(Ordering::Relaxed)
+    }
+
     pub fn set(&self, name: &str, limit: Limit) -> Result<(), Error> {
         if name.is_empty() {
             return Err(Error::EmptyClassName);
         }
-        let limit = limit.to_core()?;
+        let core = limit.to_core()?;
         self.change(|table| {
             let hash = class_hash(name);
             if !table.named.contains_key(&hash) && table.named.len() == self.max {
                 return Err(Error::TooManyClasses(self.max));
             }
-            table.named.insert(hash, (name.to_owned(), limit));
+            table.named.insert(hash, (name.to_owned(), limit, core));
             Ok(())
         })
     }
 
+    /// Removes the class `name`, and its shadow with it.
     pub fn remove(&self, name: &str) -> bool {
         let mut removed = false;
         let _ = self.change(|table| {
-            removed = table.named.remove(&class_hash(name)).is_some();
+            let hash = class_hash(name);
+            removed = table.named.remove(&hash).is_some();
+            // Only a named class's: `""` hashes to 0, the default's.
+            if removed {
+                table.shadows.remove(&hash);
+            }
             Ok(())
         });
         removed
     }
 
     pub fn set_default(&self, limit: Limit) -> Result<(), Error> {
+        let given = limit;
         let limit = limit.to_core()?;
         self.change(|table| {
             table.default = limit;
+            table.default_given = given;
             Ok(())
         })
     }
 
-    /// Every named class at once: those left out are removed. All or
-    /// nothing.
+    /// Every named class at once: those left out are removed, with their
+    /// shadows. All or nothing.
     pub fn replace<S: Into<String>>(
         &self,
         classes: impl IntoIterator<Item = (S, Limit)>,
     ) -> Result<(), Error> {
-        let named = checked(classes, self.max)?
+        let named: HashMap<_, _> = checked(classes, self.max)?
             .into_iter()
-            .map(|(name, limit)| (class_hash(&name), (name, limit)))
+            .map(|(name, given, limit)| (class_hash(&name), (name, given, limit)))
             .collect();
         self.change(|table| {
+            table
+                .shadows
+                .retain(|class, _| *class == 0 || named.contains_key(class));
             table.named = named;
             Ok(())
         })
+    }
+
+    /// Gives the class `name`, `""` for the default, the shadow `limit`, or
+    /// takes its shadow away with `None`.
+    pub fn set_shadow(&self, name: &str, limit: Option<Limit>) -> Result<(), Error> {
+        let limit = limit
+            .map(|limit| Ok((limit, limit.to_core()?)))
+            .transpose()?;
+        self.change(|table| {
+            let class = table.class_named(name)?;
+            match limit {
+                Some(limit) => table.shadows.insert(class, limit),
+                None => table.shadows.remove(&class),
+            };
+            Ok(())
+        })
+    }
+
+    /// Every shadow at once: those left out are removed. All or nothing; a
+    /// class given twice takes its last shadow.
+    pub fn replace_shadows<S: Into<String>>(
+        &self,
+        shadows: impl IntoIterator<Item = (S, Limit)>,
+    ) -> Result<(), Error> {
+        let shadows: Vec<(String, Limit, CoreLimit)> = shadows
+            .into_iter()
+            .map(|(name, limit)| Ok((name.into(), limit, limit.to_core()?)))
+            .collect::<Result<_, Error>>()?;
+        self.change(|table| {
+            let mut all = HashMap::new();
+            for (name, limit, core) in shadows {
+                all.insert(table.class_named(&name)?, (limit, core));
+            }
+            table.shadows = all;
+            Ok(())
+        })
+    }
+
+    /// The shadows by class name, `""` for the default, in no particular
+    /// order.
+    pub fn shadows(&self) -> Vec<(String, Limit)> {
+        let table = self.snapshot();
+        table
+            .shadows
+            .iter()
+            .map(|(&class, &(limit, _))| {
+                let name = match table.named.get(&class) {
+                    Some((name, _, _)) => name.clone(),
+                    None => String::new(),
+                };
+                (name, limit)
+            })
+            .collect()
     }
 
     /// The named classes, in no particular order.
@@ -169,7 +402,7 @@ impl Classes {
         self.snapshot()
             .named
             .values()
-            .map(|(name, limit)| (name.clone(), Limit::from_core(*limit)))
+            .map(|(name, limit, _)| (name.clone(), *limit))
             .collect()
     }
 
@@ -178,19 +411,13 @@ impl Classes {
         let mut current = self.table.write().unwrap_or_else(PoisonError::into_inner);
         let mut table = Table::clone(&current);
         edit(&mut table)?;
-        self.default.store(pack(table.default), Ordering::Relaxed);
+        self.default_rate
+            .store(table.default.rate.to_bits(), Ordering::Relaxed);
+        self.default_burst
+            .store(table.default.burst, Ordering::Relaxed);
+        self.has_shadows
+            .store(table.has_shadows(), Ordering::Relaxed);
         *current = Arc::new(table);
         Ok(())
-    }
-}
-
-fn pack(limit: CoreLimit) -> u64 {
-    (limit.per_second as u64) << 32 | limit.burst as u64
-}
-
-fn unpack(packed: u64) -> CoreLimit {
-    CoreLimit {
-        per_second: (packed >> 32) as u32,
-        burst: packed as u32,
     }
 }

@@ -3,7 +3,7 @@
 // against a limit of 1000: whatever is admitted is what the shares allow.
 
 use rateguard_core::gcra::Nanos;
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::partition::PartitionPolicy;
 use rateguard_sim::invariant::AdmissionWindow;
 use rateguard_sim::link::{Fate, Link, NodeIndex};
@@ -20,8 +20,10 @@ const END: Nanos = 55 * ONE_SEC;
 
 fn config() -> Config {
     Config {
-        limit_per_sec: 1000,
-        burst: 10,
+        limit: Limit {
+            rate: 1000.0,
+            burst: 10,
+        },
         alpha: 0.5,
         floor_factor: 0.1,
         cooldown: 5 * ONE_SEC,

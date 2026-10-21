@@ -7,7 +7,7 @@
 // every run: no key above R plus a burst per node.
 
 use rateguard_core::gcra::{Decision, Nanos};
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::partition::PartitionPolicy;
 use rateguard_sim::link::{Fate, Link, NodeIndex, PerfectLink};
 use rateguard_sim::sim::Sim;
@@ -22,8 +22,10 @@ const BETA: f64 = 0.05;
 // rateguard's Builder with `.limit(1000)` and nothing else.
 fn defaults() -> Config {
     Config {
-        limit_per_sec: 1000,
-        burst: 50,
+        limit: Limit {
+            rate: 1000.0,
+            burst: 50,
+        },
         alpha: 0.5,
         floor_factor: BETA,
         cooldown: 5 * ONE_SEC,
@@ -47,7 +49,7 @@ const ALL: [NodeIndex; NODES] = [0, 1, 2, 3, 4];
 
 // R plus one burst per node, spread over a window of `secs`.
 fn ceiling(secs: u64) -> f64 {
-    LIMIT + (NODES as f64 * defaults().burst as f64) / secs as f64
+    LIMIT + (NODES as f64 * defaults().limit.burst as f64) / secs as f64
 }
 
 fn assert_between(what: &str, rate: f64, low: f64, high: f64) {

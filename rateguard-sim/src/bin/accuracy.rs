@@ -28,7 +28,7 @@ fn with_table(readme: &str, table: &str) -> Option<String> {
 }
 
 fn main() -> ExitCode {
-    let table = accuracy::markdown(&accuracy::rows());
+    let table = accuracy::report();
     let mode = std::env::args().nth(1);
     if mode.is_none() {
         print!("{table}");

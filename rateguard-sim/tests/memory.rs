@@ -4,7 +4,7 @@
 // every protocol period and held to its bound.
 
 use rateguard_core::gcra::Nanos;
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::node::{Footprint, SwimConfig};
 use rateguard_core::peer_demand::stale_after_rounds;
 use rateguard_proto::MAX_DEMAND_KEYS;
@@ -17,8 +17,10 @@ const PERIOD: Nanos = 200 * ONE_MS;
 
 fn config() -> Config {
     Config {
-        limit_per_sec: 1000,
-        burst: 50,
+        limit: Limit {
+            rate: 1000.0,
+            burst: 50,
+        },
         alpha: 0.5,
         floor_factor: 0.05,
         cooldown: 5 * ONE_SEC,

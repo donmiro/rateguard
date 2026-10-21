@@ -22,7 +22,7 @@ fn without_the_network() {
     use rateguard_core::{
         boundary::{Action, Event, PeerId},
         gcra::Decision,
-        limiter::Config,
+        limiter::{Config, Limit},
         node::{Node, SwimConfig},
     };
 
@@ -30,8 +30,10 @@ fn without_the_network() {
 
     let mut node = Node::new(
         Config {
-            limit_per_sec: 1_000,
-            burst: 10,
+            limit: Limit {
+                rate: 1_000.0,
+                burst: 10,
+            },
             alpha: 0.5,
             floor_factor: 0.05,
             cooldown: 5 * ONE_SEC,

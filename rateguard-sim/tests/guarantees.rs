@@ -1,7 +1,7 @@
 // The guarantees of spec §5.4 that the membership layer already owns.
 
 use rateguard_core::gcra::Nanos;
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_proto::MAX_DATAGRAM;
 use rateguard_sim::link::{Fate, Link, NetConfig, NodeIndex, PerfectLink, SeededLink};
 use rateguard_sim::sim::Sim;
@@ -13,8 +13,10 @@ const RUN: Nanos = 30 * ONE_SEC;
 
 fn config() -> Config {
     Config {
-        limit_per_sec: 1000,
-        burst: 10,
+        limit: Limit {
+            rate: 1000.0,
+            burst: 10,
+        },
         alpha: 0.5,
         floor_factor: 0.1,
         cooldown: 5 * ONE_SEC,

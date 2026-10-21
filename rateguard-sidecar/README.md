@@ -27,16 +27,59 @@ client will do.
 | Method | Path | Body | Answer |
 |---|---|---|---|
 | POST | `/v1/check` | `{"key": "tenant:42", "class": "pro"}`, `class` optional | `200 {"allowed": true}` or `200 {"allowed": false, "retry_after_ms": 120}` |
-| GET | `/v1/stats` | | what `Guard::stats` tells, as JSON, with the keys denied most by name; see [Stats](#stats) |
+| GET | `/v1/stats` | | what `Guard::stats` tells, as JSON, with the keys denied most, and those a shadow limit would deny most, by name; see [Stats](#stats) |
+| GET | `/v1/keys?class=pro&key=tenant:42` | | one key's rates, share, limit and shadow, as JSON; `404` while this node keeps no state for it; loopback only, never on `--metrics-listen`; see [One key](#one-key) |
 | GET | `/healthz` | | `200` while the node runs, `503` once it has left |
 | GET | `/metrics` | | Prometheus metrics |
 | PUT | `/v1/classes` | `{"pro": {"per_second": 1000, "burst": 50}}` | `204`; replaces every named class; `--admin` only |
 | PUT | `/v1/limit` | `{"per_second": 100, "burst": 5}` | `204`; the default class; `--admin` only |
+| PUT | `/v1/key_limits` | `[{"class": "pro", "key": "tenant:42", "limit": {"per_minute": 90000}}, {"class": "free", "key": "tenant:7", "as_class": "pro"}]` | `204`; replaces every exception; `--admin` only; see [Limits](#limits) |
+| PUT | `/v1/shadows` | `{"free": {"per_second": 10}, "": null}` | `204`; replaces every shadow, `""` is the default class; `--admin` only; see [Shadow limits](#shadow-limits) |
 | PUT | `/v1/dry_run` | `{"on": true}` | `204`; `--admin` only |
 
 A decision is always a `200`: the `429` is your service's answer to its
-client. A request the sidecar cannot read is a `400`. `burst` is optional,
-a twentieth of the rate by default.
+client. A request the sidecar cannot read is a `400`.
+
+## Limits
+
+A limit in a body has exactly one of `per_second`, `per_minute` and
+`per_hour`, and an optional `burst`, by default a twentieth of the count:
+`{"per_minute": 1000}` and `{"per_hour": 5000, "burst": 10}`. Two periods
+at once, or none, is a `400`; `{"per_second": 100}`, the form of 0.6, reads
+as before.
+
+`per_minute` is not a fixed window. The limit is smoothed: 1000 a minute is
+about 16.7 a second plus the burst, so a client that waits for the minute to
+begin and sends 1000 at once gets denials. The burst is per sidecar: a fleet
+of N admits up to N times the burst back to back.
+
+An entry of `PUT /v1/key_limits` is the exception of one key: `class` is
+the class your service checks it in (`""` or left out for the default), and
+it has either its own `limit` or `as_class`, the name of the class whose
+limit it follows, tariff changes included; an `as_class` the sidecar does
+not have is accepted, and gives the default limit, counted in
+`unknown_class`. The key keeps its identity and
+its debt: moving it from 500 to 2000 a second gives it no fresh burst, and
+while the change has not reached every sidecar, the fleet admits at most the
+higher of the two limits. A body replaces every exception, all or nothing;
+there is room for 4096 of them by default.
+
+## Shadow limits
+
+`PUT /v1/shadows` gives a class a second limit that denies nothing: every
+attempt on a key of the class is also run through it, and what it would have
+denied is counted, in `shadow_denied` and in `most_shadow_denied`; a key in
+the overflow slot, past the tracked keys, has no shadow, so under heavy key
+churn the count is short of them. The class's real limit decides as before.
+To roll a new limit out, set it as the shadow, read the report, then put it in
+`/v1/classes` and clear the shadow.
+
+The count errs on the strict side: a key whose demand lies between the hot
+thresholds of the two limits is held to a smaller share under the shadow than
+it would get as the real limit, so the shadow denies it more than enforcing
+the limit would. Rolled out, the new limit affects as many clients as the
+report says, or fewer. A key with its own limit has no shadow; one that
+follows a class follows that class's shadow.
 
 ## Configuration
 
@@ -45,9 +88,9 @@ Every flag is also a variable, for Kubernetes: `--limit` is
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--limit` | required | Requests per second per key in the default class, across the fleet |
-| `--burst` | `limit / 20` | Requests one instance may admit back to back |
-| `--class name=rate[/burst]` | none | A class of limits; repeated, or comma-separated in `RATEGUARD_CLASSES` |
+| `--limit` | required | Requests per key in the default class, across the fleet, as `100`, `1000/min` or `5000/h`, with a burst after the unit if you like: `5000/h/10` |
+| `--burst` | `count / 20` | Requests one instance may admit back to back, when `--limit` gives none |
+| `--class name=limit` | none | A class of limits, its limit in the form of `--limit`: `pro=1000/min/50`, `free=10`; repeated, or comma-separated in `RATEGUARD_CLASSES` |
 | `--bind` | `0.0.0.0:7946` | UDP address for gossip |
 | `--advertise` | the bind address | Where the other instances reach this one; required with `0.0.0.0`. In Kubernetes, the pod IP |
 | `--seeds` | none | Peers to join through, comma-separated; a headless service name will do |
@@ -58,6 +101,7 @@ Every flag is also a variable, for Kubernetes: `--limit` is
 | `--dry-run` | off | Admit everything, count what would be denied |
 | `--drain` | `10s` | How long to go on answering after leaving on SIGTERM |
 | `--tracked-keys`, `--hot-keys`, `--max-classes` | as in `rateguard` | |
+| `--most-denied` | `10` | How many keys `most_denied` and `most_shadow_denied` list in `/v1/stats`, at most 1024, `0` for none (`RATEGUARD_MOST_DENIED`) |
 | `--gossip-secret-file` | none | Gossip secrets, one per line in base64, at most two: the first signs, either verifies. Reread every 10 s; see [Signed gossip](#signed-gossip) |
 | `--gossip-auth` | `required` with a secret file, else `off` | `off`, `transitional` or `required` |
 | `--key-salt-file` | none | A salt for the hashes of keys, its bytes as they are, at least 16; read once, at start |
@@ -81,19 +125,44 @@ under the pod's `terminationGracePeriodSeconds`.
 [`rateguard` README](https://github.com/donmiro/rateguard#observability),
 `gossip_auth` as `"off"`, `"transitional"` or `"required"`, and
 `rejected_datagrams` as `{"unsigned": 0, "bad_tag": 0, "malformed": 0}`.
-Each entry of `most_denied` has its `key_hash`, as a string, and
-`denied_per_sec`; and, when the sidecar knows them, the `key` itself and its
-`class`, `""` for the default one:
+Each entry of `most_denied` has its `key_hash`, as a string, its
+`denied_per_sec`, its `requests_per_sec` and its `shadow_denied_per_sec`, all
+averaged over the last ten seconds or so on this sidecar, a new key's so far;
+and, when the sidecar knows them, the `key` itself and its `class`, `""` for
+the default one:
 
 ```json
-{"key_hash": "8270364711458143018", "denied_per_sec": 42.5, "key": "203.0.113.7", "class": "free"}
+{"key_hash": "8270364711458143018", "denied_per_sec": 42.5, "requests_per_sec": 310.0, "shadow_denied_per_sec": 0.0, "key": "203.0.113.7", "class": "free"}
 ```
+
+`most_shadow_denied` is the same list by shadow denials: the clients a shadow
+limit would have limited. Both rank keys by the plain average over the window,
+the time before a key was first seen counted as silent, so a key denied once
+just now ranks below one denied as often for ten seconds. `shadow_denied` is
+the total. Every number is this sidecar's alone; adding them up across the
+fleet is for whoever asks.
 
 The sidecar remembers a key's string when it denies it, and only then, in a
 table of the last 1024; a key over 256 bytes is kept cut, with
 `"key_truncated": true`. An entry has no `key` and `class` when the key was
 denied before the sidecar restarted or has been pushed out of the table, and
-in a dry run, where nothing is denied.
+in a dry run, where nothing is denied. A shadow denial remembers the name
+too, so `most_shadow_denied` is named like the other, in a table of its own
+of the last 1024 keys only a shadow denied: a shadow tried on many keys
+pushes out no name of a real denial.
+
+### One key
+
+`GET /v1/keys?class=pro&key=tenant:42` answers for one key (`class` may be
+left out for the default class):
+
+```json
+{"requests_per_sec": 310.0, "denied_per_sec": 12.5, "shadow_denied_per_sec": 40.0, "share": 200.0, "limit": {"per_second": 1000, "burst": 50}, "shadow": {"per_second": 500, "burst": 25}}
+```
+
+`share` is the rate this sidecar admits the key at now, `limit` is the limit
+it is held to, its own or its class's, and `shadow` is null without one.
+`404` means this sidecar keeps no state for the key: it is not busy here.
 
 Keys are what your service sends, and may be personal data: IP addresses,
 user names. They are served on the API's address only, on loopback, never
@@ -165,7 +234,7 @@ the commands in its header, probes and Prometheus on `--metrics-listen`.
 The image:
 
 ```sh
-docker build -f rateguard-sidecar/Dockerfile -t rateguard-sidecar:0.6.0 .
+docker build -f rateguard-sidecar/Dockerfile -t rateguard-sidecar:0.7.0 .
 ```
 
 ## License

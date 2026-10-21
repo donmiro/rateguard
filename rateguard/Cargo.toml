@@ -11,7 +11,7 @@ keywords = ["rate-limit", "rate-limiter", "distributed", "gossip", "tokio"]
 categories = ["network-programming", "web-programming", "concurrency"]
 
 [dependencies]
-rateguard-core = { version = "0.6.0", path = "../rateguard-core" }
+rateguard-core = { version = "0.7.0", path = "../rateguard-core" }
 rateguard-proto = { version = "0.6.0", path = "../rateguard-proto", features = ["auth"] }
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

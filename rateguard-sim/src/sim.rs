@@ -115,6 +115,7 @@ pub struct Sim<L: Link> {
     nodes: Vec<Node>,
     swim: SwimConfig,
     policy: PartitionPolicy,
+    quorum_memory: Option<Nanos>,
     bootstrap: Bootstrap,
     generations: Vec<u64>,
     down: Vec<bool>,
@@ -140,6 +141,10 @@ pub struct Sim<L: Link> {
     auths: Vec<Auth>,
     /// Datagrams each node refused before decoding.
     rejected: Vec<u64>,
+    /// The shadow limit of each key given one, at every node.
+    shadows: HashMap<u64, Limit>,
+    /// The requests a shadow would have denied, with what it said.
+    shadow_denials: Vec<Admission>,
 }
 
 impl<L: Link> Sim<L> {
@@ -176,6 +181,7 @@ impl<L: Link> Sim<L> {
             nodes: Vec::with_capacity(node_count),
             swim,
             policy: PartitionPolicy::default(),
+            quorum_memory: None,
             bootstrap,
             generations: vec![0; node_count],
             down: vec![false; node_count],
@@ -194,6 +200,8 @@ impl<L: Link> Sim<L> {
             widest: HashMap::new(),
             auths: vec![Auth::off(); node_count],
             rejected: vec![0; node_count],
+            shadows: HashMap::new(),
+            shadow_denials: Vec::new(),
         };
 
         for index in 0..node_count {
@@ -221,6 +229,9 @@ impl<L: Link> Sim<L> {
             seed,
         );
         node.set_partition_policy(self.policy);
+        if let Some(memory) = self.quorum_memory {
+            node.set_quorum_memory(memory);
+        }
         match &self.bootstrap {
             Bootstrap::Static => {
                 for other in (0..node_count).filter(|&other| other != index) {
@@ -303,6 +314,15 @@ impl<L: Link> Sim<L> {
         }
     }
 
+    /// Sets how long every node without a majority keeps counting it
+    /// against the size it last saw, restarted ones included.
+    pub fn set_quorum_memory(&mut self, memory: Nanos) {
+        self.quorum_memory = Some(memory);
+        for node in &mut self.nodes {
+            node.set_quorum_memory(memory);
+        }
+    }
+
     /// Stops checking an invariant, to replace it with a looser one: the
     /// standard admission window, say, under a policy that overshoots on
     /// purpose.
@@ -324,6 +344,21 @@ impl<L: Link> Sim<L> {
         self.widen(key, limit);
     }
 
+    /// `key` has the shadow limit `shadow` at every node from now on, or
+    /// none: it decides nothing, and what it would have denied is in
+    /// [`shadow_denials`](Sim::shadow_denials).
+    pub fn set_shadow(&mut self, key: u64, shadow: Option<Limit>) {
+        match shadow {
+            Some(shadow) => self.shadows.insert(key, shadow),
+            None => self.shadows.remove(&key),
+        };
+    }
+
+    /// Every request a shadow would have denied, in order.
+    pub fn shadow_denials(&self) -> &[Admission] {
+        &self.shadow_denials
+    }
+
     /// `key` has `limit` at `node` from `at` on: a change of config that
     /// reaches the nodes one by one.
     pub fn schedule_key_limit(&mut self, at: Nanos, node: NodeIndex, key: u64, limit: Limit) {
@@ -342,13 +377,13 @@ impl<L: Link> Sim<L> {
             .any(|limits| !limits.contains_key(&key));
         let start = match self.widest.get(&key) {
             Some(&widest) => widest,
-            None if default_in_force => self.config.limit(),
+            None if default_in_force => self.config.limit,
             None => limit,
         };
         self.widest.insert(
             key,
             Limit {
-                per_second: start.per_second.max(limit.per_second),
+                rate: start.rate.max(limit.rate),
                 burst: start.burst.max(limit.burst),
             },
         );
@@ -515,9 +550,24 @@ impl<L: Link> Sim<L> {
 
         let happened = match event.kind {
             Kind::Request { key } => {
-                let decision = match self.key_limits[target].get(&key) {
-                    Some(&limit) => self.nodes[target].check_in(key, limit, now),
-                    None => self.nodes[target].check(key, now),
+                let limit = self.key_limits[target].get(&key).copied();
+                let decision = match (limit, self.shadows.get(&key)) {
+                    (limit, Some(&shadow)) => {
+                        let limit = limit.unwrap_or(self.config.limit);
+                        let (decision, traced) =
+                            self.nodes[target].check_in_traced(key, limit, Some(shadow), now);
+                        if let Some(denied @ Decision::Deny { .. }) = traced {
+                            self.shadow_denials.push(Admission {
+                                at: now,
+                                node: target,
+                                key,
+                                decision: denied,
+                            });
+                        }
+                        decision
+                    }
+                    (Some(limit), None) => self.nodes[target].check_in(key, limit, now),
+                    (None, None) => self.nodes[target].check(key, now),
                 };
                 let admission = Admission {
                     at: now,
@@ -681,8 +731,10 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            limit_per_sec: 1000,
-            burst: 10,
+            limit: Limit {
+                rate: 1000.0,
+                burst: 10,
+            },
             alpha: 0.5,
             floor_factor: 0.1,
             cooldown: 5 * ONE_SEC,
@@ -697,7 +749,10 @@ mod tests {
     }
 
     fn limit(per_second: u32, burst: u32) -> Limit {
-        Limit { per_second, burst }
+        Limit {
+            rate: per_second as f64,
+            burst,
+        }
     }
 
     #[test]
@@ -713,7 +768,7 @@ mod tests {
         s.schedule_key_limit(ONE_SEC, 0, KEY, limit(200, 4));
         assert_eq!(
             s.widest[&KEY],
-            config().limit(),
+            config().limit,
             "the others keep the default"
         );
         let mut t = sim(3);

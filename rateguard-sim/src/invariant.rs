@@ -37,7 +37,7 @@ impl View<'_> {
         self.key_limits
             .get(&key)
             .copied()
-            .unwrap_or(self.config.limit())
+            .unwrap_or(self.config.limit)
     }
 }
 
@@ -183,15 +183,17 @@ impl Invariant for AdmissionWindow {
 
         let admitted = times.len() as u128;
         let limit = view.limit_of(admission.key);
-        let rate_part = self.limits as u128 * limit.per_second as u128 * self.window as u128;
-        let burst_part = view.nodes.len() as u128 * limit.burst as u128 * ONE_SEC as u128;
+        // In floats: R is fractional now. The sums stay far below 2^53, so
+        // a whole-number limit is still exact.
+        let rate_part = self.limits as f64 * limit.rate * self.window as f64;
+        let burst_part = view.nodes.len() as f64 * limit.burst as f64 * ONE_SEC as f64;
 
-        if admitted * ONE_SEC as u128 > rate_part + burst_part {
+        if admitted as f64 * ONE_SEC as f64 > rate_part + burst_part {
             return Err(format!(
                 "key {} admitted {admitted} times in the last {} ns, the bound is {:.1}",
                 admission.key,
                 self.window,
-                (rate_part + burst_part) as f64 / ONE_SEC as f64
+                (rate_part + burst_part) / ONE_SEC as f64
             ));
         }
         Ok(())
@@ -209,8 +211,10 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            limit_per_sec: 1000,
-            burst: 10,
+            limit: Limit {
+                rate: 1000.0,
+                burst: 10,
+            },
             alpha: 0.5,
             floor_factor: 0.1,
             cooldown: 5 * ONE_SEC,

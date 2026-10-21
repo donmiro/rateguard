@@ -8,7 +8,8 @@
 
 use std::hash::{BuildHasher, RandomState};
 
-use rateguard_core::gcra::{AtomicGcra, Quota};
+use rateguard_core::gcra::{AtomicGcra, Quota, ShadowGcra};
+use rateguard_core::limiter::Tally;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::sync::{AtomicU64, Ordering, fence};
@@ -19,9 +20,10 @@ const EMPTY: u64 = 0;
 const BUSY: u64 = u64::MAX;
 
 /// One key's state: its GCRA, the attempts and denials since the last tick,
-/// and its class. One cache line a slot, 64 bytes, as the README's memory
-/// bound (guarantee 4) counts: no two keys share a line, and there is room
-/// left for what may come.
+/// its class, and its class's shadow with the shadow's denials. One cache
+/// line a slot, exactly 64 bytes, as the README's memory bound (guarantee
+/// 4) counts: no two keys share a line, and the shadow's load on the
+/// request path is in the line the check has just read.
 #[derive(Debug)]
 #[repr(align(64))]
 pub(crate) struct Slot {
@@ -34,6 +36,12 @@ pub(crate) struct Slot {
     /// The hash of the key's class, 0 for the default; set by whoever takes
     /// the slot for the key, just after taking it.
     pub class: AtomicU64,
+    /// The key's class's shadow limit, scaled to this node's share; off
+    /// for a class with none, a key with a limit of its own, and a free
+    /// slot.
+    pub shadow: ShadowGcra,
+    /// Requests the shadow would have denied since the last tick.
+    shadow_denials: AtomicU64,
 }
 const ATTEMPT: u64 = 1;
 const DENIAL: u64 = 1 << 32;
@@ -44,6 +52,8 @@ impl Slot {
             gcra: AtomicGcra::new(quota),
             counts: AtomicU64::new(0),
             class: AtomicU64::new(0),
+            shadow: ShadowGcra::new(),
+            shadow_denials: AtomicU64::new(0),
         }
     }
 
@@ -58,17 +68,28 @@ impl Slot {
         self.counts.fetch_add(DENIAL, Ordering::Relaxed);
     }
 
-    /// Whether attempts or denials wait to be taken.
+    /// One more request the shadow would have denied, besides its attempt.
+    pub fn count_shadow_denial(&self) {
+        self.shadow_denials.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether attempts or denials wait to be taken. Shadow denials come
+    /// with an attempt, so attempts tell for them too.
     pub fn has_counts(&self) -> bool {
         self.counts.load(Ordering::Relaxed) != 0
     }
 
-    /// The attempts and denials counted since the last call, cleared.
-    pub fn take_counts(&self) -> (u64, u64) {
+    /// The attempts, denials and shadow denials counted since the last
+    /// call, cleared.
+    pub fn take_counts(&self) -> Tally {
         // Acquire: a slot's class, written before its first attempt, is
         // seen with it.
         let counts = self.counts.swap(0, Ordering::Acquire);
-        (counts & (DENIAL - 1), counts >> 32)
+        Tally {
+            attempts: counts & (DENIAL - 1),
+            denials: counts >> 32,
+            shadow_denials: self.shadow_denials.swap(0, Ordering::Relaxed),
+        }
     }
 }
 
@@ -275,7 +296,9 @@ impl KeyTable {
             return false;
         }
         slot.gcra.reset(quota);
+        slot.shadow.reset();
         slot.counts.store(0, Ordering::Relaxed);
+        slot.shadow_denials.store(0, Ordering::Relaxed);
         slot.class.store(0, Ordering::Relaxed);
         slot.key.store(EMPTY, Ordering::Release);
         true
@@ -344,8 +367,32 @@ mod tests {
         }
         slot.count_denial();
         slot.count_denial();
-        assert_eq!(slot.take_counts(), (5, 2));
-        assert_eq!(slot.take_counts(), (0, 0), "taking them clears them");
+        slot.count_shadow_denial();
+        assert_eq!(
+            slot.take_counts(),
+            Tally {
+                attempts: 5,
+                denials: 2,
+                shadow_denials: 1
+            }
+        );
+        assert_eq!(
+            slot.take_counts(),
+            Tally::default(),
+            "taking them clears them"
+        );
+    }
+
+    #[test]
+    fn a_released_slot_forgets_its_shadow() {
+        let t = KeyTable::new(1, q());
+        let slot = t.slot(1);
+        slot.shadow.set(Some(q()), 0);
+        slot.count_shadow_denial();
+        assert!(t.release(slot, 1, q()));
+        let next = t.slot(2);
+        assert_eq!(next.shadow.check(0), None);
+        assert_eq!(next.take_counts(), Tally::default());
     }
 
     #[test]
@@ -388,7 +435,7 @@ mod tests {
             "the freed slot is reused"
         );
         assert!(!next.gcra.has_debt(0));
-        assert_eq!(next.take_counts(), (0, 0));
+        assert_eq!(next.take_counts(), Tally::default());
     }
 
     #[test]
@@ -462,7 +509,7 @@ mod tests {
         });
         let mut seen = std::collections::HashMap::new();
         t.for_each(|key, slot| {
-            *seen.entry(key).or_insert(0) += slot.take_counts().0;
+            *seen.entry(key).or_insert(0) += slot.take_counts().attempts;
         });
         assert_eq!(seen.len(), 300, "one slot per key");
         let lost = 8 * 300 - seen.values().sum::<u64>();
@@ -519,6 +566,37 @@ mod loom_tests {
             let mut copies = 0;
             t.for_each(|key, _| copies += usize::from(key == 7));
             assert_eq!(copies, 1);
+        });
+    }
+
+    // The background task switches a slot's shadow on and off while a
+    // request checks it: the check must never unpack the 0 of "off", and
+    // the shadow ends as last set.
+    #[test]
+    fn a_shadow_set_while_checked_never_panics() {
+        loom::model(|| {
+            let t = loom::sync::Arc::new(KeyTable::new(1, q()));
+            t.slot(1);
+            let (a, b) = (t.clone(), t.clone());
+            let checks = loom::thread::spawn(move || {
+                let slot = a.slot(1);
+                for now in 0..2 {
+                    if let Some(rateguard_core::gcra::Decision::Deny { .. }) =
+                        slot.shadow.check(now)
+                    {
+                        slot.count_shadow_denial();
+                    }
+                }
+            });
+            let sets = loom::thread::spawn(move || {
+                let slot = b.slot(1);
+                slot.shadow.set(Some(Quota::new(1, 1)), 0);
+                slot.shadow.set(None, 1);
+                slot.shadow.set(Some(q()), 1);
+            });
+            checks.join().unwrap();
+            sets.join().unwrap();
+            assert!(t.slot(1).shadow.check(2).is_some(), "on, as last set");
         });
     }
 

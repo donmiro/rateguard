@@ -21,8 +21,10 @@ const LIMIT: f64 = 1000.0;
 /// rateguard's `Guard::builder().limit(1000)`, nothing else set.
 pub fn defaults() -> Config {
     Config {
-        limit_per_sec: 1000,
-        burst: 50,
+        limit: Limit {
+            rate: 1000.0,
+            burst: 50,
+        },
         alpha: 0.5,
         floor_factor: 0.05,
         cooldown: 5 * ONE_SEC,
@@ -301,7 +303,7 @@ fn limit_change(scenario: &'static str, expected: &'static str, from: u32, to: u
     let change = 20 * ONE_SEC;
     let run = 50 * ONE_SEC;
     let limit = |per_second: u32| Limit {
-        per_second,
+        rate: per_second as f64,
         burst: per_second / 20,
     };
     let mut s = Sim::new(NODES, defaults(), PerfectLink::new(ONE_MS));
@@ -318,6 +320,56 @@ fn limit_change(scenario: &'static str, expected: &'static str, from: u32, to: u
         &s,
         whole(change, change + 15 * ONE_SEC, run),
     )
+}
+
+/// The shadow line of the report: a shadow at R/5 next to a limit of R,
+/// against the same run with R/5 enforced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShadowLine {
+    /// Requests the shadow would have denied, a second over the steady
+    /// window.
+    pub shadow_denied: f64,
+    /// Requests denied with the shadow's limit enforced, a second over the
+    /// same window.
+    pub denied: f64,
+}
+
+/// Skewed demand on R = 1000 with a shadow at R/5, and the same with R/5
+/// enforced: the key is hot under either, so the shadow's share is the
+/// enforced one, scaled.
+pub fn shadow() -> ShadowLine {
+    let run = 40 * ONE_SEC;
+    let (from, until) = (20 * ONE_SEC, run);
+    let fifth = Limit {
+        rate: LIMIT / 5.0,
+        burst: (LIMIT / 5.0 / 20.0) as u32,
+    };
+    let in_window = |a: &&crate::sim::Admission| a.key == KEY && (from..until).contains(&a.at);
+    let secs = ((until - from) / ONE_SEC) as f64;
+
+    let mut shadowed = Sim::new(NODES, defaults(), PerfectLink::new(ONE_MS));
+    shadowed.remove_invariant("admission-window");
+    shadowed.set_shadow(KEY, Some(fifth));
+    streams(&mut shadowed, SKEWED, run);
+    shadowed.run_until(run);
+    let shadow_denied = shadowed.shadow_denials().iter().filter(in_window).count();
+
+    let mut enforced = Sim::new(NODES, defaults(), PerfectLink::new(ONE_MS));
+    enforced.remove_invariant("admission-window");
+    enforced.set_key_limit(KEY, fifth);
+    streams(&mut enforced, SKEWED, run);
+    enforced.run_until(run);
+    let denied = enforced
+        .admissions()
+        .iter()
+        .filter(in_window)
+        .filter(|a| a.decision != Decision::Allow)
+        .count();
+
+    ShadowLine {
+        shadow_denied: shadow_denied as f64 / secs,
+        denied: denied as f64 / secs,
+    }
 }
 
 /// Every scenario, measured.
@@ -398,6 +450,24 @@ pub fn rows() -> Vec<Row> {
             1000,
         ),
     ]
+}
+
+/// The whole report as the README holds it: the table of every scenario,
+/// then the shadow line.
+pub fn report() -> String {
+    format!("{}\n{}", markdown(&rows()), shadow_markdown(&shadow()))
+}
+
+/// The shadow line as the README's.
+pub fn shadow_markdown(line: &ShadowLine) -> String {
+    // Rounded to a tenth of a percent first, and `+ 0.0` turns a -0.0 into
+    // 0.0.
+    let off = ((line.shadow_denied / line.denied - 1.0) * 1000.0).round() / 10.0 + 0.0;
+    format!(
+        "Shadow at R/5, skewed demand on R: shadow denials vs. enforced, \
+         {:.1} vs. {:.1} a second ({off:+.1}%).\n",
+        line.shadow_denied, line.denied
+    )
 }
 
 /// The rows as the README's table.

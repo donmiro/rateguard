@@ -2,7 +2,7 @@ use proptest::prelude::*;
 use rateguard_core::demand::Demand;
 use rateguard_core::gcra::{Decision, Gcra, Nanos, Quota};
 use rateguard_core::hot_set::HotSet;
-use rateguard_core::limiter::{Config, Limiter};
+use rateguard_core::limiter::{Config, Limit, Limiter};
 
 const ONE_SEC: Nanos = 1_000_000_000;
 const THRESHOLD: f64 = 100.0;
@@ -112,8 +112,10 @@ proptest! {
     fn memory_is_bounded_by_config_not_by_key_cardinality(hot_set_size in 1usize..8, slack in 0usize..8, cluster_size in 1usize..64, ops in prop::collection::vec((0u64..5_000, 0u64..(ONE_SEC / 4)), 1..400)) {
         let max_tracked_keys = hot_set_size + slack;
         let mut l = Limiter::new(Config {
-            limit_per_sec: 1_000,
-            burst: 10,
+            limit: Limit {
+                rate: 1_000.0,
+                burst: 10,
+            },
             alpha: 0.5,
             floor_factor: 0.1,
             cooldown: 5 * ONE_SEC,

@@ -7,12 +7,14 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use rateguard_core::boundary::{Action, Event, PeerId};
+use rateguard_core::limiter::KeyRates;
 use rateguard_core::node::Node;
 use rateguard_proto::Address;
 use rateguard_proto::auth::{Auth, Rejected};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
+use crate::classes::{Resolved, shadow_quota};
 use crate::guard::Shared;
 use crate::stats::RejectedDatagrams;
 use crate::transport::Transport;
@@ -28,6 +30,16 @@ pub(crate) fn sender(bytes: &[u8]) -> Option<PeerId> {
         .map(|update| PeerId::new(update.member))
 }
 
+/// What a `Guard` asks of the background task, which alone owns the core.
+#[derive(Debug)]
+pub(crate) enum Query {
+    /// The rates of the key with this hash, if the core tracks it.
+    Key {
+        hash: u64,
+        reply: oneshot::Sender<Option<KeyRates>>,
+    },
+}
+
 /// Runs the node until it is asked to leave or the last `Guard` is gone,
 /// then leaves the cluster.
 pub(crate) async fn run<T: Transport>(
@@ -37,6 +49,7 @@ pub(crate) async fn run<T: Transport>(
     shared: Weak<Shared>,
     mut ticker: tokio::time::Interval,
     mut leave: mpsc::Receiver<oneshot::Sender<()>>,
+    mut queries: mpsc::Receiver<Query>,
 ) {
     let Some((epoch, mut auth)) = shared.upgrade().map(|shared| (shared.epoch, shared.auth()))
     else {
@@ -75,6 +88,16 @@ pub(crate) async fn run<T: Transport>(
             }
             found = names.next() => {
                 names.update(&mut node, found);
+                Vec::new()
+            }
+            // The branch is off once every sender is gone, which only
+            // happens with the last Guard.
+            Some(query) = queries.recv() => {
+                match query {
+                    Query::Key { hash, reply } => {
+                        let _ = reply.send(node.limiter().key_rates(hash));
+                    }
+                }
                 Vec::new()
             }
             // None: the last Guard is gone.
@@ -296,10 +319,11 @@ pub(crate) async fn watch(
 fn hold_at_floor(shared: &Shared, config: &rateguard_core::limiter::Config) {
     let n = shared.cluster_size.load(Ordering::Relaxed).max(1);
     let floor = |limit: rateguard_core::limiter::Limit| {
-        let rate = limit.per_second as f64 * config.floor_factor / n as f64;
+        let rate = limit.rate * config.floor_factor / n as f64;
         rateguard_core::gcra::Quota::per_second(rate, limit.burst)
     };
     let classes = shared.classes.snapshot();
+    let key_limits = shared.key_limits.snapshot();
     let strictest = floor(classes.strictest());
     // Keys not seen yet too: a slot taken from now on is sized from these.
     let factor = config.floor_factor / n as f64;
@@ -308,9 +332,12 @@ fn hold_at_floor(shared: &Shared, config: &rateguard_core::limiter::Config) {
         .store(factor.to_bits(), Ordering::Relaxed);
     shared.free_quota.store(strictest.pack(), Ordering::Relaxed);
     let now = shared.now();
-    shared.table.for_each(|_, slot| {
-        let (limit, _) = classes.lookup(slot.class.load(Ordering::Relaxed));
-        slot.gcra.set_quota(floor(limit), now);
+    shared.table.for_each(|key, slot| {
+        let Resolved { limit, shadow, .. } =
+            classes.resolve(&key_limits, slot.class.load(Ordering::Relaxed), key);
+        let quota = floor(limit);
+        slot.gcra.set_quota(quota, now);
+        slot.shadow.set(shadow_quota(quota, limit, shadow), now);
     });
     shared
         .table
@@ -322,27 +349,30 @@ fn hold_at_floor(shared: &Shared, config: &rateguard_core::limiter::Config) {
 fn sync(node: &mut Node, shared: &Arc<Shared>, rejected: RejectedDatagrams) -> Vec<Action> {
     let now = shared.now();
     let classes = shared.classes.snapshot();
+    let key_limits = shared.key_limits.snapshot();
     let mut counts = Counts {
         rejected,
         ..Counts::default()
     };
     shared.table.for_each(|key, slot| {
-        let (n, d) = slot.take_counts();
-        let (limit, known) = classes.lookup(slot.class.load(Ordering::Relaxed));
-        if n > 0 {
-            node.record(key, n, d, limit, now);
+        let tally = slot.take_counts();
+        let Resolved { limit, known, .. } =
+            classes.resolve(&key_limits, slot.class.load(Ordering::Relaxed), key);
+        if tally.attempts > 0 {
+            node.record(key, tally, limit, now);
         }
-        counts.attempts += n;
-        counts.denied += d;
+        counts.attempts += tally.attempts;
+        counts.denied += tally.denials;
+        counts.shadow_denied += tally.shadow_denials;
         if !known {
-            counts.unknown_class += n;
+            counts.unknown_class += tally.attempts;
         }
     });
-    // Not a key: counted, but no demand of anyone's.
-    let (overflowed, d) = shared.table.overflow().take_counts();
-    counts.attempts += overflowed;
-    counts.denied += d;
-    counts.overflowed = overflowed;
+    // Not a key: counted, but no demand of anyone's. It has no shadow.
+    let overflowed = shared.table.overflow().take_counts();
+    counts.attempts += overflowed.attempts;
+    counts.denied += overflowed.denials;
+    counts.overflowed = overflowed.attempts;
     let actions = node.handle(Event::Tick, now).to_vec();
     report(node, shared, counts);
 
@@ -359,14 +389,31 @@ fn sync(node: &mut Node, shared: &Arc<Shared>, rejected: RejectedDatagrams) -> V
     // One kept for its debt, or for a check since, gets what a new key of
     // its class gets now, as the core treats a key it does not track: left
     // alone, a key the core dropped would keep the quota it had then.
+    // Each shadow follows the quota just set, scaled; with no shadow in any
+    // class, the classes are not looked up again.
+    let shadows = classes.has_shadows();
+    let resolve = |key: u64, slot: &crate::table::Slot| {
+        classes.resolve(&key_limits, slot.class.load(Ordering::Relaxed), key)
+    };
     shared.table.for_each(|key, slot| match node.quota(key) {
-        Some(quota) => slot.gcra.set_quota(quota, now),
+        Some(quota) => {
+            slot.gcra.set_quota(quota, now);
+            let shadow = if shadows {
+                let Resolved { limit, shadow, .. } = resolve(key, slot);
+                shadow_quota(quota, limit, shadow)
+            } else {
+                None
+            };
+            slot.shadow.set(shadow, now);
+        }
         None if !slot.gcra.has_debt(now) && !slot.has_counts() => {
             shared.table.release(slot, key, new_key);
         }
         None => {
-            let (limit, _) = classes.lookup(slot.class.load(Ordering::Relaxed));
-            slot.gcra.set_quota(node.new_key_quota_in(limit), now);
+            let Resolved { limit, shadow, .. } = resolve(key, slot);
+            let quota = node.new_key_quota_in(limit);
+            slot.gcra.set_quota(quota, now);
+            slot.shadow.set(shadow_quota(quota, limit, shadow), now);
         }
     });
     shared
@@ -386,6 +433,7 @@ struct Counts {
     denied: u64,
     overflowed: u64,
     unknown_class: u64,
+    shadow_denied: u64,
     /// Datagrams refused since the last tick.
     rejected: RejectedDatagrams,
 }
@@ -410,18 +458,23 @@ fn report(node: &Node, shared: &Shared, counts: Counts) {
     stats.denied += counts.denied;
     stats.overflowed += counts.overflowed;
     stats.unknown_class += counts.unknown_class;
+    stats.shadow_denied += counts.shadow_denied;
     let rejected = &mut stats.rejected_datagrams;
     rejected.unsigned += counts.rejected.unsigned;
     rejected.bad_tag += counts.rejected.bad_tag;
     rejected.malformed += counts.rejected.malformed;
-    stats.most_denied = node
-        .most_denied(10)
-        .into_iter()
-        .map(|(key_hash, denied_per_sec)| crate::stats::DeniedKey {
-            key_hash,
-            denied_per_sec,
-        })
-        .collect();
+    let listed = |keys: Vec<(u64, KeyRates)>| -> Vec<crate::stats::DeniedKey> {
+        keys.into_iter()
+            .map(|(key_hash, rates)| crate::stats::DeniedKey {
+                key_hash,
+                denied_per_sec: rates.denied_per_sec,
+                requests_per_sec: rates.requests_per_sec,
+                shadow_denied_per_sec: rates.shadow_denied_per_sec,
+            })
+            .collect()
+    };
+    stats.most_denied = listed(node.most_denied(shared.most_denied));
+    stats.most_shadow_denied = listed(node.most_shadow_denied(shared.most_denied));
     stats.cluster_size = node.cluster_size();
     stats.counted_size = node.counted_size();
     stats.suspects = suspects;
@@ -532,12 +585,14 @@ mod tests {
     // transport they must cost the node one tick, not three.
     #[tokio::test(start_paused = true)]
     async fn a_hung_transport_costs_one_budget_per_batch() {
-        use rateguard_core::limiter::Config;
+        use rateguard_core::limiter::{Config, Limit};
         use rateguard_core::node::SwimConfig;
 
         let config = Config {
-            limit_per_sec: 100,
-            burst: 5,
+            limit: Limit {
+                rate: 100.0,
+                burst: 5,
+            },
             alpha: 0.5,
             floor_factor: 0.05,
             cooldown: 5_000_000_000,
@@ -567,7 +622,12 @@ mod tests {
     // hand: no background task to tick it meanwhile.
     fn shared_for(node: &Node) -> Arc<Shared> {
         let default = crate::Limit::per_second(100).burst(5).to_core().unwrap();
-        let classes = crate::classes::Classes::new(default, Vec::new(), 16);
+        let classes = crate::classes::Classes::new(
+            crate::Limit::per_second(100).burst(5),
+            default,
+            Vec::new(),
+            16,
+        );
         let free = node.new_key_quota_in(classes.snapshot().strictest());
         Arc::new(Shared {
             table: crate::table::KeyTable::new(8, free),
@@ -575,9 +635,12 @@ mod tests {
             epoch: tokio::time::Instant::now(),
             running: std::sync::atomic::AtomicBool::new(true),
             leave: mpsc::channel(1).0,
+            queries: mpsc::channel(1).0,
+            most_denied: 10,
             dry_run: Default::default(),
             report: Default::default(),
             classes,
+            key_limits: crate::key_limits::KeyLimits::new(16),
             fresh_factor: std::sync::atomic::AtomicU64::new(node.new_key_factor().to_bits()),
             free_quota: std::sync::atomic::AtomicU64::new(free.pack()),
             auth: std::sync::RwLock::new(Arc::new(Auth::off())),
@@ -612,12 +675,14 @@ mod tests {
     }
 
     fn node_at(host: u8) -> Node {
-        use rateguard_core::limiter::Config;
+        use rateguard_core::limiter::{Config, Limit};
         use rateguard_core::node::SwimConfig;
 
         let config = Config {
-            limit_per_sec: 100,
-            burst: 5,
+            limit: Limit {
+                rate: 100.0,
+                burst: 5,
+            },
             alpha: 0.5,
             floor_factor: 0.05,
             cooldown: 5_000_000_000,

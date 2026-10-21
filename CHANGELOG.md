@@ -7,6 +7,101 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-21
+
+Limits per minute and per hour, limits for single keys, shadow limits for
+classes, and counters per key. The wire format is unchanged: nodes of 0.6
+and 0.7 run side by side, but a node of 0.6 knows no key limits or shadows,
+so in a mixed cluster an exception reaches the share of the nodes of 0.7
+only. That is a transition, not a mode to run in.
+
+### Added
+
+- `Limit::per_minute` and `Limit::per_hour`, and `count()`, `period()` and
+  `rate_per_sec()` to read a limit back. A `Limit` keeps what it was given:
+  `per_minute(60)` and `per_second(1)` admit the same but are not `==`.
+  A limit per minute is not a fixed window: GCRA smooths it, so 1000 a
+  minute is about 16.7 a second plus the burst, and the burst is per
+  instance, so a fleet of N admits up to N times it back to back.
+- `Builder::default_limit(Limit)`: the default class at any period.
+  `Builder::limit(rps)` stays.
+- Limits for single keys: `KeyLimit`, either a `Limit` of its own or
+  `KeyLimit::class(name)`, a class followed by name;
+  `Guard::set_key_limit`, `set_key_limits` (all or nothing),
+  `remove_key_limit` and `key_limits`. The key keeps its hash and its debt,
+  so a change gives no fresh burst; while it has not reached every node the
+  fleet admits at most the higher of the two limits. `Builder::max_key_limits`
+  (4096 by default, at most 2^20), `Error::TooManyKeyLimits` for a table
+  that is full and `Error::TooLargeMaxKeyLimits` for a bound over 2^20.
+  A big set goes in with `set_key_limits`: each `set_key_limit` copies the
+  table.
+- Shadow limits for classes: `Guard::set_shadow`, `set_shadows` and
+  `shadows`. Every attempt of a key with a slot of its own is also run
+  through its class's shadow, the ones the real limit denied too (keys in
+  the overflow slot have none); the shadow decides nothing and counts
+  what it would have denied. It errs on the strict side: it counts at least
+  the denials that enforcing the limit would give. `Error::UnknownClass`
+  for a class that does not exist. `Stats::shadow_denied` and, with
+  `metrics`, `rateguard_shadow_denied_total`.
+- `Guard::check_traced` and `check_in_traced`: a `Checked` of the
+  `decision` and the shadow's. They decide as `check` does.
+- Counters per key: `DeniedKey` has `requests_per_sec` and
+  `shadow_denied_per_sec`, all its rates over the same ten seconds or so,
+  a new key's rates so far; the lists rank keys by their plain average,
+  so a key denied once just now ranks below one denied as often for ten
+  seconds; `Stats::most_shadow_denied`; `Builder::most_denied(k)` sets the
+  length of both lists (10 by default, at most 1024,
+  `Error::TooManyMostDenied`);
+  `Guard::key_stats(class, key)`, an `async fn`, gives one key's
+  `KeyStats`, or `None` if the node keeps no state for it.
+- `rateguard-core`: `Tally`, `KeyRates`, `ShadowGcra` and
+  `Node::check_in_traced`.
+- `rateguard-sidecar`: a limit in JSON has exactly one of `per_second`,
+  `per_minute` and `per_hour`, with an optional `burst`; `--limit 1000/min`
+  and `--class name=5000/h/10`. `PUT /v1/key_limits`, `PUT /v1/shadows`,
+  `GET /v1/keys?class=&key=` for one key, on loopback only. `/v1/stats` has
+  `shadow_denied` and `most_shadow_denied`, named like `most_denied`, whose
+  entries have the new rates. `--most-denied` (`RATEGUARD_MOST_DENIED`).
+
+### Changed
+
+- **Breaking**, `rateguard-core`: `limiter::Limit::per_second: u32` is
+  `rate: f64`, requests per second; `limiter::Config` has `limit: Limit` in
+  place of `limit_per_sec` and `burst`; `Node::record` takes a `Tally`,
+  with the shadow denials, and `Limit`, in place of the counts, and so does
+  `Limiter::record`; `Limiter::most_denied` and `Node::most_denied` return
+  `Vec<(u64, KeyRates)>`, where they returned the denials a second;
+  `limiter::Limit` is no longer `Eq`, its rate being an `f64`; the method
+  `limiter::Config::limit()` is gone, `limit` being a field.
+- **Breaking**, `rateguard-core`: a quota keeps its interval with a unit
+  (40 bits and two of unit), so the slowest it holds is about a request in
+  34 years, where it held 18 minutes; for that, `gcra::MAX_BURST` is
+  4,194,303, where it was 16,777,215.
+- **Breaking**, `rateguard`: a burst over 4,194,303, which 0.6 took, is
+  `Error::TooLargeBurst`, from `Builder::spawn`, `set_class` and the
+  other setters of a limit.
+- `Limit::rate()` is deprecated: it rounds a slow rate up to a whole number.
+  Use `rate_per_sec()`.
+- A key's tally in a slot has room for a shadow: its slot is still 64 bytes.
+  What the 0.4 slot kept in reserve for `check_n` went to the shadow.
+- `rateguard-sidecar`: `/v1/stats` and `Args` take the new fields, and
+  `Args::limit` is a `LimitSpec { limit, has_burst }`, where it was a
+  `u32`; the 0.6 forms of flags and bodies are read as before.
+
+### Fixed
+
+- A rate so slow that its interval did not fit the quota, such as
+  `per_hour(1)` on 40 nodes at the floor, was held *looser* than asked: the
+  interval was cut, and the docs said the opposite. Slow rates are now held
+  exactly, and the docs of `Quota` say what is cut, past 34 years.
+- The theoretical arrival time of a key at a very slow rate could overflow
+  `max(tat, now) + t`; it saturates now, in `Gcra::check` and
+  `AtomicGcra::check`. A burst so long at so slow a rate that
+  `interval × (burst − 1)` passes 292 years is cut short there, stricter,
+  where it would have let every request through. `rateguard-core` refuses
+  a limit whose rate is not finite or not above zero, with a panic as it
+  does a zero burst.
+
 ## [0.6.0] - 2026-10-20
 
 Signed gossip and salted keys. Without a secret the wire format is
@@ -291,7 +386,8 @@ The first release.
 - A runnable `axum` middleware example.
 - An accuracy report in the README, generated by the simulator.
 
-[Unreleased]: https://github.com/donmiro/rateguard/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/donmiro/rateguard/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/donmiro/rateguard/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/donmiro/rateguard/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/donmiro/rateguard/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/donmiro/rateguard/compare/v0.4.0...v0.5.0

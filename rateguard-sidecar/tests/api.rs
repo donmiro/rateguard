@@ -409,3 +409,258 @@ async fn metrics_are_served_with_an_exporter_on_both_routers() {
         assert_eq!(send(&router, "GET", "/metrics", None).await.0, 200);
     }
 }
+
+#[tokio::test]
+async fn limits_take_a_period() {
+    let guard = guard();
+    let router = router(&guard, true);
+    let put = |body: Value| send(&router, "PUT", "/v1/classes", Some(body));
+    assert_eq!(put(json!({"m": {"per_minute": 600}})).await.0, 204);
+    assert_eq!(guard.classes(), [("m".to_owned(), Limit::per_minute(600))]);
+    assert_eq!(send(&router, "GET", "/v1/stats", None).await.0, 200);
+    assert_eq!(put(json!({"h": {"per_hour": 5, "burst": 2}})).await.0, 204);
+    for bad in [
+        json!({"m": {"per_second": 1, "per_minute": 60}}),
+        json!({"m": {}}),
+        json!({"m": {"per_hour": 0}}),
+        json!({"m": {"burst": 5}}),
+        json!({"m": {"per_minute": -1}}),
+        json!({"m": 5}),
+    ] {
+        let (status, body) = put(bad.clone()).await;
+        assert_eq!(status, 400, "{bad}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+    assert_eq!(
+        put(json!({"pro": {"per_second": 1000, "burst": 50}}))
+            .await
+            .0,
+        204
+    );
+    let (status, _) = send(&router, "PUT", "/v1/limit", Some(json!({"per_hour": 100}))).await;
+    assert_eq!(status, 204);
+}
+
+#[tokio::test]
+async fn key_limits_route_replaces_all() {
+    let guard = guard();
+    let router = router(&guard, true);
+    let body = json!([
+        {"class": "pro", "key": "tenant:42", "limit": {"per_minute": 600, "burst": 20}},
+        {"class": "free", "key": "tenant:7", "as_class": "pro"},
+        {"key": "tenant:1", "limit": {"per_second": 9}},
+    ]);
+    assert_eq!(
+        send(&router, "PUT", "/v1/key_limits", Some(body)).await.0,
+        204
+    );
+    assert_eq!(guard.key_limits().len(), 3);
+    // Replaces all, and all or nothing: a bad entry leaves the table as it was.
+    let replace = json!([{"class": "pro", "key": "only", "limit": {"per_second": 3}}]);
+    assert_eq!(
+        send(&router, "PUT", "/v1/key_limits", Some(replace))
+            .await
+            .0,
+        204
+    );
+    let keys: Vec<_> = guard.key_limits().into_iter().map(|(_, k, _)| k).collect();
+    assert_eq!(keys, ["only"]);
+    let bad = json!([{"key": "x", "limit": {"per_second": 0}}]);
+    let (status, body) = send(&router, "PUT", "/v1/key_limits", Some(bad)).await;
+    assert_eq!(status, 400);
+    assert!(body["error"].is_string(), "{body}");
+    assert_eq!(guard.key_limits().len(), 1);
+    // An empty list clears.
+    assert_eq!(
+        send(&router, "PUT", "/v1/key_limits", Some(json!([])))
+            .await
+            .0,
+        204
+    );
+    assert!(guard.key_limits().is_empty());
+}
+
+#[tokio::test]
+async fn key_limits_route_refuses_both_limit_and_as_class() {
+    let guard = guard();
+    let router = router(&guard, true);
+    for bad in [
+        json!([{"key": "k", "limit": {"per_second": 1}, "as_class": "pro"}]),
+        json!([{"key": "k"}]),
+        json!({"key": "k"}),
+    ] {
+        let (status, body) = send(&router, "PUT", "/v1/key_limits", Some(bad.clone())).await;
+        assert_eq!(status, 400, "{bad}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+    assert!(guard.key_limits().is_empty());
+}
+
+#[tokio::test]
+async fn shadows_route_sets_and_clears() {
+    let guard = guard();
+    let router = router(&guard, true);
+    let body = json!({"pro": {"per_second": 10}, "": {"per_minute": 60}});
+    assert_eq!(send(&router, "PUT", "/v1/shadows", Some(body)).await.0, 204);
+    let mut shadows = guard.shadows();
+    shadows.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        shadows,
+        [
+            (String::new(), Limit::per_minute(60)),
+            ("pro".to_owned(), Limit::per_second(10)),
+        ]
+    );
+    // A null, or a class left out, is no shadow for it.
+    let body = json!({"pro": {"per_second": 5}, "": null});
+    assert_eq!(send(&router, "PUT", "/v1/shadows", Some(body)).await.0, 204);
+    assert_eq!(guard.shadows(), [("pro".to_owned(), Limit::per_second(5))]);
+    assert_eq!(
+        send(&router, "PUT", "/v1/shadows", Some(json!({}))).await.0,
+        204
+    );
+    assert!(guard.shadows().is_empty());
+    // A class that does not exist, and a limit that is not one.
+    let (status, body) = send(
+        &router,
+        "PUT",
+        "/v1/shadows",
+        Some(json!({"nope": {"per_second": 5}})),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(body["error"].is_string(), "{body}");
+    let bad = json!({"pro": {"per_second": 5, "per_hour": 1}});
+    assert_eq!(send(&router, "PUT", "/v1/shadows", Some(bad)).await.0, 400);
+}
+
+// Checks `key` of "pro", then polls `/v1/keys` until the node tracks it.
+async fn tracked(router: &Router, key: &str) -> Value {
+    check(router, json!({"key": key, "class": "pro"})).await;
+    let uri = format!("/v1/keys?key={key}&class=pro");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = send(router, "GET", &uri, None).await;
+        if status == 200 {
+            return body;
+        }
+        assert_eq!(status, 404, "{body}");
+        assert!(tokio::time::Instant::now() < deadline, "never tracked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn keys_route_names_a_tracked_key() {
+    let guard = guard();
+    let router = router(&guard, true);
+    let put = json!([
+        {"class": "pro", "key": "own", "limit": {"per_minute": 600, "burst": 20}},
+        {"class": "pro", "key": "follows", "as_class": "pro"},
+    ]);
+    assert_eq!(
+        send(&router, "PUT", "/v1/key_limits", Some(put)).await.0,
+        204
+    );
+    let shadows = json!({"pro": {"per_second": 7}});
+    assert_eq!(
+        send(&router, "PUT", "/v1/shadows", Some(shadows)).await.0,
+        204
+    );
+    let body = tracked(&router, "own").await;
+    assert_eq!(
+        body["limit"],
+        json!({"per_minute": 600, "burst": 20}),
+        "{body}"
+    );
+    // A limit of its own keeps a key out of the class's shadow.
+    assert_eq!(body["shadow"], Value::Null, "{body}");
+    for field in [
+        "requests_per_sec",
+        "denied_per_sec",
+        "shadow_denied_per_sec",
+        "share",
+    ] {
+        assert!(body[field].is_f64(), "{field}: {body}");
+    }
+    let body = tracked(&router, "follows").await;
+    assert_eq!(
+        body["limit"],
+        json!({"per_second": 10, "burst": 5}),
+        "{body}"
+    );
+    assert_eq!(body["shadow"]["per_second"], 7, "{body}");
+}
+
+#[tokio::test]
+async fn keys_route_404s_an_untracked_key() {
+    let guard = guard();
+    let router = router(&guard, false);
+    let (status, body) = send(&router, "GET", "/v1/keys?key=nobody", None).await;
+    assert_eq!(status, 404);
+    assert!(body["error"].is_string(), "{body}");
+    // No key at all is a bad request.
+    assert_eq!(send(&router, "GET", "/v1/keys", None).await.0, 400);
+}
+
+#[tokio::test]
+async fn keys_route_is_not_on_the_metrics_listener() {
+    let guard = guard();
+    let public = public_app(App::new(guard.clone(), true, None));
+    assert_eq!(send(&public, "GET", "/v1/keys?key=k", None).await.0, 404);
+    assert_eq!(
+        send(&public, "PUT", "/v1/key_limits", Some(json!([])))
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        send(&public, "PUT", "/v1/shadows", Some(json!({}))).await.0,
+        404
+    );
+}
+
+#[tokio::test]
+async fn admin_routes_are_absent_without_admin() {
+    let guard = guard();
+    let router = router(&guard, false);
+    assert_eq!(
+        send(&router, "PUT", "/v1/key_limits", Some(json!([])))
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        send(&router, "PUT", "/v1/shadows", Some(json!({}))).await.0,
+        404
+    );
+}
+
+#[tokio::test]
+async fn stats_names_the_shadow_denied_keys() {
+    let guard = guard();
+    let router = router(&guard, true);
+    // The default class's shadow, tighter than its limit's burst of 3.
+    let body = json!({"": {"per_second": 1}});
+    assert_eq!(send(&router, "PUT", "/v1/shadows", Some(body)).await.0, 204);
+    for _ in 0..10 {
+        check(&router, json!({"key": "tenant:9"})).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, stats) = send(&router, "GET", "/v1/stats", None).await;
+        if let Some(entry) = stats["most_shadow_denied"].as_array().unwrap().first() {
+            assert_eq!(entry["key"], "tenant:9", "{stats}");
+            assert_eq!(entry["class"], "", "{stats}");
+            assert!(
+                entry["shadow_denied_per_sec"].as_f64().unwrap() > 0.0,
+                "{stats}"
+            );
+            assert!(entry["requests_per_sec"].is_f64(), "{stats}");
+            assert!(stats["shadow_denied"].as_u64().unwrap() > 0, "{stats}");
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{stats}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

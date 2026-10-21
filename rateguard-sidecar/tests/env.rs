@@ -47,6 +47,9 @@ fn switches_take_the_usual_ways_of_saying_yes_and_no() {
     assert_eq!(args.classes.len(), 2);
     assert_eq!(args.drain.0, std::time::Duration::from_secs(3));
 
+    let args = with(&[("RATEGUARD_LIMIT", "10"), ("RATEGUARD_MOST_DENIED", "40")]).unwrap();
+    assert_eq!(args.most_denied, Some(40));
+
     // Paths only: a secret's value is never a flag or a variable, so that
     // `ps` and /proc/*/cmdline do not show it.
     let args = with(&[

@@ -21,6 +21,9 @@ const ONE_SEC: u64 = 1_000_000_000;
 /// The most keys one node keeps state for: a table of 2²¹ slots, 64 MB.
 const MAX_TRACKED_KEYS: usize = 1 << 20;
 
+/// The longest list of the keys denied most.
+const MAX_MOST_DENIED: usize = 1024;
+
 /// A duration in nanoseconds, the longest ones held at `u64::MAX` (584
 /// years) rather than cut down to whatever their low bits say.
 fn nanos(duration: Duration) -> u64 {
@@ -67,7 +70,7 @@ pub struct Builder {
     bind: Option<String>,
     advertise: Option<String>,
     seeds: Vec<String>,
-    limit: Option<u32>,
+    limit: Option<crate::Limit>,
     burst: Option<u32>,
     policy: Option<PartitionPolicy>,
     quorum_memory: Option<Duration>,
@@ -77,6 +80,8 @@ pub struct Builder {
     dry_run: bool,
     classes: Vec<(String, crate::Limit)>,
     max_classes: Option<usize>,
+    max_key_limits: Option<usize>,
+    most_denied: Option<usize>,
     // Secret's Debug shows none of its bytes, so the derived Debug of the
     // builder shows none either.
     gossip_auth: GossipAuth,
@@ -122,14 +127,25 @@ impl Builder {
         self
     }
 
-    /// Requests per second per key, across the whole cluster.
-    pub fn limit(mut self, per_sec: u32) -> Self {
-        self.limit = Some(per_sec);
+    /// Requests per second per key, across the whole cluster: the same as
+    /// [`default_limit`](Builder::default_limit) with
+    /// [`Limit::per_second`](crate::Limit::per_second).
+    pub fn limit(self, per_sec: u32) -> Self {
+        self.default_limit(crate::Limit::per_second(per_sec))
+    }
+
+    /// The limit of every key in no class, in any form: per second, minute
+    /// or hour. The last of [`limit`](Builder::limit) and this wins.
+    pub fn default_limit(mut self, limit: crate::Limit) -> Self {
+        self.limit = Some(limit);
         self
     }
 
-    /// How many requests a key may get back to back on one node. Defaults
-    /// to `limit / 20`, and never less than 1.
+    /// How many requests a key may get back to back on one node, whichever
+    /// of [`limit`](Builder::limit) and [`default_limit`](Builder::default_limit)
+    /// set the limit, and in whatever order: it is applied on top of the
+    /// limit's own burst. Defaults to a twentieth of the count, and never
+    /// less than 1.
     pub fn burst(mut self, burst: u32) -> Self {
         self.burst = Some(burst);
         self
@@ -190,6 +206,16 @@ impl Builder {
         self
     }
 
+    /// The most key limits the node keeps, see
+    /// [`Guard::set_key_limit`](crate::Guard::set_key_limit); defaults to
+    /// 4096, at most 1048576 ([`Error::TooLargeMaxKeyLimits`] over that).
+    /// Each is two short strings and a limit, so the default is some half
+    /// a megabyte.
+    pub fn max_key_limits(mut self, n: usize) -> Self {
+        self.max_key_limits = Some(n);
+        self
+    }
+
     /// Signs the gossip with a secret every node of the cluster shares, so
     /// that under [`GossipAuth::Required`] a node holding none can neither
     /// join nor speak for its members: how in `mode`, with `secrets`, at
@@ -236,6 +262,16 @@ impl Builder {
     pub fn key_salt(mut self, salt: impl Into<Vec<u8>>) -> Self {
         let salt = salt.into();
         self.salt = Some(KeySalt::new(&salt).map_err(|_| salt.len()));
+        self
+    }
+
+    /// How many keys [`Stats::most_denied`](crate::Stats::most_denied) and
+    /// [`Stats::most_shadow_denied`](crate::Stats::most_shadow_denied) list:
+    /// 10 unless set, 0 for none. At most 1024, or [`Error::TooManyMostDenied`]
+    /// when the node starts. The lists are made once a tick over every
+    /// tracked key, whatever their length.
+    pub fn most_denied(mut self, k: usize) -> Self {
+        self.most_denied = Some(k);
         self
     }
 
@@ -311,15 +347,12 @@ impl Builder {
             }
         }
 
-        let limit = self.limit.ok_or(Error::MissingLimit)?;
-        if limit == 0 {
-            return Err(Error::ZeroLimit);
+        let mut limit = self.limit.ok_or(Error::MissingLimit)?;
+        if let Some(burst) = self.burst {
+            limit = limit.burst(burst);
         }
-        let burst = match self.burst {
-            Some(burst) if burst > MAX_BURST => return Err(Error::TooLargeBurst(burst)),
-            Some(burst) => burst.max(1),
-            None => crate::Limit::per_second(limit).burst_size(),
-        };
+        let default_limit = limit;
+        let limit = limit.to_core()?;
         let hot_keys = self.hot_keys.unwrap_or(rateguard_proto::MAX_DEMAND_KEYS);
         if hot_keys == 0 || hot_keys > rateguard_proto::MAX_DEMAND_KEYS {
             return Err(Error::TooManyHotKeys(hot_keys));
@@ -336,6 +369,14 @@ impl Builder {
             return Err(Error::TooManyClasses(max_classes));
         }
         let classes = crate::classes::checked(self.classes.clone(), max_classes)?;
+        let max_key_limits = self.max_key_limits.unwrap_or(4096);
+        if max_key_limits > crate::key_limits::MAX_KEY_LIMITS {
+            return Err(Error::TooLargeMaxKeyLimits(max_key_limits));
+        }
+        let most_denied = self.most_denied.unwrap_or(10);
+        if most_denied > MAX_MOST_DENIED {
+            return Err(Error::TooManyMostDenied(most_denied));
+        }
         let period = nanos(self.period.unwrap_or(Duration::from_millis(200)));
         if period / 4 == 0 {
             return Err(Error::ZeroPeriod);
@@ -344,8 +385,7 @@ impl Builder {
         let salt = self.salt.clone().transpose().map_err(Error::ShortSalt)?;
 
         let core = Config {
-            limit_per_sec: limit,
-            burst,
+            limit,
             alpha: ALPHA,
             floor_factor: BETA,
             cooldown: 5 * ONE_SEC,
@@ -377,6 +417,9 @@ impl Builder {
             dry_run: self.dry_run,
             classes,
             max_classes,
+            max_key_limits,
+            most_denied,
+            default_limit,
             auth,
             salt,
         })
@@ -437,8 +480,12 @@ fn start<T: crate::Transport>(
     }
 
     let (leave, leaving) = tokio::sync::mpsc::channel(1);
+    // Bounded: a flood of questions waits its turn, one tick's work at most
+    // each, rather than grow without limit.
+    let (queries, questions) = tokio::sync::mpsc::channel(64);
     let classes = crate::classes::Classes::new(
-        settings.core.limit(),
+        settings.default_limit,
+        settings.core.limit,
         settings.classes,
         settings.max_classes,
     );
@@ -451,9 +498,12 @@ fn start<T: crate::Transport>(
         epoch: tokio::time::Instant::now(),
         running: AtomicBool::new(true),
         leave,
+        queries,
+        most_denied: settings.most_denied,
         dry_run: AtomicBool::new(settings.dry_run),
         report: Default::default(),
         classes,
+        key_limits: crate::key_limits::KeyLimits::new(settings.max_key_limits),
         fresh_factor: std::sync::atomic::AtomicU64::new(node.new_key_factor().to_bits()),
         free_quota: std::sync::atomic::AtomicU64::new(free_quota.pack()),
         auth: std::sync::RwLock::new(Arc::new(settings.auth)),
@@ -480,6 +530,7 @@ fn start<T: crate::Transport>(
         Arc::downgrade(&shared),
         ticker,
         leaving,
+        questions,
     ));
     tokio::spawn(crate::driver::watch(
         task,
@@ -534,8 +585,13 @@ pub(crate) struct Settings {
     pub quorum_memory: u64,
     pub dry_run: bool,
     /// The named classes, checked.
-    pub classes: Vec<(String, rateguard_core::limiter::Limit)>,
+    pub classes: Vec<(String, crate::Limit, rateguard_core::limiter::Limit)>,
     pub max_classes: usize,
+    pub max_key_limits: usize,
+    /// How long the lists of the keys denied most are.
+    pub most_denied: usize,
+    /// The default limit as given, for reading back.
+    pub default_limit: crate::Limit,
     /// How the gossip is signed and checked.
     pub auth: Auth,
     /// The salt of the key hashes, if any.
@@ -564,7 +620,7 @@ pub enum Error {
     BadSeed(String),
     /// More hot keys than the 64 one datagram can report.
     TooManyHotKeys(usize),
-    /// A burst over the 16,777,215 a quota holds.
+    /// A burst over the 4,194,303 a quota holds.
     TooLargeBurst(u32),
     /// Fewer tracked keys than hot keys: a hot key is always tracked.
     TooFewTrackedKeys,
@@ -587,6 +643,12 @@ pub enum Error {
     /// More classes than [`Builder::max_classes`] allows, or a
     /// `max_classes` over 4096.
     TooManyClasses(usize),
+    /// More key limits than the [`Builder::max_key_limits`] of this many.
+    TooManyKeyLimits(usize),
+    /// A [`Builder::max_key_limits`] over the 1,048,576 a node keeps.
+    TooLargeMaxKeyLimits(usize),
+    /// A [`Builder::most_denied`] over 1024.
+    TooManyMostDenied(usize),
     /// The mode or the secrets of
     /// [`Builder::gossip_auth`] or
     /// [`Guard::set_gossip_auth`](crate::Guard::set_gossip_auth) refused.
@@ -594,6 +656,9 @@ pub enum Error {
     /// A [`Builder::key_salt`] of this many bytes, fewer than the 16 a
     /// salt takes.
     ShortSalt(usize),
+    /// A shadow for a class this node does not have: see
+    /// [`Guard::set_shadow`](crate::Guard::set_shadow).
+    UnknownClass(String),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -638,12 +703,22 @@ impl fmt::Display for Error {
                 "more classes than {n}, or more than {} allowed",
                 crate::classes::MAX_CLASSES
             ),
+            Error::TooManyKeyLimits(n) => write!(f, "more than {n} key limits"),
+            Error::TooLargeMaxKeyLimits(n) => write!(
+                f,
+                "max_key_limits of {n}, at most {}",
+                crate::key_limits::MAX_KEY_LIMITS
+            ),
+            Error::TooManyMostDenied(n) => {
+                write!(f, "{n} most denied keys, at most {MAX_MOST_DENIED}")
+            }
             Error::GossipAuth(error) => fmt::Display::fmt(error, f),
             Error::ShortSalt(n) => write!(
                 f,
                 "a key salt of {n} bytes, at least {} are needed",
                 KeySalt::MIN_LEN
             ),
+            Error::UnknownClass(name) => write!(f, "no class named {name:?}"),
         }
     }
 }
@@ -694,6 +769,25 @@ mod tests {
         assert!(!debug.contains("104,\n"), "{debug}");
     }
 
+    // Two errors, not one: a table that is full, and a bound on it that no
+    // node could hold.
+    #[test]
+    fn too_many_key_limits_and_too_large_a_bound_read_apart() {
+        assert_eq!(
+            Error::TooManyKeyLimits(2).to_string(),
+            "more than 2 key limits"
+        );
+        assert_eq!(
+            Error::TooLargeMaxKeyLimits(1 << 21).to_string(),
+            "max_key_limits of 2097152, at most 1048576"
+        );
+        assert!(matches!(
+            valid().max_key_limits((1 << 20) + 1).settings(),
+            Err(Error::TooLargeMaxKeyLimits(n)) if n == (1 << 20) + 1
+        ));
+        assert!(valid().max_key_limits(1 << 20).settings().is_ok());
+    }
+
     #[test]
     fn gossip_is_unsigned_unless_asked() {
         assert_eq!(valid().settings().unwrap().auth.mode(), GossipAuth::Off);
@@ -718,7 +812,7 @@ mod tests {
             "10.0.0.1:7946".parse().unwrap(),
             "the bind address"
         );
-        assert_eq!(s.core.burst, 50, "limit / 20");
+        assert_eq!(s.core.limit.burst, 50, "limit / 20");
         assert_eq!(s.core.hot_set_size, 64);
         assert_eq!(s.core.max_tracked_keys, 4096);
         assert_eq!((s.core.alpha, s.core.floor_factor), (0.5, 0.05));
@@ -733,7 +827,7 @@ mod tests {
             .limit(u32::MAX)
             .settings()
             .unwrap();
-        assert_eq!(s.core.burst, rateguard_core::gcra::MAX_BURST);
+        assert_eq!(s.core.limit.burst, rateguard_core::gcra::MAX_BURST);
     }
 
     #[test]
@@ -763,7 +857,7 @@ mod tests {
             .limit(7)
             .settings()
             .unwrap();
-        assert_eq!(s.core.burst, 1);
+        assert_eq!(s.core.limit.burst, 1);
     }
 
     #[test]

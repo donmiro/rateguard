@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use rateguard::{GossipAuth, Guard, Limit, PartitionPolicy};
-use rateguard_sidecar::args::{Args, ClassSpec, Policy};
+use rateguard_sidecar::args::{Args, ClassSpec, LimitSpec, Policy};
 
 fn parse(flags: &[&str]) -> Result<Args, clap::Error> {
     Args::try_parse_from(std::iter::once("rateguard-sidecar").chain(flags.iter().copied()))
@@ -55,6 +55,65 @@ fn the_defaults_listen_on_loopback_and_gossip_on_7946() {
     assert_eq!(args.bind, "0.0.0.0:7946");
     assert!(!args.admin && !args.dry_run);
     assert_eq!(args.metrics_listen, None);
+}
+
+#[test]
+fn a_limit_takes_a_unit() {
+    let args = parse(&["--limit", "1000/min"]).unwrap();
+    assert_eq!(args.limit.limit, Limit::per_minute(1000));
+    assert!(!args.limit.has_burst);
+    let args = parse(&["--limit", "5000/h/10"]).unwrap();
+    assert_eq!(args.limit.limit, Limit::per_hour(5000).burst(10));
+    assert!(args.limit.has_burst);
+    assert_eq!(
+        parse(&["--limit", "100/5"]).unwrap().limit.limit,
+        Limit::per_second(100).burst(5)
+    );
+    assert_eq!(
+        "pro=5000/h/10".parse::<ClassSpec>().unwrap(),
+        ClassSpec("pro".into(), Limit::per_hour(5000).burst(10))
+    );
+    assert_eq!(
+        "x=100/5".parse::<ClassSpec>().unwrap(),
+        ClassSpec("x".into(), Limit::per_second(100).burst(5))
+    );
+    assert_eq!(
+        "x=1000/min/50".parse::<ClassSpec>().unwrap(),
+        ClassSpec("x".into(), Limit::per_minute(1000).burst(50))
+    );
+    let error = "x=1/day".parse::<ClassSpec>().unwrap_err();
+    assert!(error.contains("x=1/day"), "{error}");
+    for bad in ["1/day", "1/min/x", "1/min/5/6", "/min", "1/"] {
+        assert!(bad.parse::<LimitSpec>().is_err(), "{bad}");
+    }
+    // Whether the text gave a burst, for `--burst` to fill in the rest.
+    assert_eq!(
+        "1000/min/50".parse::<LimitSpec>().unwrap(),
+        LimitSpec {
+            limit: Limit::per_minute(1000).burst(50),
+            has_burst: true,
+        }
+    );
+    assert_eq!(
+        "1000/min".parse::<LimitSpec>().unwrap(),
+        LimitSpec {
+            limit: Limit::per_minute(1000),
+            has_burst: false,
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_burst_flag_fills_in_only_where_the_limit_has_none() {
+    // A slow limit earns nothing back while the test runs, so what a key
+    // is admitted is its burst.
+    let admitted = |limit: &'static str| {
+        let args = parse(&["--limit", limit, "--burst", "7", "--bind", "127.0.0.1:0"]).unwrap();
+        let guard = args.builder().unwrap().spawn().unwrap();
+        (0..20).filter(|_| guard.check("k").is_allowed()).count()
+    };
+    assert_eq!(admitted("100/h"), 7);
+    assert_eq!(admitted("100/h/3"), 3);
 }
 
 #[test]
@@ -120,6 +179,14 @@ async fn flags_the_library_refuses_are_refused_at_start() {
 fn health_and_metrics_may_listen_apart() {
     let args = parse(&["--limit", "1", "--metrics-listen", "0.0.0.0:9090"]).unwrap();
     assert_eq!(args.metrics_listen, Some("0.0.0.0:9090".parse().unwrap()));
+}
+
+#[test]
+fn most_denied_flag_and_env() {
+    assert_eq!(parse(&["--limit", "1"]).unwrap().most_denied, None);
+    let args = parse(&["--limit", "1", "--most-denied", "25"]).unwrap();
+    assert_eq!(args.most_denied, Some(25));
+    assert!(parse(&["--limit", "1", "--most-denied", "x"]).is_err());
 }
 
 // A file of its own per test, removed when dropped.

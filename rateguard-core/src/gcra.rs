@@ -7,8 +7,9 @@
 //! forward. Unlike `governor`, the quota can change in flight
 //! ([`Gcra::set_quota`]): a node's share changes every protocol period.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use crate::sync::{AtomicU64, Ordering};
 
 /// Time in nanoseconds since an origin the caller picks. Only differences
 /// matter, so any monotonic clock will do, and so will a simulated one.
@@ -16,17 +17,34 @@ pub type Nanos = u64;
 
 const ONE_SEC: Nanos = 1_000_000_000;
 const INTERVAL_BITS: u32 = 40;
-const BURST_BITS: u32 = 64 - INTERVAL_BITS;
-/// The longest emission interval a quota holds: about 18 minutes. A slower
-/// rate is held at this one, stricter than asked, never looser.
-pub const MAX_INTERVAL: Nanos = (1 << INTERVAL_BITS) - 1;
-/// The largest burst a quota holds: 16,777,215.
+const UNIT_BITS: u32 = 2;
+const BURST_BITS: u32 = 64 - INTERVAL_BITS - UNIT_BITS;
+const UNIT_SHIFT: u32 = BURST_BITS;
+const INTERVAL_SHIFT: u32 = BURST_BITS + UNIT_BITS;
+/// Nanoseconds in each unit an interval is counted in, by the unit's code in
+/// the packed word. Code 3 is unused.
+const UNIT_NANOS: [u64; 3] = [1, 1_000, 1_000_000];
+/// The longest emission interval a quota holds: 2^40 - 1 milliseconds, about
+/// 34 years. A rate too slow for it is held at this interval, so it admits
+/// **more** often than asked, looser, not stricter.
+pub const MAX_INTERVAL: Nanos = ((1 << INTERVAL_BITS) - 1) * 1_000_000;
+/// The largest burst a quota holds: 4,194,303.
 pub const MAX_BURST: u32 = (1 << BURST_BITS) - 1;
 
 /// A rate, kept as the emission interval between requests, and how many
 /// requests may arrive back to back. An interval rather than a whole number
 /// of requests per second: a node's share of a small limit over a big fleet
 /// is well under one a second, and rounding it up multiplies the limit.
+///
+/// The interval is counted in the finest unit (nanoseconds, microseconds or
+/// milliseconds) that holds it in 40 bits, so a short interval is exact and a
+/// long one is off by under a part in 10^9. A coarser unit rounds up, to the
+/// strict side. The interval kept here is already rounded, so a quota equals
+/// the one it is unpacked from.
+///
+/// The burst tolerance, `interval × (burst − 1)`, is held under 292 years: a
+/// slow rate with a big burst past that gets a shorter burst, stricter, not
+/// looser (see `MAX_TAU` in the source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Quota {
     interval: Nanos,
@@ -64,14 +82,27 @@ impl Quota {
     fn with_interval(interval: Nanos, burst: u32) -> Self {
         assert!(burst > 0, "burst must be > 0");
         assert!(burst <= MAX_BURST, "burst must be <= {MAX_BURST}");
+        let (value, unit) = Self::encode_interval(interval.clamp(1, MAX_INTERVAL));
         Self {
-            interval: interval.clamp(1, MAX_INTERVAL),
+            interval: value * UNIT_NANOS[unit],
             burst,
         }
     }
 
+    /// The interval as a value and a unit code, in the finest unit that
+    /// holds it, rounded up when the unit is coarser than a nanosecond.
+    fn encode_interval(interval: Nanos) -> (u64, usize) {
+        for (unit, nanos) in UNIT_NANOS.iter().enumerate() {
+            let value = interval.div_ceil(*nanos);
+            if value < 1 << INTERVAL_BITS {
+                return (value, unit);
+            }
+        }
+        unreachable!("the interval is at most MAX_INTERVAL, which fits in milliseconds")
+    }
+
     /// The rate, in requests per second: the one it was made with, up to
-    /// the rounding of the interval to whole nanoseconds.
+    /// the rounding of the interval to its unit.
     pub fn rate_per_sec(&self) -> f64 {
         ONE_SEC as f64 / self.interval as f64
     }
@@ -83,14 +114,22 @@ impl Quota {
 
     /// The quota as one word, for an `AtomicU64`.
     pub fn pack(self) -> u64 {
-        (self.interval << BURST_BITS) | self.burst as u64
+        let (value, unit) = Self::encode_interval(self.interval);
+        (value << INTERVAL_SHIFT) | ((unit as u64) << UNIT_SHIFT) | self.burst as u64
     }
 
     /// # Panics
     ///
     /// If the word does not hold a quota made by [`pack`](Quota::pack).
     pub fn unpack(packed: u64) -> Self {
-        Self::with_interval(packed >> BURST_BITS, (packed & MAX_BURST as u64) as u32)
+        let unit = ((packed >> UNIT_SHIFT) & ((1 << UNIT_BITS) - 1)) as usize;
+        let nanos = *UNIT_NANOS
+            .get(unit)
+            .expect("the interval's unit is unknown");
+        Self::with_interval(
+            (packed >> INTERVAL_SHIFT).saturating_mul(nanos),
+            (packed & MAX_BURST as u64) as u32,
+        )
     }
 
     fn t_nanos(&self) -> Nanos {
@@ -98,8 +137,56 @@ impl Quota {
     }
 
     fn tau_nanos(&self) -> Nanos {
-        self.interval.saturating_mul(self.burst as u64 - 1)
+        tau(self.interval, self.burst as u64)
     }
+
+    /// The interval and τ of the quota packed in `packed`, straight from
+    /// the word: what [`step`] needs, for every check. `unpack` validates
+    /// and re-encodes the interval through [`with_interval`], which is
+    /// needed nowhere here: a word made by `pack` is already rounded to its
+    /// unit, so both give the same `t` and `tau`.
+    ///
+    /// [`with_interval`]: Quota::with_interval
+    #[inline]
+    fn decode(packed: u64) -> (Nanos, Nanos) {
+        let unit = (packed >> UNIT_SHIFT) & ((1 << UNIT_BITS) - 1);
+        // Code 3 is never packed; read as milliseconds, like code 2,
+        // instead of a bounds check on the request path.
+        let nanos = DECODE_UNIT_NANOS[unit as usize];
+        // At most 2^40 × 10^6 < 2^60: no overflow.
+        let t = (packed >> INTERVAL_SHIFT) * nanos;
+        (t, tau(t, packed & MAX_BURST as u64))
+    }
+}
+
+/// [`UNIT_NANOS`] for every two-bit code, the unused 3 as milliseconds.
+const DECODE_UNIT_NANOS: [u64; 4] = [UNIT_NANOS[0], UNIT_NANOS[1], UNIT_NANOS[2], UNIT_NANOS[2]];
+
+/// The longest burst tolerance τ: 2^63 − 1 ns, some 292 years.
+///
+/// A slow rate with a big burst asks for more: at the slowest interval,
+/// [`MAX_INTERVAL`], `interval × (burst − 1)` passes 2^64 from a burst of
+/// 18. Saturated at `u64::MAX`, τ would put the earliest admission,
+/// `TAT − τ`, at 0 for good, and every request would be admitted. Capped,
+/// such a quota admits `⌊τ_MAX / interval⌋ + 1` back to back, fewer than its
+/// burst: it errs strict, never admitting more than the quota.
+///
+/// Why half of `u64::MAX` and not just under it: an admission needs
+/// `TAT ≤ now + τ`, and the TAT saturates at `u64::MAX`. Were `now + τ` to
+/// reach `u64::MAX`, any TAT would pass and the limit would be gone again.
+/// With τ at most 2^63 − 1, that takes a clock past 2^63 ns from its
+/// origin, 292 years: a node counts from its own start, a simulation from
+/// 0. A quota whose `interval × (burst − 1)` fits under the cap is
+/// unchanged: any burst at an interval up to 36 minutes, a burst up to 9 at
+/// any interval.
+const MAX_TAU: Nanos = u64::MAX / 2;
+
+/// τ of a quota: `interval × (burst − 1)`, capped at [`MAX_TAU`].
+#[inline]
+fn tau(interval: Nanos, burst: u64) -> Nanos {
+    interval
+        .saturating_mul(burst.saturating_sub(1))
+        .min(MAX_TAU)
 }
 
 /// One key's limiter.
@@ -126,6 +213,11 @@ impl Gcra {
         Self { quota, tat: None }
     }
 
+    /// The quota it enforces now.
+    pub fn quota(&self) -> Quota {
+        self.quota
+    }
+
     /// Admits or denies one request at `now`.
     pub fn check(&mut self, now: Nanos) -> Decision {
         let t = self.quota.t_nanos();
@@ -138,7 +230,8 @@ impl Gcra {
             return Decision::Deny { retry_at: earliest };
         }
 
-        self.tat = Some(std::cmp::max(tat, now) + t);
+        // Saturating: a TAT near the end of time must not wrap or panic.
+        self.tat = Some(std::cmp::max(tat, now).saturating_add(t));
         Decision::Allow
     }
 
@@ -202,23 +295,7 @@ impl AtomicGcra {
 
     /// Admits or denies one request at `now`.
     pub fn check(&self, now: Nanos) -> Decision {
-        let quota = self.quota();
-        let (t, tau) = (quota.t_nanos(), quota.tau_nanos());
-        let mut tat = self.tat.load(Ordering::Acquire);
-        loop {
-            let earliest = tat.saturating_sub(tau);
-            if now < earliest {
-                return Decision::Deny { retry_at: earliest };
-            }
-            let next = tat.max(now) + t;
-            match self
-                .tat
-                .compare_exchange_weak(tat, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Decision::Allow,
-                Err(seen) => tat = seen,
-            }
-        }
+        step(&self.tat, self.quota.load(Ordering::Relaxed), now)
     }
 
     /// Like [`Gcra::set_quota`]: the debt carries over in requests.
@@ -240,24 +317,7 @@ impl AtomicGcra {
             return;
         }
         let old = Quota::unpack(self.quota.swap(quota.pack(), Ordering::AcqRel));
-        if old == quota {
-            return;
-        }
-        let (old_t, new_t) = (old.t_nanos() as f64, quota.t_nanos() as f64);
-        // A plain compare-and-swap loop: `fetch_update` is deprecated on
-        // newer toolchains and its replacement missing on older ones.
-        let mut tat = self.tat.load(Ordering::Acquire);
-        loop {
-            let debt_slots = tat.saturating_sub(now) as f64 / old_t;
-            let rescaled = now.saturating_add((debt_slots * new_t).round() as u64);
-            match self
-                .tat
-                .compare_exchange_weak(tat, rescaled, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return,
-                Err(seen) => tat = seen,
-            }
-        }
+        rescale(&self.tat, old, quota, now);
     }
 
     /// See [`Gcra::has_debt`].
@@ -268,6 +328,114 @@ impl AtomicGcra {
     /// Back to a fresh limiter on `quota`, for a slot handed to another key.
     pub fn reset(&self, quota: Quota) {
         self.quota.store(quota.pack(), Ordering::Release);
+        self.tat.store(0, Ordering::Release);
+    }
+}
+
+/// One GCRA step on the TAT in `tat`, at the quota packed in `quota`: the
+/// decision of [`AtomicGcra::check`] and [`ShadowGcra::check`].
+#[inline]
+fn step(tat: &AtomicU64, quota: u64, now: Nanos) -> Decision {
+    let (t, tau) = Quota::decode(quota);
+    let mut seen = tat.load(Ordering::Acquire);
+    loop {
+        let earliest = seen.saturating_sub(tau);
+        if now < earliest {
+            return Decision::Deny { retry_at: earliest };
+        }
+        let next = seen.max(now).saturating_add(t);
+        match tat.compare_exchange_weak(seen, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Decision::Allow,
+            Err(current) => seen = current,
+        }
+    }
+}
+
+/// The debt in `tat`, run up at `old`, carried over to `new` in requests;
+/// see [`Gcra::set_quota`].
+fn rescale(tat: &AtomicU64, old: Quota, new: Quota, now: Nanos) {
+    if old == new {
+        return;
+    }
+    let (old_t, new_t) = (old.t_nanos() as f64, new.t_nanos() as f64);
+    // A plain compare-and-swap loop: `fetch_update` is deprecated on newer
+    // toolchains and its replacement missing on older ones.
+    let mut seen = tat.load(Ordering::Acquire);
+    loop {
+        let debt_slots = seen.saturating_sub(now) as f64 / old_t;
+        let rescaled = now.saturating_add((debt_slots * new_t).round() as u64);
+        match tat.compare_exchange_weak(seen, rescaled, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(current) => seen = current,
+        }
+    }
+}
+
+/// A second [`AtomicGcra`] that only counts, for a limit being tried out
+/// next to the one that decides: a shadow. It may be off, and is when new.
+///
+/// Off is 0 in the quota word, which no packed quota is. It is a type of
+/// its own, not an `AtomicGcra` that may be off, because `AtomicGcra`
+/// unpacks the quota it replaces on every change, and `Quota::unpack(0)`
+/// panics: here switching on and off never goes through the debt's
+/// rescaling. Switched on, it starts fresh, its old debt forgotten.
+#[derive(Debug)]
+pub struct ShadowGcra {
+    quota: AtomicU64,
+    tat: AtomicU64,
+}
+impl Default for ShadowGcra {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl ShadowGcra {
+    /// A shadow switched off.
+    pub fn new() -> Self {
+        Self {
+            quota: AtomicU64::new(0),
+            tat: AtomicU64::new(0),
+        }
+    }
+
+    /// Switches the shadow to `quota`, or off with `None`. Off to on starts
+    /// fresh; on to on carries the debt over in requests, as
+    /// [`AtomicGcra::set_quota`] does, with the same window between the two
+    /// words; to off forgets everything.
+    pub fn set(&self, quota: Option<Quota>, now: Nanos) {
+        let packed = quota.map_or(0, Quota::pack);
+        // Most calls change nothing, once a tick for every slot.
+        if self.quota.load(Ordering::Acquire) == packed {
+            return;
+        }
+        let old = self.quota.swap(packed, Ordering::AcqRel);
+        match quota {
+            // Only a word that held a quota is unpacked: 0 is "off".
+            Some(new) if old != 0 => rescale(&self.tat, Quota::unpack(old), new, now),
+            // Off, or on from off: fresh. A check racing the change may
+            // still leave its TAT after this store: one interval's debt at
+            // most, on a shadow, which only counts.
+            _ => self.tat.store(0, Ordering::Release),
+        }
+    }
+
+    /// What the shadow says of one request at `now`, counting it; `None`
+    /// when off, at the cost of one `Relaxed` load. Inline, so that a
+    /// runtime checking a slot with no shadow pays that load and no call.
+    #[inline]
+    pub fn check(&self, now: Nanos) -> Option<Decision> {
+        // The word is read once, and decoded only when it is not 0: a
+        // concurrent switch off cannot make this decode the 0, an interval
+        // of 0 that would deny nothing.
+        match self.quota.load(Ordering::Relaxed) {
+            0 => None,
+            packed => Some(step(&self.tat, packed, now)),
+        }
+    }
+
+    /// Off, for a slot handed to another key.
+    pub fn reset(&self) {
+        self.quota.store(0, Ordering::Release);
         self.tat.store(0, Ordering::Release);
     }
 }
@@ -405,6 +573,173 @@ mod tests {
         assert_eq!(Quota::per_second(1000.0, 1), Quota::new(1000, 1));
     }
 
+    const TWO_40: u64 = 1 << 40;
+
+    #[test]
+    fn a_slow_rate_is_held_exactly_not_clamped() {
+        let rate = 1.0 / (33.0 * 86_400.0);
+        let q = Quota::per_second(rate, 1);
+        assert!((q.rate_per_sec() / rate - 1.0).abs() < 1e-6);
+
+        let mut g = Gcra::new(q);
+        assert_eq!(g.check(0), Decision::Allow);
+        assert!(matches!(g.check(ONE_SEC), Decision::Deny { .. }));
+        assert_eq!(g.check(33 * 86_400 * ONE_SEC), Decision::Allow);
+    }
+
+    #[test]
+    fn a_slow_quota_packs_into_one_word() {
+        for interval in [1, TWO_40 - 1, TWO_40, TWO_40 * 1_000, MAX_INTERVAL] {
+            for burst in [1, MAX_BURST] {
+                let q = Quota::with_interval(interval, burst);
+                assert_eq!(Quota::unpack(q.pack()), q, "{interval} ns, burst {burst}");
+                assert!(
+                    q.interval >= interval.min(MAX_INTERVAL),
+                    "never rounded down"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_interval_is_rounded_up_to_its_unit_not_down() {
+        // Just past 2^40 ns does not fit in nanoseconds: it goes to whole
+        // microseconds, rounded up.
+        let q = Quota::with_interval(TWO_40 + 1, 1);
+        assert_eq!(q.interval, (TWO_40 / 1_000 + 1) * 1_000);
+        // Just past 2^40 us goes to whole milliseconds.
+        let q = Quota::with_interval(TWO_40 * 1_000 + 1, 1);
+        assert_eq!(q.interval % 1_000_000, 0);
+        assert!(q.interval > TWO_40 * 1_000);
+    }
+
+    // The check's fast path reads the same quota as `unpack` does.
+    #[test]
+    fn a_word_decodes_to_the_quota_it_packs() {
+        for interval in [
+            1,
+            999,
+            TWO_40 - 1,
+            TWO_40 + 1,
+            TWO_40 * 1_000 + 1,
+            MAX_INTERVAL,
+        ] {
+            for burst in [1, 2, 8, 18, MAX_BURST] {
+                let q = Quota::with_interval(interval, burst);
+                let unpacked = Quota::unpack(q.pack());
+                assert_eq!(
+                    Quota::decode(q.pack()),
+                    (unpacked.t_nanos(), unpacked.tau_nanos()),
+                    "{interval} ns, burst {burst}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_packed_quota_is_never_zero() {
+        assert_ne!(Quota::per_second(1e9, 1).pack(), 0);
+    }
+
+    #[test]
+    fn the_tat_saturates_at_the_longest_interval() {
+        let now = u64::MAX - 10;
+
+        // A burst of one: the TAT sits at the end of time and the next
+        // request is denied, where an unchecked sum would wrap or panic.
+        let slowest = Quota::per_second(0.0, 1);
+        let mut g = Gcra::new(slowest);
+        assert_eq!(g.check(now), Decision::Allow);
+        assert!(matches!(g.check(now), Decision::Deny { .. }));
+        let a = AtomicGcra::new(slowest);
+        assert_eq!(a.check(now), Decision::Allow);
+        assert!(matches!(a.check(now), Decision::Deny { .. }));
+
+        // The biggest burst: `interval × (burst − 1)` is far past the end of
+        // time, so tau is capped, and the burst is cut short, not let
+        // through whole: denied after the burst, wherever the clock is
+        // short of the cap.
+        let wide = Quota::per_second(0.0, MAX_BURST);
+        for start in [0, ONE_SEC, 1 << 62] {
+            assert_eq!(admitted(wide, start, 100), 9, "from {start}");
+        }
+        // At the very end of time nothing overflows either.
+        let mut g = Gcra::new(wide);
+        assert_eq!(g.check(now), Decision::Allow);
+        assert!(g.has_debt(now));
+        let a = AtomicGcra::new(wide);
+        assert_eq!(a.check(now), Decision::Allow);
+        assert!(a.has_debt(now));
+    }
+
+    // How many of `n` requests at `now` a fresh limiter admits, the same
+    // for both kinds: the reference and the atomic one.
+    fn admitted(quota: Quota, now: Nanos, n: usize) -> usize {
+        let mut g = Gcra::new(quota);
+        let a = AtomicGcra::new(quota);
+        let mut allowed = 0;
+        for _ in 0..n {
+            let decision = g.check(now);
+            assert_eq!(a.check(now), decision);
+            allowed += usize::from(decision == Decision::Allow);
+        }
+        allowed
+    }
+
+    // A burst of 18 at the slowest rate: `interval × 17` no longer fits in
+    // 64 bits. A saturated tau would put the earliest admission at 0 and
+    // admit every request; capped, the burst is cut short instead.
+    #[test]
+    fn a_burst_too_long_to_hold_is_cut_short_not_let_through() {
+        let slowest = Quota::per_second(0.0, 18);
+        assert!(admitted(slowest, 0, 1000) <= 18);
+        assert_eq!(admitted(Quota::per_second(0.0, 17), 0, 1000), 9);
+        // Under the cap a burst is whole: 8 intervals of 34 years fit in
+        // 292.
+        assert_eq!(admitted(Quota::per_second(0.0, 9), 0, 1000), 9);
+        // The floor of one an hour on 40 nodes, `R × β / k` at the default
+        // β of 0.05, with a burst of 10,000: an interval of 33 days.
+        let floor = Quota::per_second(0.05 / 40.0 / 3600.0, 10_000);
+        let allowed = admitted(floor, 0, 20_000);
+        assert!(allowed > 0 && allowed <= 10_000, "{allowed}");
+    }
+
+    // 0 in the quota word means "no shadow": switching it off and on must
+    // never go through `Quota::unpack(0)`, which panics, and on again it
+    // starts fresh, its old debt forgotten.
+    #[test]
+    fn a_shadow_switches_on_and_off_without_unpacking_zero() {
+        let shadow = ShadowGcra::new();
+        assert_eq!(shadow.check(0), None, "off when new");
+        shadow.set(None, 0);
+        assert_eq!(shadow.check(0), None, "off to off");
+
+        shadow.set(Some(quota(1000, 2)), 0);
+        assert_eq!(shadow.check(0), Some(Decision::Allow));
+        assert_eq!(shadow.check(0), Some(Decision::Allow));
+        assert!(matches!(shadow.check(0), Some(Decision::Deny { .. })));
+
+        shadow.set(None, 0);
+        assert_eq!(shadow.check(0), None, "on to off");
+
+        shadow.set(Some(quota(1000, 2)), 0);
+        assert_eq!(shadow.check(0), Some(Decision::Allow), "fresh: the burst");
+        assert_eq!(shadow.check(0), Some(Decision::Allow));
+        assert!(matches!(shadow.check(0), Some(Decision::Deny { .. })));
+
+        // On to on carries the debt over, as `AtomicGcra::set_quota` does.
+        shadow.set(Some(quota(100, 2)), 0);
+        assert!(matches!(shadow.check(0), Some(Decision::Deny { .. })));
+
+        shadow.reset();
+        assert_eq!(shadow.check(0), None, "a reset slot has no shadow");
+    }
+
+    #[test]
+    fn a_rate_too_slow_for_34_years_is_held_looser_as_documented() {
+        assert_eq!(Quota::per_second(1e-12, 1).interval, MAX_INTERVAL);
+    }
+
     mod atomic_equivalence {
         use super::super::*;
         use proptest::prelude::*;
@@ -427,6 +762,26 @@ mod tests {
         }
 
         proptest! {
+            // The same with fractional rates, as `Quota::per_second` makes
+            // them: slow ones count their interval in coarser units.
+            #[test]
+            fn decides_like_the_reference_at_any_rate(
+                (rate, burst) in (0.000_000_1f64..5_000.0, 1u32..50),
+                ops in ops(),
+            ) {
+                let quota = Quota::per_second(rate, burst);
+                let mut reference = Gcra::new(quota);
+                let atomic = AtomicGcra::new(quota);
+                let mut now = 0;
+                for op in ops {
+                    if let Op::Check(dt) = op {
+                        now += dt;
+                        prop_assert_eq!(atomic.check(now), reference.check(now));
+                        prop_assert_eq!(atomic.has_debt(now), reference.has_debt(now));
+                    }
+                }
+            }
+
             // Single-threaded, the atomic GCRA is the reference one.
             #[test]
             fn decides_exactly_like_the_reference(
@@ -435,17 +790,23 @@ mod tests {
             ) {
                 let mut reference = Gcra::new(Quota::new(rate, burst));
                 let atomic = AtomicGcra::new(Quota::new(rate, burst));
+                // A shadow switched on decides as the others do.
+                let shadow = ShadowGcra::new();
+                shadow.set(Some(Quota::new(rate, burst)), 0);
                 let mut now = 0;
                 for op in ops {
                     match op {
                         Op::Check(dt) => {
                             now += dt;
-                            prop_assert_eq!(atomic.check(now), reference.check(now));
+                            let decision = reference.check(now);
+                            prop_assert_eq!(shadow.check(now), Some(decision.clone()));
+                            prop_assert_eq!(atomic.check(now), decision);
                         }
                         Op::SetQuota(r, b, dt) => {
                             now += dt;
                             reference.set_quota(Quota::new(r, b), now);
                             atomic.set_quota(Quota::new(r, b), now);
+                            shadow.set(Some(Quota::new(r, b)), now);
                         }
                     }
                     prop_assert_eq!(atomic.has_debt(now), reference.has_debt(now));

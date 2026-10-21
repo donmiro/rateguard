@@ -36,6 +36,7 @@ mod config;
 mod driver;
 mod guard;
 mod key;
+mod key_limits;
 mod limit;
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -47,9 +48,10 @@ pub mod tower;
 mod transport;
 
 pub use config::{Builder, Error, PartitionPolicy};
-pub use guard::{Decision, Guard};
+pub use guard::{Checked, Decision, Guard};
 pub use key::{key_hash, key_hash_in};
+pub use key_limits::KeyLimit;
 pub use limit::Limit;
 pub use rateguard_proto::auth::{AuthError, GossipAuth, Secret};
-pub use stats::{DeniedKey, RejectedDatagrams, Stats};
+pub use stats::{DeniedKey, KeyStats, RejectedDatagrams, Stats};
 pub use transport::Transport;

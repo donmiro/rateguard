@@ -50,9 +50,13 @@ if guard.check("api:tenant-42").is_allowed() {
 - **Signed gossip.** A secret the fleet shares keeps strangers out of the
   cluster, turned on and rotated by rolling updates; a key salt keeps clients
   from choosing keys that collide with someone else's.
+- **Limits per second, minute or hour**, for the default class, a class or
+  one key; one customer's deal is a key limit, changed while the fleet runs.
 - **Observable, and safe to roll out.** `stats()` and optional `metrics` say
   what each instance admits and denies and why; a dry run counts what would
-  be denied without denying it, and enforcement turns on with no restart.
+  be denied without denying it, and enforcement turns on with no restart. A
+  shadow limit counts, beside a class's real one, which keys a new limit would
+  deny, and `key_stats` tells how one key fares.
 - **Synchronous API.** `check()` is a plain function. No `async`, no executor
   required, callable from any thread.
 - **No `unsafe`**, and a pure sans-I/O core: no async runtime, no clock, no
@@ -62,7 +66,7 @@ if guard.check("api:tenant-42").is_allowed() {
 
 ```toml
 [dependencies]
-rateguard = "0.6"
+rateguard = "0.7"
 ```
 
 Requires Rust 1.88 or newer (2024 edition). Optional features:
@@ -181,6 +185,116 @@ class's new limit and others the old, the fleet admits no more than the
 higher of the two. A raised limit is never overshot; a lowered one holds
 once every instance has it (see [Accuracy](#accuracy)).
 
+### Limits per minute and per hour
+
+A limit is a count and a period:
+
+```rust
+use rateguard::Limit;
+
+Limit::per_second(100);
+Limit::per_minute(1_000); // about 16.7 a second, burst 50
+Limit::per_hour(5_000).burst(10);
+```
+
+`limit.count()`, `limit.period()` and `limit.rate_per_sec()` read it back;
+`rate()` is deprecated, as it rounds a slow rate up to a whole number. The
+default burst is a twentieth of the count, at least 1. `Builder::default_limit`
+takes any `Limit` for the default class, where `Builder::limit(rps)` takes
+requests per second. `per_minute(60)` and `per_second(1)` admit the same, but
+are not `==`: a `Limit` keeps what it was given.
+
+`per_minute` is not a fixed window. The limit is smoothed, GCRA, not a counter
+that resets: "1000 a minute" is about 16.7 a second, plus the burst. A client
+that waits for the minute to begin and sends 1000 at once gets denials. And
+the burst is per instance: a fleet of N admits up to N times the burst back to
+back, which for a burst of thousands is a lot. Use burst for smoothing, not for
+quota; a daily or monthly quota that must never be exceeded wants a shared
+ledger, not this.
+
+Slow rates are held at their rate, not rounded up: `per_hour(1)` on a fleet of
+40 is shared out as one an hour across the fleet, not cut short to a rate each
+instance can hold. As always, each instance also admits its burst on top.
+(A burst so long at so slow a rate that it spans over 292 years is cut short,
+the strict way.)
+
+### Limits for one key
+
+A customer with a deal of its own needs no class of its own and no deploy: an
+exception names a class and a key, and gives it a limit, or says "as in that
+class".
+
+```rust
+use rateguard::{KeyLimit, Limit};
+
+guard.set_key_limit("pro", "tenant:42", Limit::per_second(2_000))?;
+guard.set_key_limit("free", "tenant:7", KeyLimit::class("pro"))?; // follows Pro
+guard.remove_key_limit("pro", "tenant:42");
+// All at once:
+guard.set_key_limits([("pro", "tenant:42", Limit::per_minute(90_000))])?;
+guard.key_limits(); // Vec<(String, String, KeyLimit)>
+```
+
+The key stays the key: its hash and its debt are kept, so moving a customer
+from 500 to 2000 a second gives it no fresh burst, and the other way takes
+none away. While the change has not reached every instance, the fleet admits
+at most the higher of the two limits. `KeyLimit::class` refers to a class by
+name, so a new Pro limit follows; a class this instance does not have is
+the default limit, counted in `unknown_class`. `set_key_limits` replaces all
+the exceptions, or none if one is refused; load a big set with it, as each
+`set_key_limit` copies the whole table. An instance keeps up to
+`max_key_limits` of them, 4096 by default and at most 1,048,576
+(`Error::TooManyKeyLimits` when full, `Error::TooLargeMaxKeyLimits` for a
+bound over that).
+
+An exception is not among the classes that set the cold rate for new keys,
+so a key held to a limit stricter than every class may pass at a looser rate
+in three narrow cases: another thread's check in the nanoseconds between the
+key's taking a slot and the slot getting its own quota, at the strictest
+class's rate; a key whose first check comes just as the instance's first
+exception is set, at its class's rate until the next tick; and a key in the
+overflow slot, past `tracked_keys`, while it is there. Once a key has its
+slot, nothing is read from the exceptions on its request path; a new key's
+first check looks itself up while any exception exists.
+
+### Shadow limits
+
+To see what a new limit would do before it does it, give a class a shadow:
+
+```rust
+// "" is the default class:
+guard.set_shadow("free", Some(Limit::per_second(10)))?;
+// ... a day later, by the report:
+guard.set_class("free", Limit::per_second(10))?;
+guard.set_shadow("free", None)?;
+```
+
+The class's real limit decides, as before. Every attempt of a key with a slot
+of its own is also run through the shadow, the ones the real limit denied
+included, so it answers "what if clients sent the same under the new limit",
+for a lower limit and a higher one. Keys in the overflow slot, past
+`tracked_keys`, have no shadow, so under heavy key churn the count is short
+of them. What it would have denied is in `stats().shadow_denied`,
+`stats().most_shadow_denied` and, with `metrics`,
+`rateguard_shadow_denied_total`.
+A key with an exception of its own has no shadow; a key that follows a class
+follows its shadow. `guard.shadows()` lists them, `set_shadows` replaces them
+all, and a class that does not exist is `Error::UnknownClass`.
+
+The shadow is approximate, and errs on the strict side. A key is hot, and takes
+a share by its demand, when it passes a threshold that depends on the limit.
+A key whose demand lies between the thresholds of the two limits is cold under
+the real limit and would be hot under the shadow; the shadow gives it only the
+cold share, and so counts more denials than enforcing the limit would. The
+report is cautious: rolled out, the new limit affects as many clients as it
+says, or fewer. A class without a shadow pays for it with one load of a word
+the check already has in its cache line.
+
+`guard.check_traced(key)` and `check_in_traced(class, key)` return a `Checked`
+with the `decision` and the shadow's, `Option<Decision>`, for logs and for
+anything that needs to know which keys the shadow denied. They decide as
+`check` does.
+
 ### With `axum`
 
 With the `tower` feature, `RateLimitLayer` takes the key from each request
@@ -226,15 +340,18 @@ from rateguard_client import Client  # pip install rateguard-client
 decision = Client().check("tenant:42", cls="pro")
 ```
 
-See the [sidecar's README](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar)
+The sidecar takes limits per second, minute and hour (`--limit 1000/min`,
+`--class free=10`), and over its admin API key limits, shadows, and one key's
+counters (`GET /v1/keys`). See the
+[sidecar's README](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar)
 for its flags, its API, and a Kubernetes example.
 
 ### Configuration
 
 | Option | Default | Meaning |
 |---|---|---|
-| `limit(rps)` | required | Requests per second per key, across the entire fleet |
-| `burst(n)` | `limit / 20`, at least 1 | Requests one instance may admit back to back, on top of its share. Per instance: the fleet as a whole may admit `R` plus a burst on each. At most 16,777,215; `0` is taken as 1 |
+| `limit(rps)` | required | Requests per second per key, across the entire fleet; or `default_limit(limit)` for a `Limit` per second, minute or hour |
+| `burst(n)` | `limit / 20`, at least 1 | Requests one instance may admit back to back, on top of its share. Per instance: the fleet as a whole may admit `R` plus a burst on each. At most 4,194,303; `0` is taken as 1 |
 | `bind(addr)` | required | UDP address for gossip, as `ip:port` |
 | `advertise(addr)` | the `bind` address | Where the other instances reach this one; required when binding to `0.0.0.0` or `::`. In Kubernetes, the pod IP |
 | `seeds([..])` | `[]` | Peers to join through, as `ip:port` or `host:port`; any live member is enough. Names are looked up again while the node runs, so one name for the whole fleet, such as a Kubernetes headless service, keeps up with instances that come and go |
@@ -245,6 +362,8 @@ for its flags, its API, and a Kubernetes example.
 | `dry_run(on)` | `false` | Admit every request and count those that would be denied; see [Dry run](#dry-run) |
 | `class(name, limit)` | none | A class of limits, see [Classes of limits](#classes-of-limits) |
 | `max_classes(n)` | `64` | How many named classes an instance keeps, at most 4096 |
+| `max_key_limits(n)` | `4096` | How many exceptions for single keys an instance keeps, at most 1,048,576; see [Limits for one key](#limits-for-one-key) |
+| `most_denied(k)` | `10` | How long `most_denied` and `most_shadow_denied` are, at most 1024, `0` for none |
 | `gossip_auth(mode, secrets)` | `Off`, no secret | Whether gossip is signed, with at most two secrets of 32 bytes or more; see [Security](#security) |
 | `key_salt(bytes)` | none | A salt of 16 bytes or more for the hashes of keys, the same on every node; see [Security](#security) |
 
@@ -270,7 +389,8 @@ println!("{} admitted, {} denied", stats.admitted, stats.denied);
 | `tracked_keys`, `hot_keys` | Keys with state here, and keys coordinated with the peers |
 | `since_last_round` | Far over the protocol period, the background task is stuck |
 | `running`, `dry_run` | Whether the node still runs, and whether this is a dry run |
-| `most_denied` | Up to ten keys denied most lately, with their denials a second: who is being limited. By hash: match them with `guard.key_hash_in(class, key)` |
+| `most_denied` | The keys denied most lately (ten, or `most_denied(k)`), with their `denied_per_sec`, `requests_per_sec` and `shadow_denied_per_sec`, all over the same ten seconds or so: who is being limited, and what share of its requests. By hash: match them with `guard.key_hash_in(class, key)` |
+| `shadow_denied`, `most_shadow_denied` | What shadow limits would have denied, in all, and by key, sorted by it: who a new limit would limit |
 | `unknown_class` | Checks in a class this instance does not know, held to the default limit |
 | `gossip_auth`, `rejected_datagrams` | How this instance signs its gossip, and the datagrams it refused, by reason: `unsigned`, `bad_tag`, `malformed`. A growing `bad_tag`, secrets that do not match the peers'; a growing `unsigned`, a peer not signing yet, or a stranger |
 
@@ -278,18 +398,34 @@ println!("{} admitted, {} denied", stats.admitted, stats.denied);
 its share of the limit, before the burst; `share_in(class, key)` the same in a
 class.
 
+For one key, ask the background task:
+
+```rust
+if let Some(k) = guard.key_stats("pro", "tenant:42").await {
+    let (requests, denied) = (k.requests_per_sec, k.denied_per_sec);
+    println!("{requests:.0} requests a second, {denied:.0} denied");
+}
+```
+
+A `KeyStats` has `requests_per_sec`, `denied_per_sec`, `shadow_denied_per_sec`,
+`share`, the `limit` the key is held to, its own or its class's, and its
+`shadow`. `None` means this instance keeps no state for the key, and asking
+does not make it. Every number is this instance's alone, averaged over the
+last ten seconds or so; to get the fleet's, add them up.
+
 With the `metrics` feature the background task publishes the same, labelled
 `guard` with the address the instance advertises:
 `rateguard_checks_total{decision="allow"|"deny"}`,
-`rateguard_overflowed_total`, `rateguard_unknown_class_total`, and the gauges `rateguard_cluster_size`,
-`rateguard_counted_size`, `rateguard_suspects`, `rateguard_tracked_keys`,
-`rateguard_hot_keys`, `rateguard_held{reason="joining"|"learning"|"without_quorum"}`,
-`rateguard_dry_run`, the counter
+`rateguard_overflowed_total`, `rateguard_unknown_class_total`, and the gauges
+`rateguard_cluster_size`, `rateguard_counted_size`, `rateguard_suspects`,
+`rateguard_tracked_keys`, `rateguard_hot_keys`,
+`rateguard_held{reason="joining"|"learning"|"without_quorum"}`,
+`rateguard_dry_run`, the counters `rateguard_shadow_denied_total` and
 `rateguard_rejected_datagrams_total{reason="unsigned"|"bad_tag"|"malformed"}`
-and `rateguard_gossip_auth{mode="off"|"transitional"|"required"}`, 1 for
-the instance's mode: everything but `most_denied`, whose key hashes as
-labels would make a series per key. Install any `metrics` recorder,
-Prometheus or another; nothing is published on the request path.
+and `rateguard_gossip_auth{mode="off"|"transitional"|"required"}`, 1 for the
+instance's mode: everything but `most_denied` and `most_shadow_denied`, whose
+key hashes as labels would make a series per key. Install any `metrics`
+recorder, Prometheus or another; nothing is published on the request path.
 
 ### Dry run
 
@@ -315,7 +451,7 @@ own UDP socket and timer, feed it events, and send the datagrams it returns.
 use rateguard_core::{
     boundary::{Action, Event, PeerId},
     gcra::Decision,
-    limiter::Config,
+    limiter::{Config, Limit},
     node::{Node, SwimConfig},
 };
 
@@ -323,8 +459,10 @@ const ONE_SEC: u64 = 1_000_000_000;
 
 let mut node = Node::new(
     Config {
-        limit_per_sec: 1_000,
-        burst: 10,
+        limit: Limit {
+            rate: 1_000.0,
+            burst: 10,
+        },
         alpha: 0.5,
         floor_factor: 0.05,
         cooldown: 5 * ONE_SEC,
@@ -497,6 +635,8 @@ and CI fails if it falls out of date.
 | A node joins 10 s late | R | 1.00 R | 1.01 R | 0 | 1 s |
 | Limit lowered to R/2, one node a second | ≤ R in passing, R/2 after | 0.50 R | 1.00 R | 0 | 3 s |
 | Limit raised from R/2 to R, one node a second | ≤ R, then R | 1.00 R | 1.00 R | 0 | 3 s |
+
+Shadow at R/5, skewed demand on R: shadow denials vs. enforced, 1600.0 vs. 1600.0 a second (+0.0%).
 <!-- accuracy: end -->
 
 *Admitted, steady* is the rate once the scenario has settled, over a window

@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "rateguard"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "criterion",
@@ -1154,8 +1154,9 @@ dependencies = [
 
 [[package]]
 name = "rateguard-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
+ "loom",
  "proptest",
  "rateguard-proto",
 ]
@@ -1173,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "rateguard-sidecar"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "base64",
@@ -1193,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "rateguard-sim"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rateguard-core",
  "rateguard-proto",

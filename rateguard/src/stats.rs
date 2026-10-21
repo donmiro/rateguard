@@ -54,14 +54,29 @@ pub struct Stats {
     /// Whether this is a dry run: see
     /// [`Guard::set_dry_run`](crate::Guard::set_dry_run).
     pub dry_run: bool,
-    /// Up to ten keys with the most denials here lately, most denied first:
-    /// who is being limited. Keys go by their hash; match them with
+    /// The keys with the most denials here lately, most denied first: who
+    /// is being limited. As many as
+    /// [`Builder::most_denied`](crate::Builder::most_denied) says, ten
+    /// unless set. Keys go by their hash; match them with
     /// [`Guard::key_hash_in`](crate::Guard::key_hash_in), which knows this
     /// node's [`Builder::key_salt`](crate::Builder::key_salt).
+    ///
+    /// Ranked by denials over the last ten seconds or so, the time before
+    /// a key was first seen counted as silent: a key denied once just now
+    /// ranks below one denied as often for ten seconds. The rates listed
+    /// are a new key's so far.
     pub most_denied: Vec<DeniedKey>,
+    /// The keys whose shadow limit would have denied the most here lately,
+    /// most first, as many as `most_denied`: see
+    /// [`Guard::set_shadow`](crate::Guard::set_shadow).
+    pub most_shadow_denied: Vec<DeniedKey>,
     /// Checks in a class this node does not know, held to the default limit
     /// instead: a typo, or a class removed while still in use.
     pub unknown_class: u64,
+    /// Requests a shadow limit would have denied, whatever the real limit
+    /// decided: see [`Guard::set_shadow`](crate::Guard::set_shadow). Not
+    /// part of `admitted` or `denied`, which count what was decided.
+    pub shadow_denied: u64,
     /// How this node signs its gossip and checks its peers': see
     /// [`Builder::gossip_auth`](crate::Builder::gossip_auth).
     pub gossip_auth: GossipAuth,
@@ -100,6 +115,34 @@ pub struct DeniedKey {
     pub key_hash: u64,
     /// Denials a second here, averaged over the last ten seconds or so.
     pub denied_per_sec: f64,
+    /// Requests a second here, admitted or not, over the same window: the
+    /// denials are this much of them.
+    pub requests_per_sec: f64,
+    /// Requests a second the key's shadow limit would have denied, over the
+    /// same window.
+    pub shadow_denied_per_sec: f64,
+}
+
+/// What this node knows of one key; see
+/// [`Guard::key_stats`](crate::Guard::key_stats).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct KeyStats {
+    /// Requests a second here, admitted or not, averaged over the last ten
+    /// seconds or so.
+    pub requests_per_sec: f64,
+    /// Of those, the ones denied a second, over the same window.
+    pub denied_per_sec: f64,
+    /// The ones the key's shadow limit would have denied a second, over the
+    /// same window.
+    pub shadow_denied_per_sec: f64,
+    /// The rate, in requests per second, this instance admits for the key
+    /// now: see [`Guard::share_in`](crate::Guard::share_in).
+    pub share: f64,
+    /// The limit the key is held to, as given: its own, or its class's.
+    pub limit: crate::Limit,
+    /// Its shadow limit, if it has one.
+    pub shadow: Option<crate::Limit>,
 }
 
 /// What the background task keeps for [`Stats`], under a lock only it and

@@ -14,6 +14,17 @@
 //! | PUT | `/v1/classes` | `{"pro": {"per_second": 1000, "burst": 50}}` | `204`; admin only |
 //! | PUT | `/v1/limit` | `{"per_second": 100, "burst": 5}` | `204`; admin only |
 //! | PUT | `/v1/dry_run` | `{"on": true}` | `204`; admin only |
+//! | PUT | `/v1/key_limits` | `[{"class": "pro", "key": "tenant:42", "limit": {"per_second": 50}}, {"key": "tenant:7", "as_class": "pro"}]` | `204`; replaces all; admin only |
+//! | PUT | `/v1/shadows` | `{"free": {"per_second": 10}, "": null}` | `204`; replaces all, `""` is the default class, `null` or a missing class has no shadow; admin only |
+//! | GET | `/v1/keys?key=tenant:42&class=pro` | | `200` with the key's rates, share, `limit` and `shadow`, or `404` while it is not tracked; loopback only |
+//!
+//! A limit, in `/v1/classes` and `/v1/limit`, has exactly one period key,
+//! `per_second`, `per_minute` or `per_hour`, such as
+//! `{"per_minute": 600, "burst": 20}`; `burst` is optional. In
+//! `/v1/key_limits` an entry has exactly one of `limit` and `as_class`, and
+//! `class` may be left out for the default class. An `as_class` this node
+//! does not have is taken: the key gets the default limit, and its checks
+//! are counted in `unknown_class`, as with [`rateguard::KeyLimit::Class`].
 //!
 //! A decision is always a `200`: a `429` is the service's answer to its own
 //! client, not the sidecar's to the service. A request it cannot read is a
@@ -21,7 +32,8 @@
 //!
 //! [`public_app`] is the part that may face the pod's network, for
 //! kubelet's probes and Prometheus: `/healthz` and `/metrics`, nothing that
-//! checks or changes anything.
+//! checks or changes anything, and nothing that names a key: `/v1/keys` and
+//! the key names in `/v1/stats` may be personal data.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,12 +50,12 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use metrics_exporter_prometheus::PrometheusHandle;
-use rateguard::{Decision, GossipAuth, Guard, Limit};
+use rateguard::{Decision, GossipAuth, Guard, KeyLimit, Limit};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -66,7 +78,8 @@ pub struct App {
 }
 
 impl App {
-    /// An API over `guard`, remembering the last 1024 keys denied.
+    /// An API over `guard`, remembering the last 1024 keys denied, and
+    /// apart from them the last 1024 only a shadow denied.
     pub fn new(guard: Guard, admin: bool, metrics: Option<PrometheusHandle>) -> Self {
         App {
             guard,
@@ -82,6 +95,7 @@ pub fn app(app: App) -> Router {
     let mut router = Router::new()
         .route("/v1/check", post(check))
         .route("/v1/stats", get(stats))
+        .route("/v1/keys", get(key_stats))
         .route("/healthz", get(health));
     if let Some(handle) = &app.metrics {
         router = router.route("/metrics", metrics(handle.clone()));
@@ -90,7 +104,9 @@ pub fn app(app: App) -> Router {
         router = router
             .route("/v1/classes", put(set_classes))
             .route("/v1/limit", put(set_limit))
-            .route("/v1/dry_run", put(set_dry_run));
+            .route("/v1/dry_run", put(set_dry_run))
+            .route("/v1/key_limits", put(set_key_limits))
+            .route("/v1/shadows", put(set_shadows));
     }
     router.with_state(app)
 }
@@ -200,22 +216,30 @@ async fn check(State(app): State<App>, body: Bytes) -> Response {
     // surrogates share a limit, which is stricter, never looser.
     let key = String::from_utf8_lossy(&check.key);
     let class = check.class.as_deref().unwrap_or("");
-    let decision = match &check.class {
-        Some(class) => app.guard.check_in(class, &key),
-        None => app.guard.check(&key),
+    let checked = match &check.class {
+        Some(class) => app.guard.check_in_traced(class, &key),
+        None => app.guard.check_traced(&key),
     };
     let json = [(header::CONTENT_TYPE, "application/json")];
-    match decision {
+    // A shadow's denial names the key as a real one does, for
+    // `most_shadow_denied`, in a table of its own so that it pushes out no
+    // real one's name; the answer is the real decision's alone. Only
+    // here: an allowed check takes no lock and hashes once. A dry run's
+    // would-be denial is answered as allowed, so it is not recorded either.
+    let shadow_denied = matches!(checked.shadow, Some(Decision::Deny { .. }));
+    let denied = matches!(checked.decision, Decision::Deny { .. });
+    if shadow_denied || denied {
+        let hash = app.guard.key_hash_in(class, &key);
+        let mut named = app.denied.lock().unwrap_or_else(PoisonError::into_inner);
+        if denied {
+            named.record(hash, class, &key);
+        } else {
+            named.record_shadow(hash, class, &key);
+        }
+    }
+    match checked.decision {
         Decision::Allow => (json, r#"{"allowed":true}"#).into_response(),
         Decision::Deny { retry_after } => {
-            // Only here: an allowed check takes no lock and hashes once. A
-            // dry run's would-be denial is answered as allowed, so it is not
-            // recorded either.
-            let hash = app.guard.key_hash_in(class, &key);
-            app.denied
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .record(hash, class, &key);
             // Whole milliseconds, rounded up: rounding down invites an early
             // retry.
             let ms = retry_after.as_nanos().div_ceil(1_000_000);
@@ -231,24 +255,30 @@ async fn check(State(app): State<App>, body: Bytes) -> Response {
 async fn stats(State(app): State<App>) -> Response {
     let s = app.guard.stats();
     let named = app.denied.lock().unwrap_or_else(PoisonError::into_inner);
-    let most_denied: Vec<Value> = s
-        .most_denied
-        .iter()
-        .map(|d| {
-            // As strings: a JSON number loses a u64's last digits in most
-            // languages.
-            let mut entry =
-                json!({"key_hash": d.key_hash.to_string(), "denied_per_sec": d.denied_per_sec});
-            if let Some(named) = named.get(d.key_hash) {
-                entry["key"] = named.key.as_str().into();
-                entry["class"] = named.class.as_str().into();
-                if named.truncated {
-                    entry["key_truncated"] = true.into();
+    let name_all = |list: &[rateguard::DeniedKey]| -> Vec<Value> {
+        list.iter()
+            .map(|d| {
+                // As strings: a JSON number loses a u64's last digits in
+                // most languages.
+                let mut entry = json!({
+                    "key_hash": d.key_hash.to_string(),
+                    "denied_per_sec": d.denied_per_sec,
+                    "requests_per_sec": d.requests_per_sec,
+                    "shadow_denied_per_sec": d.shadow_denied_per_sec,
+                });
+                if let Some(named) = named.get(d.key_hash) {
+                    entry["key"] = named.key.as_str().into();
+                    entry["class"] = named.class.as_str().into();
+                    if named.truncated {
+                        entry["key_truncated"] = true.into();
+                    }
                 }
-            }
-            entry
-        })
-        .collect();
+                entry
+            })
+            .collect()
+    };
+    let most_denied = name_all(&s.most_denied);
+    let most_shadow_denied = name_all(&s.most_shadow_denied);
     drop(named);
     axum::Json(json!({
         "admitted": s.admitted,
@@ -266,7 +296,9 @@ async fn stats(State(app): State<App>) -> Response {
         "since_last_round_ms": s.since_last_round.map(|d| d.as_millis() as u64),
         "running": s.running,
         "dry_run": s.dry_run,
+        "shadow_denied": s.shadow_denied,
         "most_denied": most_denied,
+        "most_shadow_denied": most_shadow_denied,
         "gossip_auth": args::mode_name(s.gossip_auth),
         "rejected_datagrams": {
             "unsigned": s.rejected_datagrams.unsigned,
@@ -292,44 +324,175 @@ fn metrics(handle: PrometheusHandle) -> axum::routing::MethodRouter<App> {
     })
 }
 
-#[derive(Deserialize)]
-struct LimitBody {
-    per_second: u32,
-    #[serde(default)]
-    burst: Option<u32>,
-}
-impl LimitBody {
-    fn limit(&self) -> Limit {
-        let limit = Limit::per_second(self.per_second);
-        match self.burst {
-            Some(burst) => limit.burst(burst),
-            None => limit,
+/// A limit from its JSON form: exactly one of `per_second`, `per_minute`
+/// and `per_hour`, and optionally `burst`. The one parser of limits, for
+/// every route that takes one; a body with only `per_second` and `burst`
+/// is the 0.6 form and reads as before.
+pub(crate) fn limit_from_json(value: &Value) -> Result<Limit, String> {
+    let object = value
+        .as_object()
+        .ok_or("a limit is an object such as {\"per_second\": 100}")?;
+    let count = |key: &str, value: &Value| -> Result<u32, String> {
+        value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("{key} is not a whole number that fits in 32 bits"))
+    };
+    let mut limit = None;
+    for (key, make) in [
+        ("per_second", Limit::per_second as fn(u32) -> Limit),
+        ("per_minute", Limit::per_minute),
+        ("per_hour", Limit::per_hour),
+    ] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        if limit.is_some() {
+            return Err("a limit has one of per_second, per_minute and per_hour".into());
         }
+        let n = count(key, value)?;
+        if n == 0 {
+            return Err(format!("{key} is 0, and a limit of none admits nothing"));
+        }
+        limit = Some(make(n));
+    }
+    let limit = limit.ok_or("a limit needs one of per_second, per_minute and per_hour")?;
+    match object.get("burst") {
+        None | Some(Value::Null) => Ok(limit),
+        Some(burst) => Ok(limit.burst(count("burst", burst)?)),
     }
 }
 
+/// A limit as [`limit_from_json`] reads it: the inverse.
+pub(crate) fn limit_to_json(limit: Limit) -> Value {
+    let key = match limit.period().as_secs() {
+        1 => "per_second",
+        60 => "per_minute",
+        _ => "per_hour",
+    };
+    json!({key: limit.count(), "burst": limit.burst_size()})
+}
+
 async fn set_classes(State(app): State<App>, body: Bytes) -> Response {
-    let classes: HashMap<String, LimitBody> = match serde_json::from_slice(&body) {
+    let classes: HashMap<String, Value> = match serde_json::from_slice(&body) {
         Ok(classes) => classes,
         Err(error) => return bad_request(error),
     };
-    let classes = classes
-        .into_iter()
-        .map(|(name, limit)| (name, limit.limit()));
-    match app.guard.set_classes(classes) {
+    let mut parsed = Vec::with_capacity(classes.len());
+    for (name, value) in classes {
+        match limit_from_json(&value) {
+            Ok(limit) => parsed.push((name, limit)),
+            Err(error) => return bad_request(format!("class {name}: {error}")),
+        }
+    }
+    match app.guard.set_classes(parsed) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => bad_request(error),
     }
 }
 
 async fn set_limit(State(app): State<App>, body: Bytes) -> Response {
-    let limit: LimitBody = match serde_json::from_slice(&body) {
-        Ok(limit) => limit,
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
         Err(error) => return bad_request(error),
     };
-    match app.guard.set_limit(limit.limit()) {
+    match limit_from_json(&value).map(|limit| app.guard.set_limit(limit)) {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(error)) => bad_request(error),
+        Err(error) => bad_request(error),
+    }
+}
+
+async fn set_key_limits(State(app): State<App>, body: Bytes) -> Response {
+    let entries: Vec<Value> = match serde_json::from_slice(&body) {
+        Ok(entries) => entries,
+        Err(error) => return bad_request(error),
+    };
+    let mut parsed = Vec::with_capacity(entries.len());
+    for (at, entry) in entries.iter().enumerate() {
+        match key_limit_from_json(entry) {
+            Ok(parsed_entry) => parsed.push(parsed_entry),
+            Err(error) => return bad_request(format!("entry {at}: {error}")),
+        }
+    }
+    match app.guard.set_key_limits(parsed) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => bad_request(error),
+    }
+}
+
+// One entry of `PUT /v1/key_limits`: its class, key and limit.
+fn key_limit_from_json(entry: &Value) -> Result<(String, String, KeyLimit), String> {
+    let object = entry.as_object().ok_or("an entry is an object")?;
+    let text = |name: &str| -> Result<Option<String>, String> {
+        match object.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text.clone())),
+            Some(_) => Err(format!("{name} is not a string")),
+        }
+    };
+    let key = text("key")?.ok_or("an entry needs a key")?;
+    let class = text("class")?.unwrap_or_default();
+    let limit = match (object.get("limit"), text("as_class")?) {
+        (Some(limit), None) => KeyLimit::from(limit_from_json(limit)?),
+        (None, Some(name)) => KeyLimit::class(name),
+        _ => return Err("an entry has exactly one of limit and as_class".into()),
+    };
+    Ok((class, key, limit))
+}
+
+async fn set_shadows(State(app): State<App>, body: Bytes) -> Response {
+    let shadows: HashMap<String, Value> = match serde_json::from_slice(&body) {
+        Ok(shadows) => shadows,
+        Err(error) => return bad_request(error),
+    };
+    let mut parsed = Vec::with_capacity(shadows.len());
+    for (class, value) in shadows {
+        // Replace-all: no shadow for a class is a class left out, or null.
+        if value.is_null() {
+            continue;
+        }
+        match limit_from_json(&value) {
+            Ok(limit) => parsed.push((class, limit)),
+            Err(error) => return bad_request(format!("class {class:?}: {error}")),
+        }
+    }
+    match app.guard.set_shadows(parsed) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => bad_request(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct KeyQuery {
+    key: String,
+    #[serde(default)]
+    class: String,
+}
+
+async fn key_stats(
+    State(app): State<App>,
+    query: Result<Query<KeyQuery>, impl std::fmt::Display>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return bad_request(error),
+    };
+    match app.guard.key_stats(&query.class, &query.key).await {
+        Some(s) => axum::Json(json!({
+            "requests_per_sec": s.requests_per_sec,
+            "denied_per_sec": s.denied_per_sec,
+            "shadow_denied_per_sec": s.shadow_denied_per_sec,
+            "share": s.share,
+            "limit": limit_to_json(s.limit),
+            "shadow": s.shadow.map(limit_to_json),
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "this node does not track the key"})),
+        )
+            .into_response(),
     }
 }
 

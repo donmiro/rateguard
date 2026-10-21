@@ -32,7 +32,7 @@ use crate::{
     boundary::{Action, Event, PeerId},
     gcra::{Decision, Nanos, Quota},
     gossip::{self, Gossip},
-    limiter::{Config, Limit, Limiter},
+    limiter::{Config, KeyRates, Limit, Limiter, Tally},
     member::{Applied, MemberTable},
     membership::{Change, Membership},
     partition::{self, PartitionPolicy, SizeHistory},
@@ -299,19 +299,24 @@ impl Node {
         self.refresh_cap(self.last_now);
     }
 
-    /// Counts `attempts` collected by a runtime that enforces in its own
-    /// table, `denials` of them denied, for a key whose limit is `limit`;
+    /// Counts what a runtime that enforces in its own table collected for
+    /// a key whose limit is `limit`: attempts, denials and shadow denials;
     /// [`quota`](Node::quota) is the way back.
     ///
     /// # Panics
     ///
     /// If `now` is earlier than a time already seen, or the limit is out of
     /// range, as for [`Limiter::check_in`].
-    pub fn record(&mut self, key: u64, attempts: u64, denials: u64, limit: Limit, now: Nanos) {
+    pub fn record(&mut self, key: u64, tally: Tally, limit: Limit, now: Nanos) {
         self.advance(now);
         let cluster_size = self.allocation_size();
-        self.limiter
-            .record(key, attempts, denials, limit, now, cluster_size);
+        self.limiter.record(key, tally, limit, now, cluster_size);
+    }
+
+    /// The key's requests, denials and shadow denials a second, if it is
+    /// tracked; see [`Limiter::key_rates`].
+    pub fn key_rates(&self, key: u64) -> Option<KeyRates> {
+        self.limiter.key_rates(key)
     }
 
     /// The quota `key` is held to after the last round, every cap included.
@@ -321,7 +326,7 @@ impl Node {
 
     /// The quota a key not seen before starts with, at the config's limit.
     pub fn new_key_quota(&self) -> Quota {
-        self.new_key_quota_in(self.limiter.config().limit())
+        self.new_key_quota_in(self.limiter.config().limit)
     }
 
     /// The quota a key not seen before starts with in `limit`.
@@ -337,8 +342,14 @@ impl Node {
 
     /// Up to `k` keys with the most denials lately, in denials a second,
     /// most denied first; see [`Limiter::most_denied`].
-    pub fn most_denied(&self, k: usize) -> Vec<(u64, f64)> {
+    pub fn most_denied(&self, k: usize) -> Vec<(u64, KeyRates)> {
         self.limiter.most_denied(k)
+    }
+
+    /// Up to `k` keys with the most shadow denials lately, most first; see
+    /// [`Limiter::most_shadow_denied`].
+    pub fn most_shadow_denied(&self, k: usize) -> Vec<(u64, KeyRates)> {
+        self.limiter.most_shadow_denied(k)
     }
 
     /// Whether the key has state on this node.
@@ -451,7 +462,7 @@ impl Node {
     /// If `now` is earlier than a time already seen: time running backwards
     /// would break GCRA silently.
     pub fn check(&mut self, key: u64, now: Nanos) -> Decision {
-        self.check_in(key, self.limiter.config().limit(), now)
+        self.check_in(key, self.limiter.config().limit, now)
     }
 
     /// Like [`check`](Node::check), for a key with a limit of its own.
@@ -464,6 +475,27 @@ impl Node {
         self.advance(now);
         self.limiter
             .check_in(key, limit, now, self.allocation_size())
+    }
+
+    /// Like [`check_in`](Node::check_in), with what the limit `shadow`,
+    /// only tried out, would have decided, as
+    /// [`Limiter::check_in_traced`] tells it: for a caller that enforces
+    /// here, as the simulator does. The decision is `check_in`'s.
+    ///
+    /// # Panics
+    ///
+    /// As [`check_in`](Node::check_in), for either limit.
+    pub fn check_in_traced(
+        &mut self,
+        key: u64,
+        limit: Limit,
+        shadow: Option<Limit>,
+        now: Nanos,
+    ) -> (Decision, Option<Decision>) {
+        self.advance(now);
+        let cluster_size = self.allocation_size();
+        self.limiter
+            .check_in_traced(key, limit, shadow, now, cluster_size)
     }
 
     /// Handles an event and returns the datagrams to send.
@@ -1221,8 +1253,10 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            limit_per_sec: 1000,
-            burst: 10,
+            limit: Limit {
+                rate: 1000.0,
+                burst: 10,
+            },
             alpha: 0.5,
             floor_factor: 0.1,
             cooldown: 5 * ONE_SEC,
@@ -1249,7 +1283,7 @@ mod tests {
     }
 
     fn measured_interval_of(node: &mut Node, key: u64, now: Nanos) -> Nanos {
-        for _ in 0..config().burst {
+        for _ in 0..config().limit.burst {
             assert_eq!(node.check(key, now), Decision::Allow);
         }
         let Decision::Deny { retry_at } = node.check(key, now) else {
@@ -2432,7 +2466,7 @@ mod tests {
     }
 
     const PRO: Limit = Limit {
-        per_second: 200,
+        rate: 200.0,
         burst: 4,
     };
 
@@ -2474,11 +2508,58 @@ mod tests {
         assert_eq!(n.new_key_factor(), 0.05, "β / 2");
     }
 
+    // The shadow's quota is the applied one scaled by the ratio of the two
+    // limits: alone, a new key's is α × R = 500 of 1000, so a shadow of 100
+    // gets 50 a second, an interval of 20 ms, with its own burst of 2. The
+    // decision is the limit's, whatever the shadow says.
+    #[test]
+    fn a_traced_check_tells_the_shadow_scaled_from_the_applied_quota() {
+        let mut n = node();
+        n.handle(Event::Tick, 0);
+        let shadow = Limit {
+            rate: 100.0,
+            burst: 2,
+        };
+        let limit = config().limit;
+        for _ in 0..2 {
+            assert_eq!(
+                n.check_in_traced(KEY, limit, Some(shadow), 0),
+                (Decision::Allow, Some(Decision::Allow))
+            );
+        }
+        assert_eq!(
+            n.check_in_traced(KEY, limit, Some(shadow), 0),
+            (
+                Decision::Allow,
+                Some(Decision::Deny {
+                    retry_at: 20 * ONE_MS
+                })
+            )
+        );
+        assert_eq!(
+            n.check_in_traced(KEY, limit, None, 0),
+            (Decision::Allow, None),
+            "no shadow, none told"
+        );
+        n.handle(Event::Tick, PERIOD);
+        assert!(n.key_rates(KEY).unwrap().shadow_denied_per_sec > 0.0);
+        assert!(n.most_denied(10).is_empty(), "the limit denied nothing");
+    }
+
     #[test]
     fn denials_recorded_by_a_runtime_list_the_key() {
         let mut n = node();
         n.handle(Event::Tick, 0);
-        n.record(KEY, 100, 60, PRO, 0);
+        n.record(
+            KEY,
+            Tally {
+                attempts: 100,
+                denials: 60,
+                shadow_denials: 0,
+            },
+            PRO,
+            0,
+        );
         n.handle(Event::Tick, PERIOD);
         let denied = n.most_denied(10);
         assert_eq!(denied.len(), 1);
@@ -2822,12 +2903,20 @@ mod tests {
     fn a_node_fed_attempts_hands_out_quotas() {
         let mut n = node();
         n.handle(Event::Tick, 0);
-        n.record(KEY, 2000, 0, config().limit(), 0);
+        n.record(
+            KEY,
+            Tally {
+                attempts: 2000,
+                ..Tally::default()
+            },
+            config().limit,
+            0,
+        );
         assert!(n.is_tracked(KEY));
         n.handle(Event::Tick, ONE_SEC);
         assert!(n.limiter().is_hot(KEY));
         // Alone, nobody to learn from: the share is the whole limit.
-        assert_eq!(n.quota(KEY), Some(Quota::new(1000, config().burst)));
+        assert_eq!(n.quota(KEY), Some(Quota::new(1000, config().limit.burst)));
     }
 
     #[test]
@@ -2835,7 +2924,7 @@ mod tests {
         let mut n = node();
         n.add_seed(PeerId::new(1), addr(1));
         // R × β over itself and its seed; the test config has β = 0.1.
-        assert_eq!(n.new_key_quota(), Quota::new(50, config().burst));
+        assert_eq!(n.new_key_quota(), Quota::new(50, config().limit.burst));
     }
 
     #[test]
@@ -2843,10 +2932,14 @@ mod tests {
         let mut n = node();
         n.expect_peers(true);
         // R × β over itself alone; the test config has β = 0.1.
-        assert_eq!(n.new_key_quota(), Quota::new(100, config().burst));
+        assert_eq!(n.new_key_quota(), Quota::new(100, config().limit.burst));
         n.add_seed(PeerId::new(1), addr(1));
         n.remove_seed(PeerId::new(1));
-        assert_eq!(n.new_key_quota(), Quota::new(100, config().burst), "still");
+        assert_eq!(
+            n.new_key_quota(),
+            Quota::new(100, config().limit.burst),
+            "still"
+        );
         n.expect_peers(false);
         assert_eq!(cold_rate_after_round(&mut n, 0), 500.0, "a fleet of one");
     }
@@ -2864,7 +2957,7 @@ mod tests {
         };
         deliver(&mut n, 5, answer, ONE_MS);
         n.handle(Event::Tick, PERIOD);
-        assert_ne!(n.new_key_quota(), Quota::new(100, config().burst));
+        assert_ne!(n.new_key_quota(), Quota::new(100, config().limit.burst));
     }
 
     #[test]
@@ -2875,7 +2968,7 @@ mod tests {
         n.remove_seed(PeerId::new(1));
         assert_eq!(n.address(PeerId::new(1)), None);
         // R × β over itself and the seed left.
-        assert_eq!(n.new_key_quota(), Quota::new(50, config().burst));
+        assert_eq!(n.new_key_quota(), Quota::new(50, config().limit.burst));
         n.remove_seed(PeerId::new(2));
         assert_eq!(cold_rate_after_round(&mut n, 0), 500.0, "alone again");
     }

@@ -4,7 +4,7 @@
 //     cargo test --release -p rateguard-sim --test calibration -- --ignored --nocapture
 
 use rateguard_core::gcra::{Decision, Nanos};
-use rateguard_core::limiter::Config;
+use rateguard_core::limiter::{Config, Limit};
 use rateguard_sim::link::PerfectLink;
 use rateguard_sim::sim::Sim;
 
@@ -15,8 +15,10 @@ const KEY: u64 = 42;
 
 fn config(alpha: f64, beta: f64) -> Config {
     Config {
-        limit_per_sec: R as u32,
-        burst: 10,
+        limit: Limit {
+            rate: R as u32 as f64,
+            burst: 10,
+        },
         alpha,
         floor_factor: beta,
         cooldown: 5 * ONE_SEC,

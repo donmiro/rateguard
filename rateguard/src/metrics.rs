@@ -28,6 +28,11 @@ pub(crate) fn publish(stats: &Stats, guard: &str) {
         std::slice::from_ref(&label)
     )
     .absolute(stats.unknown_class);
+    metrics::counter!(
+        "rateguard_shadow_denied_total",
+        std::slice::from_ref(&label)
+    )
+    .absolute(stats.shadow_denied);
     let rejected = [
         ("unsigned", stats.rejected_datagrams.unsigned),
         ("bad_tag", stats.rejected_datagrams.bad_tag),

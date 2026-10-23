@@ -23,6 +23,9 @@ pub enum SecretsError {
     Short(usize, usize),
     /// This many secrets, more than 2.
     TooMany(usize),
+    /// The line of this number, from 1, looks like the rest of a secret
+    /// that `openssl` wrapped onto two lines.
+    Wrapped(usize),
 }
 
 impl fmt::Display for SecretsError {
@@ -35,6 +38,12 @@ impl fmt::Display for SecretsError {
                 "line {line} holds a secret of {n} bytes, at least 32 are needed"
             ),
             SecretsError::TooMany(n) => write!(f, "{n} secrets, at most 2 are held"),
+            SecretsError::Wrapped(line) => write!(
+                f,
+                "line {line} looks like the rest of a secret that was wrapped: `openssl` wraps \
+                 base64 at 64 characters, so one secret of more than 48 bytes runs onto a \
+                 second line; `openssl rand -base64 32`, or `-A` for any length, gives one line"
+            ),
         }
     }
 }
@@ -47,6 +56,10 @@ impl std::error::Error for SecretsError {}
 pub fn read_secrets(path: &Path) -> Result<Vec<Secret>, SecretsError> {
     let content = std::fs::read(path).map_err(SecretsError::Unreadable)?;
     let mut secrets = Vec::new();
+    // Whether the line before decoded and was exactly as long as `openssl`
+    // wraps at: then a short line after it is more likely its rest than a
+    // secret of its own.
+    let mut after_full_line = false;
     for (i, line) in content.split(|&b| b == b'\n').enumerate() {
         let line = line.trim_ascii();
         if line.is_empty() {
@@ -58,7 +71,12 @@ pub fn read_secrets(path: &Path) -> Result<Vec<Secret>, SecretsError> {
             .decode(line)
             .map_err(|_| SecretsError::NotBase64(i + 1))?;
         let n = bytes.len();
-        secrets.push(Secret::new(bytes).map_err(|_| SecretsError::Short(i + 1, n))?);
+        let secret = Secret::new(bytes);
+        if after_full_line && (secret.is_err() || secrets.len() == 2) {
+            return Err(SecretsError::Wrapped(i + 1));
+        }
+        after_full_line = line.len() == 64;
+        secrets.push(secret.map_err(|_| SecretsError::Short(i + 1, n))?);
     }
     if secrets.len() > 2 {
         return Err(SecretsError::TooMany(secrets.len()));
@@ -135,6 +153,25 @@ mod tests {
             read_secrets(&file.0),
             Err(SecretsError::Short(2, 31))
         ));
+    }
+
+    #[test]
+    fn a_wrapped_base64_secret_names_the_wrap() {
+        // What `openssl rand -base64 64` prints: 64 characters, then 24.
+        let line1 = "oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGh";
+        let line2 = "oaGhoaGhoaGhoaGhoaGhoaE=";
+        assert_eq!(line1.len(), 64);
+        assert_eq!(line2.len(), 24);
+        let file = File::with("wrapped", format!("{line1}\n{line2}\n").as_bytes());
+        let error = read_secrets(&file.0).unwrap_err();
+        assert!(matches!(error, SecretsError::Wrapped(2)), "{error:?}");
+        let shown = error.to_string();
+        assert!(shown.contains("line 2"), "{shown}");
+        assert!(shown.contains("openssl"), "{shown}");
+        assert!(shown.contains("64 characters"), "{shown}");
+        assert!(shown.contains("-base64 32"), "{shown}");
+        assert!(shown.contains("-A"), "{shown}");
+        assert!(!shown.contains(line2), "{shown}");
     }
 
     #[test]

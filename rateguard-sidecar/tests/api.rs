@@ -7,7 +7,7 @@ use axum::Router;
 use axum::body::Body;
 use http_body_util::BodyExt;
 use rateguard::{GossipAuth, Guard, Limit, Secret};
-use rateguard_sidecar::{App, app, public_app};
+use rateguard_sidecar::{App, MAX_BODY, app, public_app};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -240,9 +240,12 @@ async fn stats_tell_the_gossip_auth_and_the_rejected_datagrams() {
     let router = router(&guard, false);
     let (_, stats) = send(&router, "GET", "/v1/stats", None).await;
     assert_eq!(stats["gossip_auth"], "off", "{stats}");
+    assert_eq!(stats["identity_conflicts"], 0, "{stats}");
+    assert_eq!(stats["members_refused"], 0, "{stats}");
+    assert_eq!(stats["members_full"], false, "{stats}");
     assert_eq!(
         stats["rejected_datagrams"],
-        json!({"unsigned": 0, "bad_tag": 0, "malformed": 0})
+        json!({"unsigned": 0, "bad_tag": 0, "malformed": 0, "mismatched_records": 0})
     );
     // A datagram that is no message, counted in every mode.
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -663,4 +666,76 @@ async fn stats_names_the_shadow_denied_keys() {
         assert!(tokio::time::Instant::now() < deadline, "{stats}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+// The class is a field of the same body as the key, and Python and
+// JavaScript send a lone surrogate in it as readily. A 400 would have their
+// clients fail open.
+#[tokio::test]
+async fn a_class_with_a_lone_surrogate_is_checked() {
+    let guard = guard();
+    let router = router(&guard, false);
+    let mut decisions = Vec::new();
+    for _ in 0..4 {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/check")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"key":"k","class":"pro\ud800"}"#))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        decisions.push(value["allowed"].as_bool().unwrap());
+    }
+    // An unknown class is the default class, whose burst is 3.
+    assert_eq!(decisions, [true, true, true, false]);
+}
+
+#[tokio::test]
+async fn a_body_of_the_limit_is_checked_and_one_byte_more_is_413() {
+    let guard = guard();
+    let router = router(&guard, false);
+    let body_of = |len: usize| {
+        let frame = r#"{"key":""}"#.len();
+        format!(r#"{{"key":"{}"}}"#, "a".repeat(len - frame))
+    };
+    let post = |body: String| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/check")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let at = body_of(MAX_BODY);
+    assert_eq!(at.len(), MAX_BODY);
+    let response = router.clone().oneshot(post(at)).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    let response = router
+        .clone()
+        .oneshot(post(body_of(MAX_BODY + 1)))
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 413);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value, json!({"error": "the body is too large"}));
+}
+
+// The body limit is for checks: a bulk replace of key limits is far larger.
+#[tokio::test]
+async fn a_bulk_key_limits_body_over_the_check_limit_is_accepted() {
+    let guard = guard();
+    let router = router(&guard, true);
+    let entries: Vec<Value> = (0..1500)
+        .map(|i| json!({"key": format!("tenant:{i}"), "limit": {"per_second": 50}}))
+        .collect();
+    let body = Value::Array(entries);
+    assert!(body.to_string().len() > MAX_BODY);
+    let (status, value) = send(&router, "PUT", "/v1/key_limits", Some(body)).await;
+    assert_eq!(status, 204, "{value}");
+    assert_eq!(guard.key_limits().len(), 1500);
 }

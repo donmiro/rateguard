@@ -7,6 +7,103 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-22
+
+Fixes from an audit of 0.7.0, and a cap on the members a node keeps. The
+wire format is unchanged: nodes of 0.7.0 and 0.7.1 run side by side, and
+every fix works when the peer is on 0.7.0.
+
+### Added
+
+- `Builder::max_members(n)`: a bound on the members a node keeps, 8192 by
+  default, from 1 to 65,536 (`Error::TooLargeMaxMembers` outside that).
+  News of a member the node already knows is always taken; a stranger past
+  the cap is refused and not gossiped on, and nobody is evicted. Size it
+  for the fleet plus every address that churned in the last 10 minutes
+  (`tombstone_ttl`): about twice the fleet for rolling deploys that give
+  pods new IPs (the default covers fleets up to about 4000 instances under
+  rolling deploys). Over the cap the limit is not guaranteed: a node the
+  table refused counts the fleet short and can admit more than its share.
+  For 10 minutes after it refused a live newcomer, a node shares the limit
+  as if `n` nodes were up and holds every key at the floor `R × β / n`, as
+  it cannot count the newcomer nor see its demand. That softens an
+  overflow but does not close it: the refused node itself does not hold,
+  as its own table is not full, and a node that heard of the newcomer only
+  second-hand lifts its hold after `tombstone_ttl` while the overflow
+  lasts, once the gossip about it has run out. Treat any growth of
+  `members_refused` in a legitimate fleet as a reason to raise the cap now.
+  It bounds memory, not availability: a flood of made-up
+  members brings every key down to that floor, and real newcomers wait for
+  a slot. Only signing keeps strangers out. `rateguard-core`:
+  `Node::set_max_members`, `max_members`, `members_refused` and
+  `Held::members_full`.
+- `Stats::members_full` and, with `metrics`,
+  `rateguard_held{reason="members_full"}`, also in the sidecar's
+  `/v1/stats`: every key held at the floor over `max_members` because the
+  full member table refused a live newcomer in the last 10 minutes.
+- `Stats::members_refused` and, with `metrics`,
+  `rateguard_members_refused_total`: members refused at the cap. Steady
+  growth means a cluster bigger than the cap or a flood.
+- `Stats::identity_conflicts` and `rateguard_identity_conflicts_total`
+  (`rateguard-core`: `Node::identity_conflicts`): news that outbid this
+  node's own incarnation. A quick restart adds one; steady growth means two
+  instances advertise one address.
+- The Python client's `Decision.error`: why a decision was made without the
+  sidecar's answer, whatever `on_error` says.
+- `rateguard-sidecar`: `--max-members` (`RATEGUARD_MAX_MEMBERS`),
+  `members_refused` and `identity_conflicts` in `/v1/stats`, a warning at
+  start when gossip is not signed, and a body limit of 64 KiB on
+  `/v1/check`.
+
+### Fixed
+
+- A key that was tracked and idle kept its old limit after a change to its
+  key limit, class or the default: the driver only handed the new limit to
+  keys that had traffic in the round. It now takes it at the next tick.
+- `rateguard-sidecar`: a key with a lone surrogate sent in `class` was
+  answered `400`, as 0.5.1 fixed for `key`; the class is read as bytes now.
+  A `/v1/check` body over 64 KiB is refused with `413` and a JSON error;
+  the admin routes keep 2 MB. A gossip secret file wrapped at 64 characters
+  by `openssl base64` is refused with a hint, not read as short secrets.
+- The clients took a `413` from the sidecar, a key over its limit, as an
+  outage and let the request through, as `on_error` says. A `413` now
+  denies, whatever `on_error` is. The TypeScript client checks the status
+  before it reads the body, and in Python and TypeScript an empty URL is
+  unset.
+- A key new to a node had its demand measured from the moment it was first
+  seen, not from the last tick, so its first tick read low, and under
+  `max_tracked_keys` a heavy new key was evicted in favour of idle ones. It
+  is now measured from the previous tick.
+- A node that fell behind its own incarnation after a quick restart was
+  never told, so its leave went unheard. It is told now, and
+  `identity_conflicts` counts the conflict.
+- A demand report that was not taken, as a reordered or replayed datagram
+  is, did not count for the sender at all. It now counts at the maximum for
+  the stale window, so such a datagram can make a node stricter and no more.
+  One case stays: a recording 0.75 to 1 of a round circle old (about 2.7 to
+  3.6 hours at the default period) can lower a peer's demand for one gap
+  between its reports; closing it takes a wider round on the wire. The
+  recorded leave replayed after a restart is open (spec §9.1, item 37).
+- A probe's sequence number started at 1 on every run, so a reply recorded
+  in an earlier run could keep a dead peer alive in a later one. It starts
+  at random.
+- A key at the saturation point of its TAT, after a dip to the slowest rate
+  and back, was handed its whole burst again. It now carries at least the
+  larger burst's debt, and `Gcra::set_quota` with an identical quota no
+  longer moves a large TAT by rounding.
+- A period over 600 s panicked in `Builder::spawn`, the tombstone TTL being
+  shorter than the suspicion timeout; the TTL is stretched to the period.
+  Changing a class copied the whole table while it held readers out; the
+  copy is made outside their lock now.
+- A datagram whose sender goes by an ID other than its address gives is
+  `malformed`, signed or not; a later record naming a member so is dropped
+  alone, counted in the new `RejectedDatagrams::mismatched_records` (also
+  `rateguard_rejected_datagrams_total{reason="mismatched_records"}` and in
+  the sidecar's `/v1/stats`), so that a 0.7.0 peer passing on a forger's
+  news is still heard. The demand of a refused stranger is not
+  kept; the members a node keeps are bounded by `max_members`, so a flood of
+  made-up members no longer grows its memory without limit.
+
 ## [0.7.0] - 2026-10-21
 
 Limits per minute and per hour, limits for single keys, shadow limits for
@@ -386,7 +483,8 @@ The first release.
 - A runnable `axum` middleware example.
 - An accuracy report in the README, generated by the simulator.
 
-[Unreleased]: https://github.com/donmiro/rateguard/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/donmiro/rateguard/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/donmiro/rateguard/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/donmiro/rateguard/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/donmiro/rateguard/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/donmiro/rateguard/compare/v0.5.0...v0.5.1

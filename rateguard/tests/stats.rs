@@ -78,7 +78,7 @@ async fn a_lone_node_tells_its_cluster_and_keys() {
     let stats = until(&guard, |s| s.tracked_keys == 1).await;
     assert_eq!((stats.cluster_size, stats.counted_size), (1, 1));
     assert_eq!((stats.suspects, stats.hot_keys), (0, 0));
-    assert!(!stats.joining && !stats.learning && !stats.without_quorum);
+    assert!(!stats.joining && !stats.learning && !stats.without_quorum && !stats.members_full);
     let since = stats.since_last_round.expect("rounds run");
     assert!(since < Duration::from_secs(1), "{since:?}");
 }
@@ -291,4 +291,87 @@ async fn key_stats_gives_up_with_the_task() {
     guard.leave().await;
     let answered = tokio::time::timeout(Duration::from_secs(5), guard.key_stats("", "k")).await;
     assert_eq!(answered, Ok(None), "no task left to ask");
+}
+
+#[tokio::test]
+async fn an_alive_of_its_own_it_did_not_make_is_an_identity_conflict() {
+    // A peer, played by hand: the node's seed, so the node writes first and
+    // says who it is.
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let at = peer.local_addr().unwrap();
+    let guard = builder(100, 5).seeds([at.to_string()]).spawn().unwrap();
+    assert_eq!(guard.stats().identity_conflicts, 0);
+    let mut buf = [0u8; 1500];
+    let (len, from) = tokio::time::timeout(Duration::from_secs(10), peer.recv_from(&mut buf))
+        .await
+        .expect("the node knocks on its seed")
+        .unwrap();
+    let knock = rateguard_proto::decode(&buf[..len]).unwrap();
+    let own = knock.updates()[0];
+
+    // The peer holds the node alive above its own incarnation, as when a
+    // second instance runs under its address.
+    let ahead = rateguard_proto::Update {
+        incarnation: own.incarnation + 5,
+        ..own
+    };
+    let reply = rateguard_proto::Message::Ping {
+        seq: 1,
+        updates: vec![
+            rateguard_proto::Update {
+                member: id_of(at.into()),
+                addr: at.into(),
+                incarnation: 0,
+                status: rateguard_proto::Status::Alive,
+            },
+            ahead,
+        ],
+        demand: Vec::new(),
+    };
+    let bytes = rateguard_proto::encode(&reply).unwrap();
+    peer.send_to(&bytes, from).await.unwrap();
+    let stats = until(&guard, |s| s.identity_conflicts > 0).await;
+    assert_eq!(stats.identity_conflicts, 1);
+}
+
+// A peer's ID as every node derives it from its address: anything else is
+// refused as malformed.
+fn id_of(addr: rateguard_proto::Address) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(&postcard::to_allocvec(&addr).unwrap())
+}
+
+#[tokio::test]
+async fn a_stranger_over_the_member_cap_is_refused_and_counted() {
+    let port = free_port();
+    let guard = Guard::builder()
+        .bind(format!("127.0.0.1:{port}"))
+        .limit(100)
+        .max_members(1)
+        .spawn()
+        .unwrap();
+    assert_eq!(guard.stats().members_refused, 0);
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let me = rateguard_proto::Address::from(socket.local_addr().unwrap());
+    let ping = rateguard_proto::Message::Ping {
+        seq: 1,
+        updates: vec![rateguard_proto::Update {
+            member: id_of(me),
+            addr: me,
+            incarnation: 0,
+            status: rateguard_proto::Status::Alive,
+        }],
+        demand: Vec::new(),
+    };
+    let bytes = rateguard_proto::encode(&ping).unwrap();
+    socket.send_to(&bytes, ("127.0.0.1", port)).unwrap();
+    let stats = until(&guard, |s| s.members_refused > 0).await;
+    assert_eq!(stats.members_refused, 1);
+    assert_eq!(stats.cluster_size, 1);
+    // A newcomer this instance cannot count: it shares as if its table
+    // were full of live members, and holds every key at that floor.
+    assert!(stats.members_full);
+    assert_eq!(
+        stats.rejected_datagrams.malformed, 0,
+        "refused, not malformed"
+    );
 }

@@ -3,8 +3,11 @@ package rateguard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,6 +114,24 @@ func TestASidecarThatAnswersBadlyCountsAsAnError(t *testing.T) {
 	}
 }
 
+func TestAKeyOverTheSidecarsLimitIsDeniedWhateverOnErrorSays(t *testing.T) {
+	f := newFake(t, 413, 0, func(map[string]string) any { return map[string]any{"error": "the body is too large"} })
+	d, err := New(Options{URL: f.URL}).Check(context.Background(), "k")
+	if err == nil || d.Allowed || d.RetryAfter != 0 || !strings.Contains(err.Error(), "64 KiB") {
+		t.Fatalf("got %+v, %v", d, err)
+	}
+}
+
+func TestAServerErrorFollowsOnError(t *testing.T) {
+	f := newFake(t, 500, 0, func(map[string]string) any { return map[string]any{"error": "boom"} })
+	if d, err := New(Options{URL: f.URL}).Check(context.Background(), "k"); err == nil || !d.Allowed {
+		t.Fatalf("got %+v, %v", d, err)
+	}
+	if d, err := New(Options{URL: f.URL, OnError: Deny}).Check(context.Background(), "k"); err == nil || d.Allowed {
+		t.Fatalf("got %+v, %v", d, err)
+	}
+}
+
 func TestTheURLComesFromTheEnvironmentByDefault(t *testing.T) {
 	f := newFake(t, 200, 0, allow)
 	t.Setenv("RATEGUARD_SIDECAR_URL", f.URL)
@@ -147,5 +168,26 @@ func TestFailingChecksKeepTheirConnection(t *testing.T) {
 	}
 	if len(f.peers) != 1 {
 		t.Fatalf("%d connections for 20 failing checks, want 1", len(f.peers))
+	}
+}
+
+// Against a real `rateguard-sidecar --limit 2 --burst 2`: see
+// sdk/live/run.sh. Go cannot send a lone surrogate (its JSON encoder
+// replaces it), so that live case is left to the other clients.
+func TestLiveTheBurstIsAllowedAndTheNextDenied(t *testing.T) {
+	url := os.Getenv("RATEGUARD_LIVE_URL")
+	if url == "" {
+		t.Skip("RATEGUARD_LIVE_URL is not set")
+	}
+	c := New(Options{URL: url, Timeout: 2 * time.Second})
+	key := fmt.Sprintf("go-live-%d", os.Getpid())
+	for i := 0; i < 2; i++ {
+		if d, err := c.Check(context.Background(), key); err != nil || !d.Allowed {
+			t.Fatalf("check %d: got %+v, %v", i, d, err)
+		}
+	}
+	d, err := c.Check(context.Background(), key)
+	if err != nil || d.Allowed || d.RetryAfter <= 0 {
+		t.Fatalf("third check: got %+v, %v", d, err)
 	}
 }

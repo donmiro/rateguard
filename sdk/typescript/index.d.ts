@@ -6,7 +6,8 @@ export interface Decision {
   retryAfterMs: number;
   /**
    * Set when the sidecar could not answer: the decision then follows
-   * `onError`.
+   * `onError`, except for a key over the sidecar's 64 KiB limit (a 413),
+   * which is always denied.
    */
   error?: string;
 }

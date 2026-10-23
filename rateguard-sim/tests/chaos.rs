@@ -294,3 +294,58 @@ fn a_rolling_restart_of_the_whole_cluster_converges() {
     });
     everyone_sees_everyone(&s);
 }
+
+// Someone on the wire records datagrams and sends copies again, each up to
+// ten minutes after the original. The copies are genuine, signed or not,
+// so only their content can give them away.
+struct Replaying {
+    rng: rateguard_core::rng::Rng,
+    share: f64,
+    reach: Nanos,
+}
+impl Link for Replaying {
+    fn fate(&mut self, _from: NodeIndex, _to: NodeIndex, now: Nanos, _len: usize) -> Fate {
+        let replayed = self.rng.unit() < self.share;
+        let later = now + LATENCY + 1 + self.rng.up_to(self.reach);
+        if replayed {
+            Fate::Duplicated(now + LATENCY, later)
+        } else {
+            Fate::Delivered(now + LATENCY)
+        }
+    }
+}
+
+// Node 1 is idle until it restarts, busy after; node 0 restarts later and
+// so never saw node 1's first run. Replayed reports of that run show node 1
+// idle. Taken at face value they would hand node 0 node 1's share too.
+#[test]
+fn replayed_datagrams_never_push_the_fleet_over_r() {
+    const KEY: u64 = 42;
+    const END: Nanos = 120 * ONE_SEC;
+    seed::each_seed(3, |seed| {
+        let link = Replaying {
+            rng: rateguard_core::rng::Rng::new(seed),
+            share: 0.5,
+            reach: 600 * ONE_SEC,
+        };
+        let mut s = Sim::new(5, config(), link);
+        s.schedule_restart(1, 40 * ONE_SEC, 41 * ONE_SEC);
+        s.schedule_restart(0, 50 * ONE_SEC, 51 * ONE_SEC);
+        s.schedule_request_stream(0, KEY, 800, 0, END);
+        s.schedule_request_stream(1, KEY, 20, 0, 40 * ONE_SEC);
+        s.schedule_request_stream(1, KEY, 800, 41 * ONE_SEC, END);
+        for node in 2..5 {
+            s.schedule_request_stream(node, KEY, 100, 0, END);
+        }
+        // The admission window is among the standard invariants: it is
+        // checked on every admission of the run.
+        s.run_until(END);
+
+        let from = 10 * ONE_SEC;
+        let rate = s.admitted_between(from, END) as f64 / ((END - from) / ONE_SEC) as f64;
+        assert!(
+            rate <= 1000.0 * 1.01,
+            "admitted {rate:.1} a second on average, R is 1000"
+        );
+    });
+}

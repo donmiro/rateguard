@@ -23,6 +23,9 @@ async fn main() -> ExitCode {
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Installed before the node starts, so that its first tick is counted.
     let metrics = PrometheusBuilder::new().install_recorder()?;
+    for line in args.startup_warnings() {
+        eprintln!("{line}");
+    }
     let guard = args.builder()?.spawn()?;
     if let Some(path) = &args.gossip_secret_file {
         // Stops with the node.

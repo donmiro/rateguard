@@ -20,6 +20,10 @@
 //! - A peer held as suspect or dead hears it on every message sent to it,
 //!   not only while the news is in the gossip buffer: it is the one node
 //!   that can refute it.
+//! - A peer that announces itself alive below the incarnation we hold for
+//!   it, restarted at 0 before anyone noticed, hears our record of it the
+//!   same way and outbids it. Otherwise its later leave would be older than
+//!   what the cluster holds, and dropped.
 //! - Every `reconnect_interval` the probe goes to a random dead member or
 //!   unknown seed instead. Without it, two sides that buried each other
 //!   would never speak again.
@@ -45,6 +49,11 @@ const ONE_MS: Nanos = 1_000_000;
 /// How long a node without a majority keeps counting it against the size it
 /// last saw, by default: an hour. See [`PartitionPolicy::Quorum`].
 pub const DEFAULT_QUORUM_MEMORY: Nanos = 3_600_000 * ONE_MS;
+
+/// The most members a node keeps in its table by default, the dead not yet
+/// forgotten and itself included; see [`Node::set_max_members`]. Room for
+/// a fleet of a few thousand with a rolling deploy's churn on top.
+pub const DEFAULT_MAX_MEMBERS: usize = 8192;
 
 // How many rounds a share has to stay up before it is applied. A peer
 // recomputes its shares once a round, so up to a round after it has heard
@@ -137,9 +146,15 @@ pub struct Node {
     expects_peers: bool,
     last_heard: BTreeMap<PeerId, Nanos>,
     reported: VecDeque<(Nanos, Vec<KeyDemand>)>,
+    // Peers whose last message announced them alive at an incarnation
+    // below the one we hold: restarted, and nobody told them.
+    behind: BTreeSet<PeerId>,
     recent_shares: BTreeMap<u64, [f64; RISE_DELAY_ROUNDS]>,
     left: bool,
     held: Held,
+    identity_conflicts: u64,
+    // When the full table last refused news of a live newcomer.
+    last_refused_at: Option<Nanos>,
 }
 
 /// Why a node holds every key at the floor `R·β/N`, if it does; see
@@ -154,6 +169,10 @@ pub struct Held {
     /// Under `Quorum`, it has lost its majority, or regained it too
     /// recently to have been heard.
     pub without_quorum: bool,
+    /// Its member table refused a live newcomer for being full, within the
+    /// last `tombstone_ttl`: there are nodes it cannot count, nor see the
+    /// demand of. See [`Node::set_max_members`].
+    pub members_full: bool,
 }
 /// The sizes of a node's collections; see [`Node::footprint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +205,13 @@ impl Node {
     /// A node alone in its cluster. `seed` drives its random choices, so the
     /// same seed replays the same run.
     ///
+    /// A run's seed must differ from the last run's under the same ID, as
+    /// the `rateguard` runtime's does by mixing in wall-clock entropy: the
+    /// probe sequence numbers and the epoch of the demand reports are drawn
+    /// from it, and with the same seed again the replies an earlier run
+    /// was sent, replayed, can match this run's probes and keep a dead peer
+    /// alive.
+    ///
     /// # Panics
     ///
     /// If the timeouts do not fit together, see the messages for each.
@@ -208,16 +234,27 @@ impl Node {
             "a tombstone must outlive the gossip of the death, or a late echo resurrects it"
         );
 
+        // Drawn apart from `rng`, so as not to shift the random choices a
+        // seed replays. The `seq` starts at a random value too, so ACKs
+        // recorded from an earlier run (or another node) answer none of this
+        // run's probes and cannot keep a dead peer alive.
+        let mut apart = Rng::new(!seed);
+        let epoch = apart.next_u64() as u32;
+        let seq = apart.next_u64() as u32;
+
+        let mut members = MemberTable::new(local, addr);
+        members.set_max(DEFAULT_MAX_MEMBERS);
+
         Self {
             limiter: Limiter::new(config),
-            members: MemberTable::new(local, addr),
+            members,
             gossip: Gossip::new(),
             swim,
             rng: Rng::new(seed),
             seeds: Vec::new(),
             order: Vec::new(),
             next: 0,
-            seq: 0,
+            seq,
             probe: None,
             relays: BTreeMap::new(),
             next_round_at: 0,
@@ -227,9 +264,7 @@ impl Node {
             actions: Vec::new(),
             peer_demand: PeerDemand::new(),
             round_number: 0,
-            // Drawn apart from `rng`, so as not to shift the random choices
-            // a seed replays.
-            epoch: Rng::new(!seed).next_u64() as u32,
+            epoch,
             own_demand: Vec::new(),
             policy: PartitionPolicy::default(),
             sizes: SizeHistory::new(hold_of(PartitionPolicy::default())),
@@ -242,9 +277,12 @@ impl Node {
             expects_peers: false,
             last_heard: BTreeMap::new(),
             reported: VecDeque::new(),
+            behind: BTreeSet::new(),
             recent_shares: BTreeMap::new(),
             left: false,
             held: Held::default(),
+            identity_conflicts: 0,
+            last_refused_at: None,
         }
     }
 
@@ -253,15 +291,17 @@ impl Node {
     /// through [`add_seed`](Node::add_seed) instead.
     pub fn introduce(&mut self, peer: PeerId, addr: Address) {
         assert_ne!(peer, self.members.local(), "a node is not its own peer");
-        self.members.apply(
-            Update {
-                member: peer.get(),
-                addr,
-                incarnation: 0,
-                status: Status::Alive,
-            },
-            self.last_now,
-        );
+        let now = self.last_now;
+        let update = Update {
+            member: peer.get(),
+            addr,
+            incarnation: 0,
+            status: Status::Alive,
+        };
+        if self.members.apply(update, now) == Applied::Refused {
+            self.last_refused_at = Some(now);
+            self.refresh_cap(now);
+        }
     }
 
     /// Adds an address to join through. A seed is not a member until it
@@ -309,7 +349,7 @@ impl Node {
     /// range, as for [`Limiter::check_in`].
     pub fn record(&mut self, key: u64, tally: Tally, limit: Limit, now: Nanos) {
         self.advance(now);
-        let cluster_size = self.allocation_size();
+        let cluster_size = self.share_size();
         self.limiter.record(key, tally, limit, now, cluster_size);
     }
 
@@ -331,13 +371,13 @@ impl Node {
 
     /// The quota a key not seen before starts with in `limit`.
     pub fn new_key_quota_in(&self, limit: Limit) -> Quota {
-        self.limiter.new_key_quota(limit, self.allocation_size())
+        self.limiter.new_key_quota(limit, self.share_size())
     }
 
     /// The rate a key not seen before starts with, as a part of its R, every
     /// cap included: for a runtime that sizes a new key's quota itself.
     pub fn new_key_factor(&self) -> f64 {
-        self.limiter.new_key_factor(self.allocation_size())
+        self.limiter.new_key_factor(self.share_size())
     }
 
     /// Up to `k` keys with the most denials lately, in denials a second,
@@ -387,22 +427,107 @@ impl Node {
         self.quorum_memory = memory;
     }
 
+    /// The most members the node keeps, the dead not yet forgotten and
+    /// itself included ([`DEFAULT_MAX_MEMBERS`] unless set). News of a
+    /// stranger is refused while the table is full, and counted in
+    /// [`members_refused`](Node::members_refused); nobody is evicted for
+    /// it, under a lower cap either, and news of the members known is
+    /// taken as ever. A slot frees when a dead member is forgotten.
+    ///
+    /// Size it for the fleet plus every address that churned within the
+    /// last `tombstone_ttl`: the dead keep their slots until forgotten, so
+    /// about twice the fleet for rolling deploys that give pods new
+    /// addresses. For a `tombstone_ttl` after it refused a live newcomer,
+    /// the node shares the limit as if `n` nodes were up and holds every
+    /// key at the floor `R·β/n` (see [`Held::members_full`]): there are
+    /// nodes it cannot count. That softens an overflow but does not close
+    /// it, so over the cap the limit is **not guaranteed**: the refused
+    /// node itself does not hold, as its own table is not full, and a node
+    /// that heard of the newcomer only second-hand lifts its hold after
+    /// `tombstone_ttl` while the overflow lasts. Raise the cap when
+    /// [`members_refused`](Node::members_refused) grows in a legitimate
+    /// fleet.
+    ///
+    /// The cap bounds memory, not availability: with unsigned gossip a
+    /// stranger can fill the table with made-up members, and the real
+    /// newcomers wait for slots. Only signing keeps strangers out.
+    ///
+    /// # Panics
+    ///
+    /// If `n` is 0: the table always holds the node itself.
+    pub fn set_max_members(&mut self, n: usize) {
+        self.members.set_max(n);
+    }
+
+    /// The cap set with [`set_max_members`](Node::set_max_members).
+    pub fn max_members(&self) -> usize {
+        self.members.max()
+    }
+
+    /// How many times news of a stranger was refused because the member
+    /// table was full. Steady growth means a cluster bigger than
+    /// [`max_members`](Node::max_members), or a flood of made-up members.
+    pub fn members_refused(&self) -> u64 {
+        self.members.refused()
+    }
+
     /// The policy set with [`set_partition_policy`](Node::set_partition_policy).
     pub fn partition_policy(&self) -> PartitionPolicy {
         self.policy
     }
 
     // N as allocation sees it: the membership's, or under HoldDown the
-    // largest of the hold. Cold and hot keys use the same one (spec §4.1).
+    // largest of the hold. It times how long the peers' demand is kept,
+    // and how long learning lasts; the limit is shared over `share_size`.
     fn allocation_size(&self) -> usize {
         self.members.cluster_size().max(self.held_size)
     }
 
+    // N as the limit is shared over it, cold and hot keys alike (spec
+    // §4.1): `allocation_size`, but at least max_members while a live
+    // newcomer refused for a full table may still be up. We know such a
+    // node exists, not how many do, and a share over too few nodes admits
+    // more than R across the fleet; so the node errs strict and shares as
+    // if the table were full of live members. A refused node that is real
+    // keeps knocking, so the hold lasts as long as the overflow; one that
+    // is gone is forgotten by its peers within a tombstone_ttl, and so is
+    // the hold here. The refused node's demand is unseen as well, so every
+    // key is held at the floor over this N meanwhile (see refresh_cap).
+    //
+    // Under a flood of made-up members this changes little: the table
+    // fills with them and the shares already fall toward R / max_members.
+    // A legitimate overflow, a fleet that outgrew the cap or churned
+    // through it, is softened by this and not closed, and members_refused
+    // says why. Two gaps stay, so R is not guaranteed over the cap: the
+    // refused node itself never holds, as its own table is not full, and
+    // a node that heard of the newcomer second-hand lifts the hold after a
+    // tombstone_ttl while the overflow lasts, the gossip about the refused
+    // one having run out of retransmits. Not used to time staleness: that would
+    // keep the peers' demand and this node's past reports as long as a
+    // fleet of max_members needs, for a refusal.
+    fn share_size(&self) -> usize {
+        let size = self.allocation_size();
+        if self.refusing(self.last_now) {
+            size.max(self.members.max())
+        } else {
+            size
+        }
+    }
+
+    // Whether a live newcomer was refused for a full table within the last
+    // tombstone_ttl.
+    fn refusing(&self, now: Nanos) -> bool {
+        self.last_refused_at
+            .is_some_and(|at| now < at.saturating_add(self.swim.tombstone_ttl))
+    }
+
     /// The N the limit is shared out over: the [cluster
     /// size](Node::cluster_size), or more under `HoldDown` while a lost
-    /// member is still held.
+    /// member is still held, and at least
+    /// [`max_members`](Node::max_members) for a `tombstone_ttl` after the
+    /// full table refused a live newcomer.
     pub fn counted_size(&self) -> usize {
-        self.allocation_size()
+        self.share_size()
     }
 
     /// Why every key is held at the floor, as of the last round or change
@@ -473,8 +598,7 @@ impl Node {
     /// [`Limiter::check_in`].
     pub fn check_in(&mut self, key: u64, limit: Limit, now: Nanos) -> Decision {
         self.advance(now);
-        self.limiter
-            .check_in(key, limit, now, self.allocation_size())
+        self.limiter.check_in(key, limit, now, self.share_size())
     }
 
     /// Like [`check_in`](Node::check_in), with what the limit `shadow`,
@@ -493,7 +617,7 @@ impl Node {
         now: Nanos,
     ) -> (Decision, Option<Decision>) {
         self.advance(now);
-        let cluster_size = self.allocation_size();
+        let cluster_size = self.share_size();
         self.limiter
             .check_in_traced(key, limit, shadow, now, cluster_size)
     }
@@ -528,6 +652,7 @@ impl Node {
                     let members = &self.members;
                     self.last_heard
                         .retain(|&peer, _| members.status(peer).is_some());
+                    self.behind.retain(|&peer| members.status(peer).is_some());
                 }
                 self.relays.retain(|_, relay| relay.expires_at > now);
                 if now >= self.next_round_at {
@@ -575,6 +700,15 @@ impl Node {
             }
         }
         &self.actions
+    }
+
+    /// How many times this node has had to outbid an `Alive` record of
+    /// itself that it did not make: a newer incarnation of its own ID,
+    /// spread by someone else. A quick restart adds one, as the cluster
+    /// tells the new instance where its predecessor stood; steady growth
+    /// means two instances advertise one address.
+    pub fn identity_conflicts(&self) -> u64 {
+        self.identity_conflicts
     }
 
     /// Whether the node has [left](Node::leave).
@@ -758,6 +892,25 @@ impl Node {
         {
             return;
         }
+        // A peer that opens with an `Alive` older than the one we hold for
+        // it restarted unnoticed, at incarnation 0, and does not know where
+        // its predecessor stood. Unless told, its next leave is older than
+        // our record and dropped as stale. Any other opening clears the
+        // mark: the peer caught up, or says something else of itself.
+        let held = self.members.update_about(from);
+        let behind = matches!(
+            (message.updates().first(), held),
+            (Some(own), Some(held))
+                if own.member == from.get()
+                    && own.status == Status::Alive
+                    && held.status == Status::Alive
+                    && held.incarnation > own.incarnation
+        );
+        if behind {
+            self.behind.insert(from);
+        } else {
+            self.behind.remove(&from);
+        }
         for &update in message.updates() {
             self.learn(update, now);
         }
@@ -773,8 +926,14 @@ impl Node {
         // Demand comes first hand and whole, in every message; an empty
         // report says the peer has no hot key. A message with no report
         // has no round to order it by, and changes nothing. One sent before
-        // a leave may arrive after it, and is too late.
-        if !self.members.has_departed(from)
+        // a leave may arrive after it, and is too late. Only members are
+        // heard, as for `last_heard`: a sender the full table refused would
+        // otherwise leave its keys behind, and one opening under a new ID
+        // every datagram would grow them with the flood and lower every
+        // share. A newcomer with room is a member by now, its opening
+        // record learned above.
+        if self.members.status(from).is_some()
+            && !self.members.has_departed(from)
             && let Some(report) = message
                 .demand()
                 .iter()
@@ -804,6 +963,7 @@ impl Node {
         if !self.members.depart(peer) {
             return;
         }
+        self.behind.remove(&peer);
         self.peer_demand.forget(peer);
         self.last_heard.remove(&peer);
         if let Some(since) = self.members.joined_at(peer) {
@@ -922,10 +1082,28 @@ impl Node {
     fn learn(&mut self, update: Update, now: Nanos) {
         match self.members.apply(update, now) {
             Applied::Ignored => {}
+            // A refused stranger is not passed on either: the peers have
+            // tables of their own to keep. A live one may be serving
+            // requests this node cannot count, and from now on N is held
+            // up for it (see `share_size`). A dead one serves nothing, and
+            // a tombstone echoed past its forgetting must not hold N up.
+            Applied::Refused => {
+                if update.status != Status::Dead {
+                    self.last_refused_at = Some(now);
+                    if !self.held.members_full {
+                        self.refresh_cap(now);
+                    }
+                }
+            }
             Applied::Accepted { .. } => {
                 self.gossip.push(update);
             }
             Applied::Refuted(alive) => {
+                // An `Alive` of ours we did not make: another instance under
+                // our ID, now or before a restart.
+                if update.status == Status::Alive {
+                    self.identity_conflicts += 1;
+                }
                 self.gossip.push(alive);
             }
         }
@@ -937,7 +1115,10 @@ impl Node {
     //
     // Whoever we hold as suspect or dead hears it from us on every message,
     // not only while the news is in the buffer: it is the one node that can
-    // refute it, and a death nobody repeats to the dead is never undone.
+    // refute it, and a death nobody repeats to the dead is never undone. A
+    // peer behind its own incarnation hears the `Alive` we hold in the same
+    // slot: it outbids it, as a 0.7.0 node does too, and its leave counts
+    // again.
     fn outgoing(&mut self, to: PeerId) -> Vec<Update> {
         let own = self
             .members
@@ -946,7 +1127,7 @@ impl Node {
         let accusation = self
             .members
             .update_about(to)
-            .filter(|update| update.status != Status::Alive);
+            .filter(|update| update.status != Status::Alive || self.behind.contains(&to));
         let room = proto::MAX_UPDATES - 1 - usize::from(accusation.is_some());
         let limit = gossip::retransmit_limit(self.members.cluster_size());
 
@@ -1033,6 +1214,7 @@ impl Node {
     //   join already shares. N is taken as itself and its seeds.
     //   Optimistic serves anyway, by definition.
     // - Quorum without a majority, see apply_policy.
+    // - A full member table that refused a live newcomer, see share_size.
     fn refresh_cap(&mut self, now: Nanos) {
         // As a part of each key's own R.
         let beta = self.limiter.config().floor_factor;
@@ -1043,16 +1225,27 @@ impl Node {
             joining: waiting && self.policy != PartitionPolicy::Optimistic,
             learning: !waiting && !self.informed_since(self.joined_at.unwrap_or(0), now),
             without_quorum: self.policy == PartitionPolicy::Quorum && now < self.floored_until,
+            members_full: self.refusing(now),
         };
         let mut caps = Vec::with_capacity(3);
         if held.joining {
             caps.push(floor(1 + self.seeds.len()));
         }
         if held.learning {
-            caps.push(floor(self.allocation_size()));
+            caps.push(floor(self.share_size()));
         }
         if held.without_quorum {
             caps.push(floor(self.quorum_size));
+        }
+        // A node the full table refused has demand this one cannot see. A
+        // slice of R in proportion to the demand seen leaves it out, and
+        // the hot shares add up to more than R across the fleet, whatever
+        // N they are taken over. The floor over max_members is the least
+        // this node can take, and the fleet runs under the limit unless one
+        // of the two gaps named at share_size lets it through: this softens
+        // an overflow and does not guarantee R.
+        if held.members_full {
+            caps.push(floor(self.share_size()));
         }
         self.limiter.set_cap(caps.into_iter().reduce(f64::min));
         self.held = held;
@@ -1080,7 +1273,7 @@ impl Node {
     // tick is not in the list yet and gets the floor as well, unless there
     // is nobody to wait for.
     fn apply_shares(&mut self, now: Nanos) {
-        let cluster_size = self.allocation_size();
+        let cluster_size = self.share_size();
         let config = *self.limiter.config();
         let joined_at = self.joined_at.unwrap_or(0);
         let informed: BTreeSet<u64> = self
@@ -3214,5 +3407,483 @@ mod tests {
         assert_eq!(n.members().status(PeerId::new(1)), Some(Alive));
         assert!(!n.members().has_departed(PeerId::new(1)));
         assert_eq!(n.cluster_size(), 2);
+    }
+
+    // What `node` tells `peer` about it in its answer to `message`.
+    fn told_about(node: &mut Node, peer: u64, message: Message, now: Nanos) -> Option<Update> {
+        let replies = deliver(node, peer, message, now);
+        let [(to, reply)] = replies.as_slice() else {
+            panic!("expected one reply, got {replies:?}");
+        };
+        assert_eq!(to.get(), peer);
+        reply.updates().iter().copied().find(|u| u.member == peer)
+    }
+
+    // Node 0 holds peer 1 alive at incarnation 2, and the news of it has
+    // been spent: from here on, gossip no longer carries it.
+    fn holding_peer_one_at_2() -> Node {
+        let mut n = node_with([1]);
+        for k in 1..=20 {
+            deliver(&mut n, 1, hello(1, 2), k * ONE_MS);
+        }
+        assert_eq!(told_about(&mut n, 1, hello(1, 2), 21 * ONE_MS), None);
+        n
+    }
+
+    #[test]
+    fn a_peer_behind_its_own_incarnation_hears_the_record_we_hold() {
+        let mut n = holding_peer_one_at_2();
+        // A restart starts it again at 0, and nobody noticed.
+        assert_eq!(
+            told_about(&mut n, 1, hello(1, 0), 30 * ONE_MS),
+            Some(news(1, 2, Alive))
+        );
+        // Every message says it, not only the reply, while the peer is behind.
+        let (target, _, updates) = round_with_news(&mut n, 1);
+        assert_eq!(target, PeerId::new(1));
+        assert!(updates.contains(&news(1, 2, Alive)), "{updates:?}");
+    }
+
+    #[test]
+    fn a_peer_that_caught_up_is_told_no_more() {
+        let mut n = holding_peer_one_at_2();
+        assert!(told_about(&mut n, 1, hello(1, 0), 31 * ONE_MS).is_some());
+        assert_eq!(told_about(&mut n, 1, hello(1, 2), 32 * ONE_MS), None);
+        assert!(n.behind.is_empty());
+    }
+
+    #[test]
+    fn the_record_of_a_peer_behind_takes_the_accusations_slot() {
+        let mut n = holding_peer_one_at_2();
+        // A buffer full of news, as much as one datagram carries.
+        let crowd = Message::Ack {
+            seq: 999,
+            updates: (10..10 + proto::MAX_UPDATES as u64)
+                .map(|member| news(member, 0, Alive))
+                .collect(),
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 9, crowd, 30 * ONE_MS);
+        let replies = deliver(&mut n, 1, hello(1, 0), 31 * ONE_MS);
+        let [(_, reply)] = replies.as_slice() else {
+            panic!("expected one reply, got {replies:?}");
+        };
+        assert_eq!(reply.updates().len(), proto::MAX_UPDATES);
+        assert!(reply.updates().contains(&news(1, 2, Alive)));
+    }
+
+    fn hello_with(peer: u64, extra: Update) -> Message {
+        Message::Ping {
+            seq: 1,
+            updates: vec![news(peer, 0, Alive), extra],
+            demand: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_forgotten_peer_is_no_longer_behind() {
+        let mut n = node_with([1, 2]);
+        deliver(&mut n, 1, hello(1, 2), ONE_MS);
+        deliver(&mut n, 1, hello(1, 0), 2 * ONE_MS);
+        assert!(n.behind.contains(&PeerId::new(1)));
+        let obituary = Message::Ack {
+            seq: 999,
+            updates: vec![news(1, 2, Dead)],
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 2, obituary, 3 * ONE_MS);
+        let first = SWIM.tombstone_ttl / PERIOD + 1;
+        for k in first..first + 3 {
+            let (target, seq) = round(&mut n, k);
+            deliver(&mut n, target.get(), ack(seq), k * PERIOD + ONE_MS);
+        }
+        assert_eq!(n.members().status(PeerId::new(1)), None);
+        assert!(n.behind.is_empty());
+    }
+
+    #[test]
+    fn a_0_7_0_peer_refutes_the_reply_too() {
+        // A node of 0.7.0 has no notion of being behind, only the member
+        // table: an `Alive` about itself above its own incarnation is news
+        // it outbids, and the cluster learns the higher one.
+        let mut old = MemberTable::new(PeerId::new(2), addr(2));
+        assert_eq!(
+            old.apply(news(2, 1, Alive), ONE_MS),
+            Applied::Refuted(news(2, 2, Alive))
+        );
+        assert_eq!(old.incarnation(), 2);
+    }
+
+    #[test]
+    fn a_node_outbid_on_its_own_record_counts_an_identity_conflict() {
+        let mut n = node_with([1]);
+        assert_eq!(n.identity_conflicts(), 0);
+        deliver(&mut n, 1, hello_with(1, news(0, 3, Alive)), ONE_MS);
+        assert_eq!(n.identity_conflicts(), 1);
+        assert_eq!(n.members().incarnation(), 4);
+        // An accusation refuted is not one: it says nothing of a second
+        // instance.
+        deliver(&mut n, 1, hello_with(1, news(0, 4, Suspect)), 2 * ONE_MS);
+        assert_eq!(n.identity_conflicts(), 1);
+        assert_eq!(n.members().incarnation(), 5);
+        // Nor is our own record repeated back.
+        deliver(&mut n, 1, hello_with(1, news(0, 5, Alive)), 3 * ONE_MS);
+        assert_eq!(n.identity_conflicts(), 1);
+        deliver(&mut n, 1, hello_with(1, news(0, 6, Alive)), 4 * ONE_MS);
+        deliver(&mut n, 1, hello_with(1, news(0, 6, Alive)), 5 * ONE_MS);
+        assert_eq!(n.identity_conflicts(), 2);
+    }
+
+    #[test]
+    fn two_nodes_on_one_address_count_identity_conflicts() {
+        // Nodes 0 and 1 both run as peer 0, as when two instances are given
+        // one address: a datagram to peer 0 reaches either, by turns. Peers
+        // 1 and 2 are nodes 2 and 3.
+        let ids = [0u64, 0, 1, 2];
+        let mut nodes: Vec<Node> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| Node::new(config(), SWIM, PeerId::new(id), addr(id), i as u64 + 1))
+            .collect();
+        for (i, node) in nodes.iter_mut().enumerate() {
+            for peer in [0u64, 1, 2].into_iter().filter(|&peer| peer != ids[i]) {
+                node.introduce(PeerId::new(peer), addr(peer));
+            }
+        }
+        // Two instances that agree on everything never conflict. One
+        // refuted a suspicion before the other came up: it is a step
+        // ahead, and from then on each outbids the other.
+        let suspicion = Message::Ping {
+            seq: 1,
+            updates: vec![news(2, 0, Alive), news(0, 0, Suspect)],
+            demand: Vec::new(),
+        };
+        deliver(&mut nodes[0], 2, suspicion, 0);
+        assert_eq!(nodes[0].members().incarnation(), 1);
+        let mut turn = 0;
+        let mut in_flight: Vec<(u64, PeerId, Vec<u8>)> = Vec::new();
+        for ms in 0..10_000u64 {
+            let now = ms * ONE_MS;
+            let mut sent = Vec::new();
+            for (from, to, bytes) in std::mem::take(&mut in_flight) {
+                let index = match to.get() {
+                    0 => {
+                        turn += 1;
+                        turn % 2
+                    }
+                    peer => peer as usize + 1,
+                };
+                let event = Event::MessageReceived {
+                    from: PeerId::new(from),
+                    bytes: &bytes,
+                };
+                for Action::SendTo { peer, bytes } in nodes[index].handle(event, now) {
+                    sent.push((ids[index], *peer, bytes.clone()));
+                }
+            }
+            if now.is_multiple_of(TICK) {
+                for (index, node) in nodes.iter_mut().enumerate() {
+                    for Action::SendTo { peer, bytes } in node.handle(Event::Tick, now) {
+                        sent.push((ids[index], *peer, bytes.clone()));
+                    }
+                }
+            }
+            in_flight = sent;
+        }
+        for twin in &nodes[..2] {
+            assert!(
+                twin.identity_conflicts() >= 5,
+                "{} conflicts in 10 s",
+                twin.identity_conflicts()
+            );
+        }
+        for other in &nodes[2..] {
+            assert_eq!(other.identity_conflicts(), 0);
+        }
+    }
+
+    // Plays 300 rounds against a silent peer X, either recording its ACKs or
+    // replaying the ones recorded by another run.
+    fn run_with(
+        record: Option<&std::collections::HashMap<(u64, u32), Message>>,
+    ) -> (
+        Option<Status>,
+        std::collections::HashMap<(u64, u32), Message>,
+    ) {
+        let mut seen = std::collections::HashMap::new();
+        let seed = if record.is_some() { 0xDEAD_BEEF } else { 1 };
+        let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed);
+        n.introduce(PeerId::new(1), addr(1));
+        n.introduce(PeerId::new(2), addr(2));
+        const X: u64 = 1;
+        for k in 0..300u64 {
+            let t = k * PERIOD;
+            let sent = sent(n.handle(Event::Tick, t));
+            for (peer, m) in &sent {
+                if let Message::Ping { seq, .. } = m {
+                    let reply = Message::Ack {
+                        seq: *seq,
+                        updates: vec![news(peer.get(), 0, Alive)],
+                        demand: Vec::new(),
+                    };
+                    match record {
+                        // First run: everybody answers, and the attacker records.
+                        None => {
+                            seen.insert((peer.get(), *seq), reply.clone());
+                            deliver(&mut n, peer.get(), reply, t + ONE_MS);
+                        }
+                        // Second run: X is dead; Y answers; attacker replays.
+                        Some(rec) => {
+                            if peer.get() != X {
+                                deliver(&mut n, peer.get(), reply, t + ONE_MS);
+                            } else if let Some(old) = rec.get(&(X, *seq)) {
+                                deliver(&mut n, X, old.clone(), t + ONE_MS);
+                            }
+                        }
+                    }
+                }
+            }
+            // Past the ack timeout: escalation to helpers.
+            let t2 = t + PERIOD / 2 + ONE_MS;
+            for (peer, m) in sent_tick(&mut n, t2) {
+                if let (Message::PingReq { seq, .. }, Some(rec)) = (&m, record)
+                    && let Some(old) = rec.get(&(peer.get(), *seq))
+                {
+                    deliver(&mut n, peer.get(), old.clone(), t2 + ONE_MS);
+                }
+            }
+        }
+        (n.members().status(PeerId::new(X)), seen)
+    }
+
+    fn sent_tick(n: &mut Node, t: Nanos) -> Vec<(PeerId, Message)> {
+        sent(n.handle(Event::Tick, t))
+    }
+
+    #[test]
+    fn recorded_acks_of_a_previous_run_do_not_keep_a_dead_peer_alive() {
+        let (_, recorded) = run_with(None);
+        let (control, _) = run_with(Some(&std::collections::HashMap::new()));
+        let (replayed, _) = run_with(Some(&recorded));
+        // Dead, or already forgotten once its tombstone expired.
+        let gone = |s: Option<Status>| matches!(s, None | Some(Dead));
+        assert!(gone(control), "control: {control:?}");
+        assert!(gone(replayed), "replayed: {replayed:?}");
+    }
+
+    fn first_seq(seed: u64) -> u32 {
+        let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed);
+        n.introduce(PeerId::new(1), addr(1));
+        round(&mut n, 0).1
+    }
+
+    #[test]
+    fn two_runs_start_their_seq_apart() {
+        assert_ne!(first_seq(1), first_seq(2));
+    }
+
+    #[test]
+    fn the_same_seed_starts_the_same_seq() {
+        assert_eq!(first_seq(7), first_seq(7));
+    }
+
+    fn gossip(n: &mut Node, from: u64, updates: Vec<Update>, now: Nanos) {
+        let mut all = vec![news(from, 0, Alive)];
+        all.extend(updates);
+        deliver(
+            n,
+            from,
+            Message::Ack {
+                seq: 999,
+                updates: all,
+                demand: Vec::new(),
+            },
+            now,
+        );
+    }
+
+    #[test]
+    fn the_member_cap_is_8192_unless_set() {
+        let mut n = node();
+        assert_eq!(n.max_members(), DEFAULT_MAX_MEMBERS);
+        assert_eq!(DEFAULT_MAX_MEMBERS, 8192);
+        n.set_max_members(4);
+        assert_eq!(n.max_members(), 4);
+        assert_eq!(n.members_refused(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_members")]
+    fn a_cap_of_no_member_is_refused() {
+        node().set_max_members(0);
+    }
+
+    #[test]
+    fn a_full_table_refuses_strangers_and_counts_them() {
+        let mut n = node_with([1, 2, 3]);
+        n.set_max_members(4);
+        assert_eq!(n.members().known(), 4);
+        gossip(&mut n, 1, vec![news(5, 0, Alive)], 0);
+        assert_eq!(n.members().status(PeerId::new(5)), None);
+        assert_eq!(n.members_refused(), 1);
+        assert_eq!(n.members().known(), 4);
+        assert_eq!(n.cluster_size(), 4);
+        // A stranger knocking itself is a newcomer like any other.
+        gossip(&mut n, 6, Vec::new(), ONE_MS);
+        assert_eq!(n.members().status(PeerId::new(6)), None);
+        assert_eq!(n.members_refused(), 2);
+        assert_eq!(n.footprint().last_heard, 1, "only member 1 is heard of");
+    }
+
+    // Review Focus 3: a refusal blocks only newcomers.
+    #[test]
+    fn a_full_table_still_tracks_its_members() {
+        let mut n = node_with([1, 2, 3]);
+        n.set_max_members(4);
+        gossip(&mut n, 2, vec![news(1, 0, Suspect)], 0);
+        assert_eq!(n.members().status(PeerId::new(1)), Some(Suspect));
+        gossip(&mut n, 2, vec![news(1, 0, Dead)], ONE_MS);
+        assert_eq!(n.members().status(PeerId::new(1)), Some(Dead));
+        gossip(&mut n, 1, vec![news(1, 1, Alive)], 2 * ONE_MS);
+        assert_eq!(n.members().status(PeerId::new(1)), Some(Alive), "back");
+        gossip(&mut n, 2, vec![news(1, 1, Dead)], 3 * ONE_MS);
+        assert_eq!(n.members_refused(), 0);
+
+        // Past its tombstone the dead member is forgotten, and its slot is
+        // free for whoever comes first: a newcomer here.
+        let forgotten_at = 3 * ONE_MS + SWIM.tombstone_ttl;
+        n.handle(Event::Tick, forgotten_at);
+        assert_eq!(n.members().status(PeerId::new(1)), None);
+        assert_eq!(n.members().known(), 3);
+        gossip(&mut n, 2, vec![news(5, 0, Alive)], forgotten_at + ONE_MS);
+        assert_eq!(n.members().status(PeerId::new(5)), Some(Alive));
+        assert_eq!(n.members().known(), 4);
+        assert_eq!(n.members_refused(), 0);
+
+        // The forgotten one is a stranger now, and the table is full again.
+        gossip(
+            &mut n,
+            2,
+            vec![news(1, 2, Alive)],
+            forgotten_at + 2 * ONE_MS,
+        );
+        assert_eq!(n.members().status(PeerId::new(1)), None);
+        assert_eq!(n.members_refused(), 1);
+    }
+
+    // A sender refused by the full table is no member, and its demand is
+    // not kept: a stranger opening each datagram under a new ID would
+    // otherwise grow the peers' demand with the flood and lower every
+    // share.
+    #[test]
+    fn a_refused_senders_demand_is_not_kept() {
+        let mut n = node_with([1, 2, 3]);
+        n.set_max_members(4);
+        let report = |origin: u64| DemandReport {
+            origin,
+            epoch: 1,
+            round: 1,
+            keys: vec![KeyDemand {
+                key_hash: KEY,
+                demand: 500.0,
+                primary: true,
+            }],
+        };
+        let ping = |origin: u64| Message::Ping {
+            seq: 7,
+            updates: vec![news(origin, 0, Alive)],
+            demand: vec![report(origin)],
+        };
+        deliver(&mut n, 9, ping(9), 0);
+        assert_eq!(n.members_refused(), 1);
+        assert_eq!(n.peer_demand().len(), 0);
+        assert_eq!(n.peer_demand().total(KEY), 0.0);
+        assert_eq!(n.footprint().peer_demand_keys, 0);
+
+        // A member's demand is kept as ever.
+        deliver(&mut n, 1, ping(1), ONE_MS);
+        assert_eq!(n.peer_demand().total(KEY), 500.0);
+    }
+
+    // A newcomer with room in the table is a member by the time its report
+    // is read: its opening record is learned first.
+    #[test]
+    fn a_newcomers_first_report_is_kept() {
+        let mut n = node_with([1]);
+        let message = Message::Ping {
+            seq: 7,
+            updates: vec![news(5, 0, Alive)],
+            demand: vec![DemandReport {
+                origin: 5,
+                epoch: 1,
+                round: 1,
+                keys: vec![KeyDemand {
+                    key_hash: KEY,
+                    demand: 300.0,
+                    primary: true,
+                }],
+            }],
+        };
+        deliver(&mut n, 5, message, 0);
+        assert_eq!(n.members().status(PeerId::new(5)), Some(Alive));
+        assert_eq!(n.peer_demand().total(KEY), 300.0);
+    }
+
+    #[test]
+    fn a_lower_cap_evicts_nobody() {
+        let mut n = node_with([1, 2, 3]);
+        n.set_max_members(2);
+        assert_eq!(n.members().known(), 4);
+        assert_eq!(n.cluster_size(), 4);
+        gossip(&mut n, 2, vec![news(5, 0, Alive)], 0);
+        assert_eq!(n.members_refused(), 1);
+    }
+
+    // A refused newcomer is a node this one cannot count, and a share over
+    // too small an N admits more than R across the fleet. So for a
+    // tombstone_ttl after a live newcomer was refused, the limit is shared
+    // over at least max_members, and every key is held at its floor.
+    #[test]
+    fn a_full_table_shares_over_at_least_max_members() {
+        let mut n = node_with([1, 2, 3]);
+        n.set_partition_policy(PartitionPolicy::Optimistic);
+        n.set_max_members(4);
+        // A dead member keeps its slot until it is forgotten, but is not
+        // counted in N.
+        gossip(&mut n, 1, vec![news(3, 0, Dead)], 0);
+        assert_eq!(n.counted_size(), 3);
+
+        let refused_at = ONE_MS;
+        gossip(&mut n, 1, vec![news(5, 0, Alive)], refused_at);
+        assert_eq!(n.members_refused(), 1);
+        assert_eq!(n.counted_size(), 4);
+        assert!(n.held().members_full);
+        // Every key at the floor over max_members: the hot shares leave the
+        // refused node's demand out, whatever N they are taken over.
+        assert!(n.new_key_factor() <= config().floor_factor / 4.0);
+
+        // News of a dead stranger says nobody is serving unseen: it is
+        // refused all the same, but holds nothing.
+        let mut quiet = node_with([1, 2, 3]);
+        quiet.set_partition_policy(PartitionPolicy::Optimistic);
+        quiet.set_max_members(4);
+        gossip(&mut quiet, 1, vec![news(3, 0, Dead), news(5, 0, Dead)], 0);
+        assert_eq!(quiet.members_refused(), 1);
+        assert_eq!(quiet.counted_size(), 3);
+        assert!(!quiet.held().members_full);
+
+        // Up to a tombstone_ttl after the refusal, whatever else the
+        // rounds find out meanwhile.
+        let mut now = refused_at;
+        while now + PERIOD < refused_at + SWIM.tombstone_ttl {
+            now += PERIOD;
+            n.handle(Event::Tick, now);
+            assert!(n.counted_size() >= 4, "at {} ms", now / ONE_MS);
+        }
+        // Then, with no refusal since, back to the live count.
+        n.handle(Event::Tick, refused_at + SWIM.tombstone_ttl);
+        assert_eq!(n.counted_size(), n.cluster_size());
+        assert!(n.counted_size() < 4);
+        assert!(!n.held().members_full);
     }
 }

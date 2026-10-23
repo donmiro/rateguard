@@ -2,6 +2,7 @@
 answers, and what it does when the sidecar is not there."""
 
 import json
+import os
 import sys
 import threading
 import time
@@ -107,6 +108,47 @@ class ClientTest(unittest.TestCase):
         self.assertTrue(self.client(sidecar.url).check("k").allowed)
         self.assertFalse(self.client(sidecar.url, on_error="deny").check("k").allowed)
 
+    def test_a_key_over_the_sidecar_s_limit_is_denied_whatever_on_error_says(self):
+        sidecar = self.fake(lambda body: {"error": "the body is too large"}, status=413)
+        decision = self.client(sidecar.url, on_error="allow").check("k")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.retry_after, 0.0)
+        self.assertIn("64 KiB", decision.error)
+
+    def test_a_server_error_follows_on_error_and_says_why(self):
+        sidecar = self.fake(lambda body: {"error": "boom"}, status=500)
+        allowed = self.client(sidecar.url).check("k")
+        self.assertTrue(allowed.allowed)
+        self.assertIn("500", allowed.error)
+        denied = self.client(sidecar.url, on_error="deny").check("k")
+        self.assertFalse(denied.allowed)
+        self.assertIn("500", denied.error)
+
+    def test_every_failure_carries_its_reason(self):
+        gone = self.client("http://127.0.0.1:1", timeout=0.05)
+        self.assertTrue(gone.check("k").error)
+        sidecar = self.fake(lambda body: {"nonsense": 1})
+        self.assertTrue(self.client(sidecar.url).check("k").error)
+
+    def test_a_key_that_is_not_a_string_is_the_sidecar_s_400_and_allowed_with_an_error(self):
+        sidecar = self.fake(lambda body: {"error": "bad key"}, status=400)
+        decision = self.client(sidecar.url).check(42)
+        self.assertEqual(decision, Decision(allowed=True))
+        self.assertIn("400", decision.error)
+
+    def test_a_good_decision_has_no_error(self):
+        sidecar = self.fake(lambda body: {"allowed": True})
+        self.assertIsNone(self.client(sidecar.url).check("k").error)
+
+    def test_an_empty_url_is_unset(self):
+        self.assertEqual(self.client("")._port, 7947)
+        import os
+
+        os.environ["RATEGUARD_SIDECAR_URL"] = ""
+        self.addCleanup(os.environ.pop, "RATEGUARD_SIDECAR_URL")
+        client = self.client()
+        self.assertEqual((client._host, client._port), ("127.0.0.1", 7947))
+
     def test_an_unknown_on_error_is_refused(self):
         with self.assertRaises(ValueError):
             Client(on_error="maybe")
@@ -169,3 +211,31 @@ class ThreadsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(os.environ.get("RATEGUARD_LIVE_URL"), "RATEGUARD_LIVE_URL is not set")
+class LiveTest(unittest.TestCase):
+    """Against a real `rateguard-sidecar --limit 2 --burst 2`: see
+    sdk/live/run.sh."""
+
+    def client(self):
+        client = Client(os.environ["RATEGUARD_LIVE_URL"], timeout=2.0)
+        self.addCleanup(client.close)
+        return client
+
+    def test_the_burst_is_allowed_and_the_next_denied(self):
+        client = self.client()
+        key = f"py-live-{os.getpid()}"
+        self.assertTrue(client.check(key).allowed)
+        self.assertTrue(client.check(key).allowed)
+        third = client.check(key)
+        self.assertFalse(third.allowed)
+        self.assertGreater(third.retry_after, 0)
+        self.assertIsNone(third.error)
+
+    def test_a_class_with_a_lone_surrogate_is_checked_not_refused(self):
+        client = self.client()
+        key = f"py-live-surrogate-{os.getpid()}"
+        decisions = [client.check(key, cls="pro\ud800") for _ in range(3)]
+        self.assertEqual([d.allowed for d in decisions], [True, True, False])
+        self.assertTrue(all(d.error is None for d in decisions))

@@ -3,6 +3,7 @@
 ROADMAP.md
 .DS_Store
 .superpowers
+.claude
 # The SDKs' build and test leftovers.
 __pycache__/
 *.egg-info/

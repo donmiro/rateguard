@@ -58,6 +58,14 @@ pub struct Args {
     /// `most_shadow_denied`: 10 by default, at most 1024, 0 for none.
     #[arg(long, env = "RATEGUARD_MOST_DENIED")]
     pub most_denied: Option<usize>,
+    /// The most members one instance keeps track of, the dead not yet
+    /// forgotten and itself included: 8192 by default, from 1 to 65536.
+    /// Over it newcomers are refused, counted in `members_refused`, and
+    /// every key is held at the floor over it for 10 minutes. Size it for
+    /// the fleet and the addresses that churned in the last 10 minutes:
+    /// over it the limit is not guaranteed, and the hold only softens that.
+    #[arg(long, env = "RATEGUARD_MAX_MEMBERS")]
+    pub max_members: Option<usize>,
     /// Admit every request, counting those that would be denied.
     #[arg(long, env = "RATEGUARD_DRY_RUN", action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
     pub dry_run: bool,
@@ -109,6 +117,19 @@ impl Args {
         }
     }
 
+    /// What to tell on stderr before the node starts: gossip that anyone who
+    /// reaches the port may join, and sign nothing.
+    pub fn startup_warnings(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.gossip_auth() == GossipAuth::Off {
+            lines.push(format!(
+                "rateguard-sidecar: warning: gossip is not signed: anyone who can reach {} can join the cluster; see --gossip-secret-file",
+                self.bind
+            ));
+        }
+        lines
+    }
+
     /// A [`Guard`] builder set up as the flags say, with the secret and
     /// salt files read.
     pub fn builder(&self) -> Result<Builder, ArgsError> {
@@ -139,6 +160,9 @@ impl Args {
         }
         if let Some(k) = self.most_denied {
             builder = builder.most_denied(k);
+        }
+        if let Some(n) = self.max_members {
+            builder = builder.max_members(n);
         }
         for ClassSpec(name, limit) in &self.classes {
             builder = builder.class(name, *limit);

@@ -116,6 +116,10 @@ pub struct Sim<L: Link> {
     swim: SwimConfig,
     policy: PartitionPolicy,
     quorum_memory: Option<Nanos>,
+    max_members: Option<usize>,
+    /// Whether a forger has spoken: from then on a datagram to a member no
+    /// node is, one it made up, is lost rather than a bug.
+    forged: bool,
     bootstrap: Bootstrap,
     generations: Vec<u64>,
     down: Vec<bool>,
@@ -182,6 +186,8 @@ impl<L: Link> Sim<L> {
             swim,
             policy: PartitionPolicy::default(),
             quorum_memory: None,
+            max_members: None,
+            forged: false,
             bootstrap,
             generations: vec![0; node_count],
             down: vec![false; node_count],
@@ -231,6 +237,9 @@ impl<L: Link> Sim<L> {
         node.set_partition_policy(self.policy);
         if let Some(memory) = self.quorum_memory {
             node.set_quorum_memory(memory);
+        }
+        if let Some(max) = self.max_members {
+            node.set_max_members(max);
         }
         match &self.bootstrap {
             Bootstrap::Static => {
@@ -320,6 +329,14 @@ impl<L: Link> Sim<L> {
         self.quorum_memory = Some(memory);
         for node in &mut self.nodes {
             node.set_quorum_memory(memory);
+        }
+    }
+
+    /// Sets the most members every node keeps, restarted ones included.
+    pub fn set_max_members(&mut self, max: usize) {
+        self.max_members = Some(max);
+        for node in &mut self.nodes {
+            node.set_max_members(max);
         }
     }
 
@@ -432,9 +449,12 @@ impl<L: Link> Sim<L> {
     }
 
     /// `bytes` arrive at `to` as sent from `from`, and pass `to`'s check
-    /// like any datagram: a forger is scheduled this way.
+    /// like any datagram: a forger is scheduled this way. `from` may be no
+    /// node at all, a stranger, and the members it names may be made up:
+    /// what the nodes send to those is lost.
     pub fn schedule_message(&mut self, at: Nanos, from: NodeIndex, to: NodeIndex, bytes: Vec<u8>) {
         assert!(to < self.nodes.len(), "no such node: {to}");
+        self.forged = true;
         self.schedule(
             at,
             to,
@@ -654,6 +674,7 @@ impl<L: Link> Sim<L> {
             datagrams,
             largest_datagram,
             auths,
+            forged,
             ..
         } = self;
         let now = *now;
@@ -670,6 +691,10 @@ impl<L: Link> Sim<L> {
                     datagrams[source] += 1;
                     *largest_datagram = (*largest_datagram).max(bytes.len());
                     let target = peer.get() as usize;
+                    if target >= node_count && *forged {
+                        // A member a forger made up: nobody listens there.
+                        continue;
+                    }
                     assert!(
                         target < node_count,
                         "node {source} addressed an unknown peer {}",

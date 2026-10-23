@@ -167,6 +167,89 @@ async fn garbage_is_counted_malformed() {
     assert!(guard.is_running());
 }
 
+// A peer's ID as every node derives it from the address it advertises:
+// xxh3 of the postcard-encoded address.
+fn id_of(addr: rateguard_proto::Address) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(&postcard::to_allocvec(&addr).unwrap())
+}
+
+fn ping(updates: Vec<rateguard_proto::Update>) -> Vec<u8> {
+    rateguard_proto::encode(&rateguard_proto::Message::Ping {
+        seq: 1,
+        updates,
+        demand: Vec::new(),
+    })
+    .unwrap()
+}
+
+async fn until_malformed(guard: &Guard, count: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rejected = guard.stats().rejected_datagrams;
+        if rejected.malformed >= count {
+            assert_eq!(rejected.malformed, count, "{rejected:?}");
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{rejected:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// With gossip unsigned, the one thing a node can check about news is that
+// each member's ID follows from its address, as every node derives its own.
+// A datagram whose sender goes under another ID is refused whole; a later
+// record that does is dropped alone: an ID unhooked from its address is how
+// a stranger makes up members by the thousand, or speaks for a real one at
+// its own address, and a 0.7.0 peer passes such news on as it heard it.
+#[tokio::test]
+async fn a_member_that_does_not_match_its_address_is_refused() {
+    use rateguard_proto::{Address, Status, Update};
+
+    let port = free_port();
+    let guard = node(port, &[], GossipAuth::Off, Vec::new());
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let me = Address::from(socket.local_addr().unwrap());
+    let own = Update {
+        member: id_of(me),
+        addr: me,
+        incarnation: 0,
+        status: Status::Alive,
+    };
+    let made_up = Update {
+        member: 77,
+        addr: Address::V4([10, 9, 9, 9], 7946),
+        ..own
+    };
+
+    // The sender itself under another ID: nothing of it is taken.
+    let wrong_sender = Update { member: 77, ..own };
+    socket
+        .send_to(&ping(vec![wrong_sender]), ("127.0.0.1", port))
+        .unwrap();
+    until_malformed(&guard, 1).await;
+    assert_eq!(guard.cluster_size(), 1, "the node heard nobody");
+
+    // A made-up member behind a genuine opening: the sender is heard, the
+    // made-up member is not.
+    socket
+        .send_to(&ping(vec![own, made_up]), ("127.0.0.1", port))
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while guard.cluster_size() != 2 {
+        assert!(tokio::time::Instant::now() < deadline, "never joined");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while guard.stats().rejected_datagrams.mismatched_records == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "never counted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stats = guard.stats();
+    assert_eq!(stats.rejected_datagrams.mismatched_records, 1);
+    assert_eq!(stats.rejected_datagrams.malformed, 1);
+    assert_eq!(stats.cluster_size, 2, "the made-up member is not learned");
+}
+
 #[test]
 fn builder_debug_shows_no_secret() {
     // Bytes that read as text, so that a leak shows in every form.

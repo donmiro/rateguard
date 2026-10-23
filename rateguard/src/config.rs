@@ -24,6 +24,9 @@ const MAX_TRACKED_KEYS: usize = 1 << 20;
 /// The longest list of the keys denied most.
 const MAX_MOST_DENIED: usize = 1024;
 
+/// The largest member table a node may be given.
+const MAX_MAX_MEMBERS: usize = 65_536;
+
 /// A duration in nanoseconds, the longest ones held at `u64::MAX` (584
 /// years) rather than cut down to whatever their low bits say.
 fn nanos(duration: Duration) -> u64 {
@@ -82,6 +85,7 @@ pub struct Builder {
     max_classes: Option<usize>,
     max_key_limits: Option<usize>,
     most_denied: Option<usize>,
+    max_members: Option<usize>,
     // Secret's Debug shows none of its bytes, so the derived Debug of the
     // builder shows none either.
     gossip_auth: GossipAuth,
@@ -275,6 +279,38 @@ impl Builder {
         self
     }
 
+    /// The most members one node keeps in its table, the dead not yet
+    /// forgotten and itself included: 8192 unless set, from 1 to 65,536,
+    /// or [`Error::TooLargeMaxMembers`] when the node starts. Set it above
+    /// the largest the cluster gets, counting every address that churned
+    /// in the last 10 minutes (the time the dead are remembered): about
+    /// twice the fleet for rolling deploys that give pods new addresses.
+    ///
+    /// While the table is full, news of a member not seen before is
+    /// refused and counted in
+    /// [`Stats::members_refused`](crate::Stats::members_refused); nobody
+    /// is evicted for it, and a slot frees when a dead member is forgotten.
+    /// For 10 minutes after it refused a live newcomer, an instance shares
+    /// the limit as if `n` nodes were up and holds every key at the floor
+    /// `R × β / n`
+    /// ([`Stats::members_full`](crate::Stats::members_full)): there are
+    /// nodes it cannot count. That softens an overflow but does not close
+    /// it, so over the cap the limit is **not guaranteed**: the refused
+    /// node itself does not hold, as its own table is not full, and a node
+    /// that heard of the newcomer only second-hand lifts its hold after
+    /// `tombstone_ttl` while the overflow lasts. Size the cap with room
+    /// (the default covers fleets up to about 4000 instances under rolling
+    /// deploys), and treat any growth of `members_refused` in a legitimate
+    /// fleet as a reason to raise it now.
+    /// The cap bounds memory, not availability: with unsigned gossip a
+    /// stranger who reaches the port can fill the table with made-up
+    /// members, each counted in the cluster size, and the shares fall with
+    /// it. Only [`gossip_auth`](Builder::gossip_auth) keeps strangers out.
+    pub fn max_members(mut self, n: usize) -> Self {
+        self.max_members = Some(n);
+        self
+    }
+
     /// The ceiling on keys one node keeps state for; defaults to 4096.
     pub fn tracked_keys(mut self, n: usize) -> Self {
         self.tracked_keys = Some(n);
@@ -377,6 +413,12 @@ impl Builder {
         if most_denied > MAX_MOST_DENIED {
             return Err(Error::TooManyMostDenied(most_denied));
         }
+        let max_members = self
+            .max_members
+            .unwrap_or(rateguard_core::node::DEFAULT_MAX_MEMBERS);
+        if !(1..=MAX_MAX_MEMBERS).contains(&max_members) {
+            return Err(Error::TooLargeMaxMembers(max_members));
+        }
         let period = nanos(self.period.unwrap_or(Duration::from_millis(200)));
         if period / 4 == 0 {
             return Err(Error::ZeroPeriod);
@@ -400,6 +442,8 @@ impl Builder {
             protocol_period: period,
             ack_timeout: period / 2,
             suspicion_timeout: defaults.suspicion_timeout.max(period),
+            // A tombstone must outlive the suspicion, or `Node::new` panics.
+            tombstone_ttl: defaults.tombstone_ttl.max(period),
             reconnect_interval: defaults.reconnect_interval.max(period),
             ..defaults
         };
@@ -419,6 +463,7 @@ impl Builder {
             max_classes,
             max_key_limits,
             most_denied,
+            max_members,
             default_limit,
             auth,
             salt,
@@ -463,6 +508,7 @@ fn start<T: crate::Transport>(
     );
     node.set_partition_policy(settings.policy);
     node.set_quorum_memory(settings.quorum_memory);
+    node.set_max_members(settings.max_members);
     let mut names = crate::driver::Names::new(local);
     for seed in settings.seeds {
         let address = Address::from(seed);
@@ -590,6 +636,8 @@ pub(crate) struct Settings {
     pub max_key_limits: usize,
     /// How long the lists of the keys denied most are.
     pub most_denied: usize,
+    /// The most members the node keeps.
+    pub max_members: usize,
     /// The default limit as given, for reading back.
     pub default_limit: crate::Limit,
     /// How the gossip is signed and checked.
@@ -649,6 +697,8 @@ pub enum Error {
     TooLargeMaxKeyLimits(usize),
     /// A [`Builder::most_denied`] over 1024.
     TooManyMostDenied(usize),
+    /// A [`Builder::max_members`] of 0, or over 65,536.
+    TooLargeMaxMembers(usize),
     /// The mode or the secrets of
     /// [`Builder::gossip_auth`] or
     /// [`Guard::set_gossip_auth`](crate::Guard::set_gossip_auth) refused.
@@ -712,6 +762,9 @@ impl fmt::Display for Error {
             Error::TooManyMostDenied(n) => {
                 write!(f, "{n} most denied keys, at most {MAX_MOST_DENIED}")
             }
+            Error::TooLargeMaxMembers(n) => {
+                write!(f, "max_members of {n}, between 1 and {MAX_MAX_MEMBERS}")
+            }
             Error::GossipAuth(error) => fmt::Display::fmt(error, f),
             Error::ShortSalt(n) => write!(
                 f,
@@ -734,6 +787,17 @@ impl std::error::Error for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_period_over_ten_minutes_spawns() {
+        let guard = Builder::new()
+            .bind("127.0.0.1:0")
+            .limit(1000)
+            .protocol_period(Duration::from_secs(601))
+            .spawn()
+            .unwrap();
+        guard.leave().await;
+    }
 
     fn valid() -> Builder {
         Builder::new().bind("10.0.0.1:7946").limit(1000)
@@ -786,6 +850,30 @@ mod tests {
             Err(Error::TooLargeMaxKeyLimits(n)) if n == (1 << 20) + 1
         ));
         assert!(valid().max_key_limits(1 << 20).settings().is_ok());
+    }
+
+    #[test]
+    fn max_members_out_of_range_is_an_error() {
+        assert_eq!(
+            valid().settings().unwrap().max_members,
+            rateguard_core::node::DEFAULT_MAX_MEMBERS
+        );
+        for n in [1, 64, 65_536] {
+            assert_eq!(valid().max_members(n).settings().unwrap().max_members, n);
+        }
+        for n in [0, 65_537, usize::MAX] {
+            assert!(
+                matches!(
+                    valid().max_members(n).settings(),
+                    Err(Error::TooLargeMaxMembers(m)) if m == n
+                ),
+                "{n}"
+            );
+        }
+        assert_eq!(
+            Error::TooLargeMaxMembers(0).to_string(),
+            "max_members of 0, between 1 and 65536"
+        );
     }
 
     #[test]

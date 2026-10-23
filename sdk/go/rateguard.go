@@ -137,6 +137,11 @@ func (c *Client) check(ctx context.Context, body map[string]string) (Decision, e
 		_, _ = io.Copy(io.Discard, res.Body)
 		_ = res.Body.Close()
 	}()
+	if res.StatusCode == http.StatusRequestEntityTooLarge {
+		// The sidecar refuses a key this large on every attempt: allowing it
+		// would let the key past the limit for good.
+		return Decision{}, fmt.Errorf("rateguard: the key is over the sidecar's 64 KiB limit")
+	}
 	if res.StatusCode != http.StatusOK {
 		return c.onError, fmt.Errorf("rateguard: the sidecar answered %s", res.Status)
 	}

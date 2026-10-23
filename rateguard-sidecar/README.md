@@ -42,6 +42,10 @@ client. A request the sidecar cannot read is a `400`.
 
 ## Limits
 
+A `/v1/check` body may hold at most 64 KiB (65 536 bytes), the admin
+routes' bodies up to axum's 2 MB default; a larger body is
+answered `413` with `{"error": "the body is too large"}`.
+
 A limit in a body has exactly one of `per_second`, `per_minute` and
 `per_hour`, and an optional `burst`, by default a twentieth of the count:
 `{"per_minute": 1000}` and `{"per_hour": 5000, "burst": 10}`. Two periods
@@ -102,6 +106,7 @@ Every flag is also a variable, for Kubernetes: `--limit` is
 | `--drain` | `10s` | How long to go on answering after leaving on SIGTERM |
 | `--tracked-keys`, `--hot-keys`, `--max-classes` | as in `rateguard` | |
 | `--most-denied` | `10` | How many keys `most_denied` and `most_shadow_denied` list in `/v1/stats`, at most 1024, `0` for none (`RATEGUARD_MOST_DENIED`) |
+| `--max-members` | `8192` | How many members an instance keeps track of, the dead not yet forgotten and itself included, from 1 to 65536; newcomers over it are refused and counted in `members_refused`. Size it for the fleet plus the addresses that churned in the last 10 minutes, about twice the fleet for rolling deploys with new pod IPs: while it refuses newcomers, the instance holds every key at the floor `R × β / max-members` (`members_full`). Over the cap the limit is not guaranteed: that hold softens an overflow but does not close it, so raise the cap when `members_refused` grows (`RATEGUARD_MAX_MEMBERS`) |
 | `--gossip-secret-file` | none | Gossip secrets, one per line in base64, at most two: the first signs, either verifies. Reread every 10 s; see [Signed gossip](#signed-gossip) |
 | `--gossip-auth` | `required` with a secret file, else `off` | `off`, `transitional` or `required` |
 | `--key-salt-file` | none | A salt for the hashes of keys, its bytes as they are, at least 16; read once, at start |
@@ -123,8 +128,16 @@ under the pod's `terminationGracePeriodSeconds`.
 
 `/v1/stats` is `Guard::stats` as JSON: the fields of the
 [`rateguard` README](https://github.com/donmiro/rateguard#observability),
-`gossip_auth` as `"off"`, `"transitional"` or `"required"`, and
-`rejected_datagrams` as `{"unsigned": 0, "bad_tag": 0, "malformed": 0}`.
+`gossip_auth` as `"off"`, `"transitional"` or `"required"`,
+`rejected_datagrams` as
+`{"unsigned": 0, "bad_tag": 0, "malformed": 0, "mismatched_records": 0}`
+(the last counts records dropped from datagrams otherwise taken), and
+`identity_conflicts`: one after a restart quicker than the peers noticed,
+growing steadily when two instances advertise one address; and
+`members_refused`: newcomers refused for a full member table, growing
+steadily in a fleet bigger than `--max-members` or under a flood of unsigned
+gossip, which only a secret file keeps out; `members_full` is true while
+every key is held at the floor for it.
 Each entry of `most_denied` has its `key_hash`, as a string, its
 `denied_per_sec`, its `requests_per_sec` and its `shadow_denied_per_sec`, all
 averaged over the last ten seconds or so on this sidecar, a new key's so far;
@@ -196,6 +209,10 @@ cannot be read or is refused leaves the secrets in force: the sidecar says
 so on stderr, by line number and never by content, and counts it in
 `rateguard_gossip_secret_reload_errors_total`, a counter with no `guard`
 label, unlike the rest. At start, the same file stops the sidecar.
+
+`openssl rand -base64 64` wraps its output at 64 characters, so the secret
+lands on two lines and the file is refused, naming the second. Use
+`openssl rand -base64 32`, or add `-A` for any length: one line.
 
 `--gossip-auth` is `required` with a secret file and `off` without. Under
 `off` a secret file given is still read at start, which a refused one

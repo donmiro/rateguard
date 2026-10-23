@@ -90,6 +90,26 @@ jobs:
         working-directory: sdk/typescript
         run: npx -y -p typescript@5.6.3 tsc --noEmit --strict --module nodenext --moduleResolution nodenext --target es2022 test/types.ts
 
+  # Each client against the real sidecar, not only its fake: sdk/live/run.sh
+  # builds and starts it, and fails if a live test fails or is skipped.
+  sdk-live:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+      - name: Live tests
+        run: sdk/live/run.sh
+
   # The oldest Rust the crates promise to build on (rust-version): 1.88,
   # for let chains.
   msrv:

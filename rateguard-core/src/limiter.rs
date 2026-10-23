@@ -182,6 +182,10 @@ pub struct Limiter {
     shadows: HashMap<u64, Gcra>,
     /// A part of each key's R that no key gets more than.
     cap: Option<f64>,
+    /// When the last tick was, if there was one: where a new key's demand
+    /// starts, so that the next tick measures it over the interval it
+    /// folds for every other key.
+    last_tick: Option<Nanos>,
 }
 impl Limiter {
     /// A limiter with no key yet.
@@ -197,6 +201,7 @@ impl Limiter {
             shadows: HashMap::new(),
             config,
             cap: None,
+            last_tick: None,
         }
     }
 
@@ -341,12 +346,20 @@ impl Limiter {
         limit.validate();
         let cold = self.cold_quota(limit, cluster_size);
         let time_constant = self.config.demand_time_constant;
+        // From the previous tick, not from now: the next tick then folds
+        // the key's attempts over the same interval as every other key's,
+        // so `unbiased_rate` compares like with like. From now, a key first
+        // seen at the moment of a tick, as the runtime records them, would
+        // have no interval at that tick, rank last under the cap, and then
+        // have its attempts folded with the next period's over one period.
+        // Before the first tick ever there is no earlier one: from now.
+        let since = self.last_tick.unwrap_or(now);
         let state = self.keys.entry(key).or_insert_with(|| KeyState {
             limit,
-            demand: Demand::starting_at(time_constant, now),
-            requests: Demand::starting_at(DENIAL_TIME_CONSTANT, now),
-            denials: Demand::starting_at(DENIAL_TIME_CONSTANT, now),
-            shadow_denials: Demand::starting_at(DENIAL_TIME_CONSTANT, now),
+            demand: Demand::starting_at(time_constant, since),
+            requests: Demand::starting_at(DENIAL_TIME_CONSTANT, since),
+            denials: Demand::starting_at(DENIAL_TIME_CONSTANT, since),
+            shadow_denials: Demand::starting_at(DENIAL_TIME_CONSTANT, since),
             gcra: Gcra::new(cold),
             applied: cold,
         });
@@ -397,7 +410,9 @@ impl Limiter {
             let threshold = state.limit.rate / n * alpha;
             let is_hot = hot_set.update_with(key, rate, threshold, now, elsewhere(key, state));
             // Attempts not folded in yet are demand too: a key first seen
-            // at the moment of the tick would go with them.
+            // at the moment of the tick before the first one, or of a
+            // second tick at the same moment, has had no interval to
+            // measure them over, and would go with them.
             is_hot
                 || state.gcra.has_debt(now)
                 || rate >= SILENT_DEMAND
@@ -425,6 +440,7 @@ impl Limiter {
             }
         }
 
+        self.last_tick = Some(now);
         self.enforce_cap();
         if !self.shadows.is_empty() {
             let keys = &self.keys;
@@ -1353,5 +1369,82 @@ mod tests {
             panic!("burst must be exhausted");
         };
         assert_eq!(retry_at - t, 4_000_000);
+    }
+
+    // The rateguard runtime's sync: every slot's tally recorded at `now`,
+    // then the tick at the same `now`.
+    #[test]
+    fn runtime_new_heavy_key_is_tracked_under_key_pressure() {
+        let mut l = limiter();
+        let limit = config().limit;
+        let heavy = 999u64;
+        for second in 0..=7u64 {
+            let now = second * ONE_SEC;
+            // Eight steady keys at 1 a second fill the cap.
+            for key in 0..8u64 {
+                l.record(key, tally(1, 0), limit, now, N);
+            }
+            if second >= 5 {
+                // Far over the hot threshold of 100 a second.
+                l.record(heavy, tally(5000, 0), limit, now, N);
+            }
+            l.tick(now, N);
+        }
+        assert!(
+            l.tracked(heavy),
+            "the heavy key is evicted before it is measured"
+        );
+        assert!(l.is_hot(heavy), "the heavy key never turns hot");
+    }
+
+    #[test]
+    fn a_new_key_shows_its_rate_from_its_first_tick() {
+        let mut l = limiter();
+        let limit = config().limit;
+        l.tick(0, N);
+        for second in 1..=3u64 {
+            let now = second * ONE_SEC;
+            l.record(KEY, tally(50, 0), limit, now, N);
+            l.tick(now, N);
+            let rate = l.key_rates(KEY).unwrap().requests_per_sec;
+            assert!(
+                (rate / 50.0 - 1.0).abs() < 0.05,
+                "tick {second}: {rate}, not 50"
+            );
+        }
+    }
+
+    #[test]
+    fn one_off_keys_seen_just_before_the_tick_do_not_evict_steady_keys() {
+        let mut l = limiter();
+        let mut one_off = 1000u64;
+        for second in 0..20u64 {
+            for tenth in 0..10u64 {
+                for key in 0..8u64 {
+                    l.check(key, second * ONE_SEC + tenth * ONE_SEC / 10, N);
+                }
+            }
+            if second >= 10 {
+                for _ in 0..8 {
+                    l.check(one_off, (second + 1) * ONE_SEC - 1_000_000, N);
+                    one_off += 1;
+                }
+            }
+            l.tick((second + 1) * ONE_SEC, N);
+        }
+        let steady = (0..8u64).filter(|&key| l.tracked(key)).count();
+        assert_eq!(steady, 8, "steady 10/s keys evicted for one-request keys");
+    }
+
+    #[test]
+    fn the_first_tick_ever_still_measures_from_now() {
+        let mut l = limiter();
+        // Never ticked: there is no earlier tick to measure from, so the
+        // key starts at the moment it is first seen.
+        l.record(KEY, tally(50, 0), config().limit, 5 * ONE_SEC, N);
+        l.tick(6 * ONE_SEC, N);
+        // 50 over the second since 5 s; measured from 0, a sixth of that.
+        let rate = l.key_rates(KEY).unwrap().requests_per_sec;
+        assert!((rate / 50.0 - 1.0).abs() < 0.05, "{rate}");
     }
 }

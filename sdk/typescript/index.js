@@ -18,7 +18,7 @@ export class Client {
     if (onError !== "allow" && onError !== "deny") {
       throw new TypeError(`onError is "allow" or "deny", not ${JSON.stringify(onError)}`);
     }
-    const base = url ?? process.env.RATEGUARD_SIDECAR_URL ?? DEFAULT_URL;
+    const base = url || process.env.RATEGUARD_SIDECAR_URL || DEFAULT_URL;
     // A path in the URL is kept, as a proxy in front of the sidecar may need.
     this.#url = new URL(`${base.replace(/\/+$/, "")}/v1/check`).href;
     this.#timeoutMs = timeoutMs;
@@ -38,14 +38,26 @@ export class Client {
     } catch (error) {
       return this.#failed(`the sidecar did not answer: ${error.message}`);
     }
+    // The status first: an error page need not be JSON, and the status is
+    // what says what to do with it. The body is cancelled unread, to free
+    // the connection; that rejects if the body has errored already, the
+    // timeout firing after the headers, say, and the decision stands all
+    // the same.
+    if (response.status === 413) {
+      // The sidecar refuses a key this large on every attempt: allowing it
+      // would let the key past the limit for good.
+      await response.body?.cancel().catch(() => {});
+      return { allowed: false, retryAfterMs: 0, error: "the key is over the sidecar's 64 KiB limit" };
+    }
+    if (response.status !== 200) {
+      await response.body?.cancel().catch(() => {});
+      return this.#failed(`the sidecar answered ${response.status}`);
+    }
     let answer;
     try {
       answer = await response.json();
     } catch (error) {
       return this.#failed(`not a decision from the sidecar: ${error.message}`);
-    }
-    if (response.status !== 200) {
-      return this.#failed(`the sidecar answered ${response.status}`);
     }
     if (answer?.allowed === true) {
       return { allowed: true, retryAfterMs: 0 };

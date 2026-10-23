@@ -1,5 +1,6 @@
 //! The background task: the node, the socket and the ticker.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -9,8 +10,8 @@ use std::time::Duration;
 use rateguard_core::boundary::{Action, Event, PeerId};
 use rateguard_core::limiter::KeyRates;
 use rateguard_core::node::Node;
-use rateguard_proto::Address;
 use rateguard_proto::auth::{Auth, Rejected};
+use rateguard_proto::{Address, Message, Update};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -19,15 +20,66 @@ use crate::guard::Shared;
 use crate::stats::RejectedDatagrams;
 use crate::transport::Transport;
 
-/// The sender of a datagram: the member of its first record, which every
-/// message opens with (spec §3). Not the socket address, which a NAT on the
-/// way may have rewritten.
-pub(crate) fn sender(bytes: &[u8]) -> Option<PeerId> {
-    let message = rateguard_proto::decode(bytes).ok()?;
-    message
-        .updates()
-        .first()
-        .map(|update| PeerId::new(update.member))
+/// A datagram as the core gets it; see [`screen`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Screened<'a> {
+    /// The sender: the member of the first record, which every message
+    /// opens with (spec §3). Not the socket address, which a NAT on the
+    /// way may have rewritten.
+    pub from: PeerId,
+    /// The message, without the records dropped.
+    pub bytes: Cow<'a, [u8]>,
+    /// How many records were dropped.
+    pub dropped: u64,
+}
+
+/// Checks that every record names its member by the ID its address gives,
+/// as every node derives its own: news is about the node at an address, and
+/// an ID unhooked from it is either a made-up member or someone speaking
+/// for another under a borrowed name. With gossip unsigned it is the one
+/// check a node can make of news; a conforming peer, 0.7.0 included, never
+/// makes up such a record.
+///
+/// `None`, for a malformed datagram, also when the sender's own record
+/// fails the check: the message speaks for nobody then. A later record that
+/// fails it is dropped alone, the rest re-encoded for the core. A peer
+/// passes on news as it heard it, and a 0.7.0 one passes on a forger's;
+/// dropping its whole datagram for that would lose its own record, its
+/// demand and its answer to a probe. Re-encoding after `Auth::open` is
+/// safe: the signature, if any, has been checked on the bytes as sent.
+pub(crate) fn screen(bytes: &[u8]) -> Option<Screened<'_>> {
+    let matches = |update: &Update| update.member == crate::key::peer_id(update.addr).get();
+    let mut message = rateguard_proto::decode(bytes).ok()?;
+    let opening = message.updates().first()?;
+    if !matches(opening) {
+        return None;
+    }
+    let from = PeerId::new(opening.member);
+    if message.updates().iter().all(matches) {
+        return Some(Screened {
+            from,
+            bytes: Cow::Borrowed(bytes),
+            dropped: 0,
+        });
+    }
+    let updates = match &mut message {
+        Message::Ping { updates, .. }
+        | Message::Ack { updates, .. }
+        | Message::PingReq { updates, .. }
+        | Message::Leave { updates } => updates,
+        // A message of a later version this one cannot take apart: whole
+        // or not at all, and with a record failing the check, not at all.
+        _ => return None,
+    };
+    let before = updates.len();
+    updates.retain(matches);
+    let dropped = (before - updates.len()) as u64;
+    let bytes = rateguard_proto::encode(&message).ok()?;
+    Some(Screened {
+        from,
+        bytes: Cow::Owned(bytes),
+        dropped,
+    })
 }
 
 /// What a `Guard` asks of the background task, which alone owns the core.
@@ -358,7 +410,16 @@ fn sync(node: &mut Node, shared: &Arc<Shared>, rejected: RejectedDatagrams) -> V
         let tally = slot.take_counts();
         let Resolved { limit, known, .. } =
             classes.resolve(&key_limits, slot.class.load(Ordering::Relaxed), key);
-        if tally.attempts > 0 {
+        // A tracked key with no attempts this tick still learns a changed
+        // limit: the quota the tick sets is computed from the limit the
+        // core holds, and only `record` hands it over. An untracked idle
+        // key stays untracked.
+        if tally.attempts > 0
+            || node
+                .limiter()
+                .limit(key)
+                .is_some_and(|known_limit| known_limit != limit)
+        {
             node.record(key, tally, limit, now);
         }
         counts.attempts += tally.attempts;
@@ -463,6 +524,7 @@ fn report(node: &Node, shared: &Shared, counts: Counts) {
     rejected.unsigned += counts.rejected.unsigned;
     rejected.bad_tag += counts.rejected.bad_tag;
     rejected.malformed += counts.rejected.malformed;
+    rejected.mismatched_records += counts.rejected.mismatched_records;
     let listed = |keys: Vec<(u64, KeyRates)>| -> Vec<crate::stats::DeniedKey> {
         keys.into_iter()
             .map(|(key_hash, rates)| crate::stats::DeniedKey {
@@ -483,6 +545,9 @@ fn report(node: &Node, shared: &Shared, counts: Counts) {
     stats.joining = held.joining;
     stats.learning = held.learning;
     stats.without_quorum = held.without_quorum;
+    stats.members_full = held.members_full;
+    stats.identity_conflicts = node.identity_conflicts();
+    stats.members_refused = node.members_refused();
 
     #[cfg(feature = "metrics")]
     {
@@ -522,16 +587,18 @@ fn receive(
             return Vec::new();
         }
     };
-    match sender(message) {
-        Some(from) => node
-            .handle(
+    match screen(message) {
+        Some(screened) => {
+            rejected.mismatched_records += screened.dropped;
+            node.handle(
                 Event::MessageReceived {
-                    from,
-                    bytes: message,
+                    from: screened.from,
+                    bytes: &screened.bytes,
                 },
                 now,
             )
-            .to_vec(),
+            .to_vec()
+        }
         None => {
             rejected.malformed += 1;
             Vec::new()
@@ -891,6 +958,131 @@ mod tests {
         );
     }
 
+    // Every record must name its member by the ID its address gives. The
+    // sender's own record failing it makes the whole datagram malformed,
+    // and the core never sees it; news after it that fails is dropped
+    // alone (see the test below).
+    #[test]
+    fn a_member_whose_id_does_not_follow_from_its_address_is_malformed() {
+        let mut node = node_at(1);
+        let mut rejected = RejectedDatagrams::default();
+        let genuine = |host: u8| {
+            let addr = Address::from(at(host));
+            Update {
+                member: crate::key::peer_id(addr).get(),
+                addr,
+                incarnation: 0,
+                status: Status::Alive,
+            }
+        };
+        let ping = |updates: Vec<Update>| {
+            encode(&Message::Ping {
+                seq: 1,
+                updates,
+                demand: Vec::new(),
+            })
+            .unwrap()
+        };
+        let wrong = |update: Update| Update {
+            member: update.member ^ 1,
+            ..update
+        };
+
+        for datagram in [
+            ping(vec![wrong(genuine(2))]),
+            ping(vec![wrong(genuine(2)), genuine(3)]),
+            ping(vec![
+                Update {
+                    addr: at(4).into(),
+                    ..genuine(2)
+                },
+                genuine(3),
+            ]),
+        ] {
+            assert_eq!(screen(&datagram), None);
+            let actions = receive(&mut node, &Auth::off(), &datagram, 0, &mut rejected);
+            assert!(actions.is_empty());
+        }
+        assert_eq!(rejected.malformed, 3);
+        assert_eq!(node.members().known(), 1, "the core heard nobody");
+
+        // Later records failing the check: each dropped, and the rest taken.
+        let datagram = ping(vec![
+            genuine(2),
+            wrong(genuine(3)),
+            Update {
+                addr: at(4).into(),
+                ..genuine(3)
+            },
+        ]);
+        let screened = screen(&datagram).unwrap();
+        assert_eq!(screened.from, id(2));
+        assert_eq!(screened.bytes, ping(vec![genuine(2)]));
+        assert_eq!(screened.dropped, 2);
+
+        let datagram = ping(vec![genuine(2), genuine(3)]);
+        let screened = screen(&datagram).unwrap();
+        assert!(
+            matches!(screened.bytes, Cow::Borrowed(_)),
+            "taken as sent when every record passes"
+        );
+        assert_eq!(screened.dropped, 0);
+        let actions = receive(&mut node, &Auth::off(), &datagram, 0, &mut rejected);
+        assert!(!actions.is_empty(), "a genuine ping is answered");
+        assert_eq!(node.members().known(), 3);
+        assert_eq!(rejected.malformed, 3);
+        assert_eq!(rejected.mismatched_records, 0);
+    }
+
+    // A 0.7.0 peer passes on news as it heard it, a forger's record
+    // included. Only that record goes: the peer's own record, its demand
+    // and its answer still reach the core.
+    #[test]
+    fn a_forged_record_after_the_senders_is_dropped_alone() {
+        use rateguard_proto::{DemandReport, KeyDemand};
+
+        let mut node = node_at(1);
+        let mut rejected = RejectedDatagrams::default();
+        let genuine = |host: u8| {
+            let addr = Address::from(at(host));
+            Update {
+                member: crate::key::peer_id(addr).get(),
+                addr,
+                incarnation: 0,
+                status: Status::Alive,
+            }
+        };
+        let forged = Update {
+            member: 0xF0F0,
+            ..genuine(4)
+        };
+        let datagram = encode(&Message::Ping {
+            seq: 7,
+            updates: vec![genuine(2), forged, genuine(3)],
+            demand: vec![DemandReport {
+                origin: id(2).get(),
+                epoch: 1,
+                round: 1,
+                keys: vec![KeyDemand {
+                    key_hash: 42,
+                    demand: 300.0,
+                    primary: true,
+                }],
+            }],
+        })
+        .unwrap();
+
+        let actions = receive(&mut node, &Auth::off(), &datagram, 0, &mut rejected);
+        assert!(!actions.is_empty(), "the ping is answered");
+        assert_eq!(node.address(id(2)), Some(at(2).into()));
+        assert_eq!(node.address(id(3)), Some(at(3).into()));
+        assert_eq!(node.address(PeerId::new(0xF0F0)), None, "not learned");
+        assert_eq!(node.members().known(), 3);
+        assert_eq!(node.peer_demand().total(42), 300.0, "the demand is kept");
+        assert_eq!(rejected.malformed, 0);
+        assert_eq!(rejected.mismatched_records, 1);
+    }
+
     // In Off a signed frame is stripped unchecked and not counted: a node
     // not signing yet keeps hearing the nodes that already do.
     #[test]
@@ -944,7 +1136,7 @@ mod tests {
         let bytes = encode(&Message::Ping {
             seq: 1,
             updates: vec![Update {
-                member: 77,
+                member: crate::key::peer_id(me).get(),
                 addr: me,
                 incarnation: 0,
                 status: Status::Alive,
@@ -952,7 +1144,7 @@ mod tests {
             demand: Vec::new(),
         })
         .unwrap();
-        assert_eq!(sender(&bytes).map(|peer| peer.get()), Some(77));
+        assert_eq!(screen(&bytes).unwrap().from, crate::key::peer_id(me));
 
         let empty = encode(&Message::Ping {
             seq: 1,
@@ -960,7 +1152,7 @@ mod tests {
             demand: Vec::new(),
         })
         .unwrap();
-        assert_eq!(sender(&empty), None);
-        assert_eq!(sender(&[0xde, 0xad]), None);
+        assert_eq!(screen(&empty), None);
+        assert_eq!(screen(&[0xde, 0xad]), None);
     }
 }

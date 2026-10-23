@@ -29,7 +29,11 @@ if !d.Allowed {
 | `HTTPClient` | one of its own | To send through |
 
 A broken limiter should not take the service down with it, hence `Allow` by
-default; the error is returned all the same, to log. A `Client` is safe for
+default; the error is returned all the same, to log. A key over the
+sidecar's 64 KiB limit is the one exception: the sidecar refuses it with a
+413 every time, so the client denies it (and returns an error) whatever
+`OnError` says, rather than let it past the limit for good. A `Client` is
+safe for
 concurrent use and keeps connections alive.
 
 Tests: `go test ./...`.

@@ -364,6 +364,7 @@ for its flags, its API, and a Kubernetes example.
 | `max_classes(n)` | `64` | How many named classes an instance keeps, at most 4096 |
 | `max_key_limits(n)` | `4096` | How many exceptions for single keys an instance keeps, at most 1,048,576; see [Limits for one key](#limits-for-one-key) |
 | `most_denied(k)` | `10` | How long `most_denied` and `most_shadow_denied` are, at most 1024, `0` for none |
+| `max_members(n)` | `8192` | How many members an instance keeps track of, the dead not yet forgotten and itself included, from 1 to 65,536. Over it newcomers are refused and counted in `members_refused`. Size it for the fleet plus every address that churned in the last 10 minutes, the time the dead are remembered: about twice the fleet for rolling deploys that give pods new IPs. While the table refuses newcomers, every instance shares the limit as if `n` nodes were up and holds every key at the floor `R × β / n`. Over the cap the limit is not guaranteed, as that hold softens an overflow but does not close it: raise the cap when `members_refused` grows. The default covers fleets up to about 4000 instances under rolling deploys; see [Security](#security) |
 | `gossip_auth(mode, secrets)` | `Off`, no secret | Whether gossip is signed, with at most two secrets of 32 bytes or more; see [Security](#security) |
 | `key_salt(bytes)` | none | A salt of 16 bytes or more for the hashes of keys, the same on every node; see [Security](#security) |
 
@@ -383,16 +384,18 @@ println!("{} admitted, {} denied", stats.admitted, stats.denied);
 |---|---|
 | `admitted`, `denied` | What this instance decided; in a dry run, `denied` counts what it would have denied |
 | `overflowed` | Checks on keys with no place of their own in the key table: if it grows, raise `tracked_keys` |
-| `cluster_size`, `counted_size` | Members seen, and the N the limit is shared over. `counted_size` stays higher under `HoldDown` while a lost member is held: the fleet is under the limit then, not over |
+| `cluster_size`, `counted_size` | Members seen, and the N the limit is shared over. `counted_size` stays higher under `HoldDown` while a lost member is held, and is at least `max_members` while `members_full`; that is a floor on this node's shares, not a guarantee for the fleet, see `max_members(n)` |
 | `suspects` | Members not heard from lately; many of them, a network in trouble |
-| `joining`, `learning`, `without_quorum` | Why every key is held at the floor `R × β / N`, if one is true: no peer reached yet, peers not yet told this node's demand, or no majority under `Quorum` |
+| `joining`, `learning`, `without_quorum`, `members_full` | Why every key is held at the floor `R × β / N`, if one is true: no peer reached yet, peers not yet told this node's demand, no majority under `Quorum`, or a newcomer refused for a full member table in the last 10 minutes (N is then at least `max_members`) |
 | `tracked_keys`, `hot_keys` | Keys with state here, and keys coordinated with the peers |
 | `since_last_round` | Far over the protocol period, the background task is stuck |
 | `running`, `dry_run` | Whether the node still runs, and whether this is a dry run |
 | `most_denied` | The keys denied most lately (ten, or `most_denied(k)`), with their `denied_per_sec`, `requests_per_sec` and `shadow_denied_per_sec`, all over the same ten seconds or so: who is being limited, and what share of its requests. By hash: match them with `guard.key_hash_in(class, key)` |
 | `shadow_denied`, `most_shadow_denied` | What shadow limits would have denied, in all, and by key, sorted by it: who a new limit would limit |
 | `unknown_class` | Checks in a class this instance does not know, held to the default limit |
-| `gossip_auth`, `rejected_datagrams` | How this instance signs its gossip, and the datagrams it refused, by reason: `unsigned`, `bad_tag`, `malformed`. A growing `bad_tag`, secrets that do not match the peers'; a growing `unsigned`, a peer not signing yet, or a stranger |
+| `identity_conflicts` | Times this instance had to outbid an `Alive` record of itself it did not make. A restart quicker than its peers noticed adds one; steady growth means two instances advertise one address |
+| `members_refused` | News of members not seen before, refused because the member table was full (`max_members(n)`). Steady growth means a fleet bigger than the cap, or a stranger flooding unsigned gossip with made-up members |
+| `gossip_auth`, `rejected_datagrams` | How this instance signs its gossip, and the datagrams it refused, by reason: `unsigned`, `bad_tag`, `malformed` (no message, or a sender under an ID its address does not give), and `mismatched_records`: not datagrams but records after the sender's, under an ID their address does not give, dropped from a datagram otherwise taken. A growing `bad_tag`, secrets that do not match the peers'; a growing `unsigned`, a peer not signing yet, or a stranger |
 
 `guard.share(key)` is the rate one key is admitted at on this instance now:
 its share of the limit, before the burst; `share_in(class, key)` the same in a
@@ -419,9 +422,10 @@ With the `metrics` feature the background task publishes the same, labelled
 `rateguard_overflowed_total`, `rateguard_unknown_class_total`, and the gauges
 `rateguard_cluster_size`, `rateguard_counted_size`, `rateguard_suspects`,
 `rateguard_tracked_keys`, `rateguard_hot_keys`,
-`rateguard_held{reason="joining"|"learning"|"without_quorum"}`,
-`rateguard_dry_run`, the counters `rateguard_shadow_denied_total` and
-`rateguard_rejected_datagrams_total{reason="unsigned"|"bad_tag"|"malformed"}`
+`rateguard_held{reason="joining"|"learning"|"without_quorum"|"members_full"}`,
+`rateguard_dry_run`, the counters `rateguard_shadow_denied_total`,
+`rateguard_identity_conflicts_total`, `rateguard_members_refused_total` and
+`rateguard_rejected_datagrams_total{reason="unsigned"|"bad_tag"|"malformed"|"mismatched_records"}`
 and `rateguard_gossip_auth{mode="off"|"transitional"|"required"}`, 1 for the
 instance's mode: everything but `most_denied` and `most_shadow_denied`, whose
 key hashes as labels would make a series per key. Install any `metrics`
@@ -597,7 +601,9 @@ sends to one instance in practice, but not free.
 
 1. `check()` performs no I/O and takes no lock shared with a network task. Its
    latency is independent of cluster state, including a fully collapsed one.
-2. A healthy cluster in steady state admits between `R × (1 − ε)` and `R`.
+2. A healthy cluster in steady state admits between `R × (1 − ε)` and `R`,
+   as long as it fits in `max_members(n)`; over it `R` is not guaranteed,
+   see [Security](#security).
 3. Under partition, the bounds above, according to the selected policy.
 4. Memory is bounded by configuration: the coordination state is
    `O(hot_keys × N)`, and the per-key table is allocated once: two 64-byte
@@ -726,15 +732,58 @@ What this does not protect against:
 - **Eavesdropping.** Nothing is encrypted: whoever sees the traffic reads
   the nodes' addresses, the hashes of keys and their rates.
 - **Replay.** A datagram recorded on the way can be sent again, and is
-  taken. Today that does no harm: news of a member loses to newer news,
-  by incarnation; a demand report no newer than what its sender already
-  said is dropped, and so is one from a run of the sender before a recent
-  restart; a ping's reply must match the probe in flight, so a replayed one
-  cannot keep a dead node alive. Guarding against replay would take synchronised
-  clocks, or counters per sender that survive restarts, for no gain yet.
+  taken. News of a member loses to newer news, by incarnation, but a
+  recorded leave can remove a node again after it restarts, until it
+  refutes: that is open (spec §9.1, item 37). A replayed demand report
+  makes a node only stricter, never looser, with one exception: a recording
+  0.75 to 1 of a round circle old (the round is a `u16`, so about 2.7 to
+  3.6 hours at the default 200 ms period) can lower a peer's demand for one
+  gap between its reports, about N/2 rounds. Closing that takes a wider
+  round on the wire. A reordered datagram may make a node stricter for one
+  stale window. A ping's reply must match the probe in flight, and a
+  probe's sequence number starts at random, so a recorded reply cannot
+  match a probe of a later run. Guarding against replay in full would take
+  synchronised clocks, or counters per sender that survive restarts, for no
+  gain yet.
 - **A node gone rogue.** There is one secret per cluster, and whoever holds
   it can speak for any node.
 - **Salts that differ between nodes.** Nothing detects them; see below.
+
+**Without signing**, two checks still bound what a stranger can do. Every
+member in a datagram must go by the ID its address gives, as every node
+derives its own: a datagram whose sender does not is refused as
+`malformed`, and any later record that does not is dropped alone, counted
+in `mismatched_records`, so that a peer passing on a forger's news is still
+heard. That stops IDs detached from their addresses. It does not stop a stranger from giving a
+real member's address, whose ID anyone can compute; keeping out that
+impersonation takes signing. And an instance keeps at most
+`max_members(n)` members, 8192 by default: news of a newcomer is refused
+while its table is full, and counted in `members_refused`. Size it for the
+fleet plus every address that churned in the last 10 minutes, as the dead
+keep their slots that long: about twice the fleet for rolling deploys that
+give pods new IPs; the default covers fleets up to about 4000 instances
+under rolling deploys. **Over the cap the limit is not guaranteed.** The
+instances that refused a newcomer count the fleet short, and some can
+admit more than their share. While its table refuses newcomers, an
+instance cannot count them, so it shares the limit as if `max_members`
+nodes were up and holds every key at the floor `R × β / max_members`
+(`members_full`, with `members_refused` and
+`rateguard_held{reason="members_full"}` to show it). That softens an
+overflow but does not close it, for two reasons. The refused instance
+itself never holds: its own table is not full, so it shares the limit over
+the small view it has. And an instance that heard of the newcomer only
+second-hand lifts its hold after `tombstone_ttl` while the overflow lasts,
+because the gossip about the refused one has run out of retransmits. In
+the simulator, ten instances with a cap of 4 admitted 1501 a second
+against a bound of 1300, and a fleet over its cap went up to 1.3 times
+the limit. Treat any growth
+of `members_refused` in a legitimate fleet as a reason to raise the cap
+now. That cap bounds memory, not availability. A stranger can still fill the table with
+made-up members at addresses of its choosing, and every key falls to that
+floor; real newcomers wait for a slot until the made-up ones are found dead
+and forgotten. Only signing keeps strangers out. Steady growth of
+`members_refused` means either a fleet bigger than the cap or such a
+flood.
 
 **Turning signing on** in a running cluster takes three rolling updates,
 each on every node before the next starts:

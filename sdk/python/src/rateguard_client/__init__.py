@@ -23,7 +23,7 @@ import os
 import threading
 import urllib.parse
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 __all__ = ["Client", "Decision"]
 
@@ -33,10 +33,16 @@ DEFAULT_URL = "http://127.0.0.1:7947"
 @dataclass(frozen=True)
 class Decision:
     """Whether to serve the request, and if not, how many seconds until a
-    retry may be admitted."""
+    retry may be admitted.
+
+    ``error`` is set when the sidecar could not give a decision: ``allowed``
+    then follows ``on_error``, or is false for a key the sidecar refuses as
+    too big. It is left out of comparisons, so decisions compare by what
+    they decide."""
 
     allowed: bool
     retry_after: float = 0.0
+    error: str | None = field(default=None, compare=False)
 
 
 class Client:
@@ -53,7 +59,9 @@ class Client:
     def __init__(self, url: str | None = None, timeout: float = 0.05, on_error: str = "allow"):
         if on_error not in ("allow", "deny"):
             raise ValueError(f'on_error is "allow" or "deny", not {on_error!r}')
-        url = url or os.environ.get("RATEGUARD_SIDECAR_URL", DEFAULT_URL)
+        # An empty string is unset, as a blank variable in a deployment file
+        # usually means "not configured".
+        url = url or os.environ.get("RATEGUARD_SIDECAR_URL") or DEFAULT_URL
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError(f"not an http:// or https:// URL: {url}")
@@ -65,7 +73,7 @@ class Client:
         # A path in the URL is kept, as a proxy in front of the sidecar may need.
         self._path = parsed.path.rstrip("/") + "/v1/check"
         self._timeout = timeout
-        self._on_error = Decision(allowed=on_error == "allow")
+        self._allow_on_error = on_error == "allow"
         self._local = threading.local()
         # Every live thread's connection, for close(). Weak: a thread that
         # is gone takes its connection with it.
@@ -93,20 +101,29 @@ class Client:
                 self._drop()
                 if attempt == 0:
                     continue
-                return self._on_error
-            except (OSError, http.client.HTTPException):
+                return self._failed("the sidecar closed the connection")
+            except (OSError, http.client.HTTPException) as error:
                 self._drop()
-                return self._on_error
+                return self._failed(f"the sidecar did not answer: {error!r}")
+            if response.status == 413:
+                # The sidecar refuses a body this large for every attempt, so
+                # allowing it would let the key past the limit for good.
+                return Decision(
+                    allowed=False, error="the key is over the sidecar's 64 KiB limit"
+                )
             if response.status != 200:
-                return self._on_error
+                return self._failed(f"the sidecar answered {response.status}")
             try:
                 answer = json.loads(data)
                 if answer["allowed"]:
                     return Decision(allowed=True)
                 return Decision(allowed=False, retry_after=answer["retry_after_ms"] / 1000)
             except (ValueError, KeyError, TypeError):
-                return self._on_error
-        return self._on_error
+                return self._failed("not a decision from the sidecar")
+        return self._failed("the sidecar closed the connection")
+
+    def _failed(self, error: str) -> Decision:
+        return Decision(allowed=self._allow_on_error, error=error)
 
     def close(self) -> None:
         """Closes every thread's connection to the sidecar; the next check

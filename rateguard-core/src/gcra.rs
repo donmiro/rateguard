@@ -62,7 +62,8 @@ impl Quota {
     }
 
     /// Any rate, fractions of a request per second included. A rate too
-    /// slow to hold, zero or not a number, is held at [`MAX_INTERVAL`].
+    /// slow to hold, zero, infinite or not a number, is held at
+    /// [`MAX_INTERVAL`].
     ///
     /// # Panics
     ///
@@ -240,15 +241,14 @@ impl Gcra {
     /// requests ahead at the new rate, so changing the share neither wipes
     /// out its history nor punishes it.
     pub fn set_quota(&mut self, quota: Quota, now: Nanos) {
+        // The same quota changes nothing, as in `rescale`: a round trip
+        // through floating point would only move a large TAT by rounding.
+        if quota == self.quota {
+            return;
+        }
         if let Some(old_tat) = self.tat {
-            let old_t = self.quota.t_nanos();
-            let debt_nanos = old_tat.saturating_sub(now);
-            let debt_slots = debt_nanos as f64 / old_t as f64;
-
+            self.tat = Some(carry_tat(old_tat, self.quota, quota, now));
             self.quota = quota;
-            let new_t = self.quota.t_nanos();
-            let new_debt_nanos = (debt_slots * new_t as f64).round() as u64;
-            self.tat = Some(now.saturating_add(new_debt_nanos));
         } else {
             self.quota = quota;
         }
@@ -351,19 +351,38 @@ fn step(tat: &AtomicU64, quota: u64, now: Nanos) -> Decision {
     }
 }
 
-/// The debt in `tat`, run up at `old`, carried over to `new` in requests;
-/// see [`Gcra::set_quota`].
+/// The TAT that carries the debt of `tat`, run up at `old`, over to `new`
+/// in requests; the one rule of [`Gcra::set_quota`] and [`rescale`].
+///
+/// A TAT at `u64::MAX` is saturated, not a measure: the real debt is
+/// unknown. Dividing it by the old interval gives the slots it could be
+/// worth (16.7 at the slowest rate), which a key with a bigger burst would
+/// turn into a nearly fresh burst. So the debt carried is the largest of
+/// that, the old burst (the most a GCRA owes) and the new burst: a dip to
+/// the slowest rate and back, whatever burst the dip had, leaves the key as
+/// indebted as if it had spent a full burst of the quota it returns to.
+/// That is the strict guess. A debt that overflows at the new interval
+/// saturates the TAT again, as it did.
+fn carry_tat(tat: u64, old: Quota, new: Quota, now: Nanos) -> u64 {
+    let debt_slots = if tat == u64::MAX {
+        let computed = tat.saturating_sub(now) as f64 / old.t_nanos() as f64;
+        computed.max(old.burst() as f64).max(new.burst() as f64)
+    } else {
+        tat.saturating_sub(now) as f64 / old.t_nanos() as f64
+    };
+    now.saturating_add((debt_slots * new.t_nanos() as f64).round() as u64)
+}
+
+/// See [`carry_tat`].
 fn rescale(tat: &AtomicU64, old: Quota, new: Quota, now: Nanos) {
     if old == new {
         return;
     }
-    let (old_t, new_t) = (old.t_nanos() as f64, new.t_nanos() as f64);
     // A plain compare-and-swap loop: `fetch_update` is deprecated on newer
     // toolchains and its replacement missing on older ones.
     let mut seen = tat.load(Ordering::Acquire);
     loop {
-        let debt_slots = seen.saturating_sub(now) as f64 / old_t;
-        let rescaled = now.saturating_add((debt_slots * new_t).round() as u64);
+        let rescaled = carry_tat(seen, old, new, now);
         match tat.compare_exchange_weak(seen, rescaled, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return,
             Err(current) => seen = current,
@@ -740,6 +759,58 @@ mod tests {
         assert_eq!(Quota::per_second(1e-12, 1).interval, MAX_INTERVAL);
     }
 
+    // Through the slowest rate the TAT saturates at the end of time; on
+    // the way back it must still stand for the whole burst owed, not for
+    // the 16 slots a saturated TAT divides out to at the old interval.
+    #[test]
+    fn a_dip_to_the_slowest_rate_and_back_keeps_the_debt() {
+        let fast = Quota::per_second(1000.0, 1000);
+        let slowest = Quota::per_second(0.0, 1000);
+        let mut g = Gcra::new(fast);
+        let a = AtomicGcra::new(fast);
+        for _ in 0..1000 {
+            assert_eq!(g.check(0), Decision::Allow);
+            assert_eq!(a.check(0), Decision::Allow);
+        }
+        g.set_quota(slowest, 0);
+        a.set_quota(slowest, 0);
+        g.set_quota(fast, 0);
+        a.set_quota(fast, 0);
+        assert!(matches!(g.check(0), Decision::Deny { .. }));
+        assert!(matches!(a.check(0), Decision::Deny { .. }));
+        // The debt is the whole burst, so one burst's time pays it off.
+        assert_eq!(g.check(1000 * 1_000_000), Decision::Allow);
+        assert_eq!(a.check(1000 * 1_000_000), Decision::Allow);
+    }
+
+    // A dip with a small burst saturates the TAT just the same, and must
+    // not be cheaper than a dip with a big one.
+    #[test]
+    fn a_dip_with_a_small_burst_does_not_forgive_more() {
+        let fast = Quota::per_second(1000.0, 1000);
+        for dip_burst in [1, 10] {
+            let slowest = Quota::per_second(0.0, dip_burst);
+            let mut g = Gcra::new(fast);
+            let a = AtomicGcra::new(fast);
+            for _ in 0..1000 {
+                assert_eq!(g.check(0), Decision::Allow);
+                assert_eq!(a.check(0), Decision::Allow);
+            }
+            for q in [slowest, fast] {
+                g.set_quota(q, 0);
+                a.set_quota(q, 0);
+            }
+            assert!(
+                matches!(g.check(0), Decision::Deny { .. }),
+                "burst {dip_burst}"
+            );
+            assert!(
+                matches!(a.check(0), Decision::Deny { .. }),
+                "burst {dip_burst}"
+            );
+        }
+    }
+
     mod atomic_equivalence {
         use super::super::*;
         use proptest::prelude::*;
@@ -748,6 +819,8 @@ mod tests {
         enum Op {
             Check(Nanos),
             SetQuota(u32, u32, Nanos),
+            // A rate of zero: held at `MAX_INTERVAL`, where the TAT saturates.
+            Dip(u32, Nanos),
         }
 
         fn ops() -> impl Strategy<Value = Vec<Op>> {
@@ -756,6 +829,7 @@ mod tests {
                     4 => (0u64..50_000_000).prop_map(Op::Check),
                     1 => (1u32..5_000, 1u32..50, 0u64..50_000_000)
                         .prop_map(|(r, b, dt)| Op::SetQuota(r, b, dt)),
+                    1 => (1u32..50, 0u64..50_000_000).prop_map(|(b, dt)| Op::Dip(b, dt)),
                 ],
                 1..200,
             )
@@ -807,6 +881,13 @@ mod tests {
                             reference.set_quota(Quota::new(r, b), now);
                             atomic.set_quota(Quota::new(r, b), now);
                             shadow.set(Some(Quota::new(r, b)), now);
+                        }
+                        Op::Dip(b, dt) => {
+                            now += dt;
+                            let slowest = Quota::per_second(0.0, b);
+                            reference.set_quota(slowest, now);
+                            atomic.set_quota(slowest, now);
+                            shadow.set(Some(slowest), now);
                         }
                     }
                     prop_assert_eq!(atomic.has_debt(now), reference.has_debt(now));

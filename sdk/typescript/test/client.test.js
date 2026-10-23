@@ -7,7 +7,7 @@ import http from "node:http";
 import { Client } from "../index.js";
 
 // Answers /v1/check with what `answer` returns for the request body.
-async function fake(t, answer, { status = 200, delay = 0 } = {}) {
+async function fake(t, answer, { status = 200, delay = 0, raw } = {}) {
   const seen = [];
   const peers = new Set();
   const server = http.createServer((req, res) => {
@@ -18,8 +18,8 @@ async function fake(t, answer, { status = 200, delay = 0 } = {}) {
       seen.push({ path: req.url, body: parsed });
       peers.add(req.socket.remotePort);
       setTimeout(() => {
-        res.writeHead(status, { "content-type": "application/json" });
-        res.end(JSON.stringify(answer(parsed)));
+        res.writeHead(status, { "content-type": raw === undefined ? "application/json" : "text/plain" });
+        res.end(raw === undefined ? JSON.stringify(answer(parsed)) : raw);
       }, delay);
     });
   });
@@ -88,6 +88,77 @@ test("a sidecar that answers badly counts as an error", async (t) => {
   assert.equal((await new Client({ url: sidecar.url, timeoutMs: ROOMY }).check("k")).allowed, true);
   const strict = new Client({ url: sidecar.url, timeoutMs: ROOMY, onError: "deny" });
   assert.equal((await strict.check("k")).allowed, false);
+});
+
+test("a key over the sidecar's limit is denied whatever onError says", async (t) => {
+  const sidecar = await fake(t, () => ({ error: "the body is too large" }), { status: 413 });
+  const decision = await new Client({ url: sidecar.url, timeoutMs: ROOMY, onError: "allow" }).check("k");
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.retryAfterMs, 0);
+  assert.match(decision.error, /64 KiB/);
+});
+
+test("a 413 with a body that is not JSON is still a 413", async (t) => {
+  const sidecar = await fake(t, allow, { status: 413, raw: "Payload Too Large" });
+  const decision = await new Client({ url: sidecar.url, timeoutMs: ROOMY }).check("k");
+  assert.equal(decision.allowed, false);
+  assert.match(decision.error, /64 KiB/);
+  const other = await fake(t, allow, { status: 502, raw: "<html>bad gateway</html>" });
+  const bad = await new Client({ url: other.url, timeoutMs: ROOMY }).check("k");
+  assert.equal(bad.allowed, true);
+  assert.equal(bad.error, "the sidecar answered 502");
+});
+
+// The timeout may fire after the headers, while the body is still coming:
+// the body stream has errored then, and cancelling it rejects. That is no
+// reason for check() to throw instead of deciding.
+test("a body that errored is still a decision", async (t) => {
+  const errored = (status) => {
+    const body = new ReadableStream({
+      start(controller) {
+        controller.error(new Error("The operation was aborted due to timeout"));
+      },
+    });
+    return new Response(body, { status });
+  };
+  // Put back by hand: Node 18's t.mock restores a method mocked twice to
+  // the first mock, not to fetch.
+  const original = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  let status = 413;
+  globalThis.fetch = async () => errored(status);
+  const tooLarge = await new Client({ timeoutMs: ROOMY }).check("k");
+  assert.equal(tooLarge.allowed, false);
+  assert.match(tooLarge.error, /64 KiB/);
+
+  status = 503;
+  const failed = await new Client({ timeoutMs: ROOMY, onError: "deny" }).check("k");
+  assert.deepEqual(failed, { allowed: false, retryAfterMs: 0, error: "the sidecar answered 503" });
+});
+
+test("a server error follows onError and says why", async (t) => {
+  const sidecar = await fake(t, () => ({ error: "boom" }), { status: 500 });
+  const allowed = await new Client({ url: sidecar.url, timeoutMs: ROOMY }).check("k");
+  assert.equal(allowed.allowed, true);
+  assert.match(allowed.error, /500/);
+  const denied = await new Client({ url: sidecar.url, timeoutMs: ROOMY, onError: "deny" }).check("k");
+  assert.equal(denied.allowed, false);
+  assert.match(denied.error, /500/);
+});
+
+test("an empty url is unset", async (t) => {
+  const sidecar = await fake(t, allow);
+  // The default is 127.0.0.1:7947: nothing listens there, so the check
+  // fails, and says it tried that address rather than throwing on "".
+  assert.doesNotThrow(() => new Client({ url: "" }));
+  process.env.RATEGUARD_SIDECAR_URL = "";
+  t.after(() => delete process.env.RATEGUARD_SIDECAR_URL);
+  assert.doesNotThrow(() => new Client({}));
+  process.env.RATEGUARD_SIDECAR_URL = sidecar.url;
+  assert.equal((await new Client({ url: "", timeoutMs: ROOMY }).check("k")).allowed, true);
+  assert.equal(sidecar.seen.length, 1, "an empty url falls back to the environment");
 });
 
 test("an unknown onError is refused", () => {

@@ -27,7 +27,15 @@ if (!decision.allowed) {
 | `onError` | `"allow"` | `"allow"` or `"deny"` the request when the sidecar cannot answer |
 
 A broken limiter should not take the service down with it, hence `allow` by
-default; `decision.error` then says why. Connections are kept alive by
+default; `decision.error` then says why. An empty `url` or
+`$RATEGUARD_SIDECAR_URL` counts as unset.
+
+A key over the sidecar's 64 KiB limit is the one exception: the sidecar
+refuses it with a 413 every time, so the client denies it (`allowed: false`,
+with an `error`) whatever `onError` says, rather than let it past the limit
+for good.
+
+Connections are kept alive by
 Node's `fetch`.
 
 Tests: `npm test`.

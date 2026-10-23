@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rateguard_core::gcra::Quota;
 use rateguard_core::limiter::Limit as CoreLimit;
@@ -210,6 +210,10 @@ pub(crate) struct Classes {
     /// key of the default class still takes no lock.
     has_shadows: AtomicBool,
     table: RwLock<Arc<Table>>,
+    /// Held by whoever changes the table, from the copy to the swap, so that
+    /// two changes do not lose one another's edit while the readers' lock is
+    /// free.
+    writer: Mutex<()>,
 }
 impl Classes {
     /// Checked by the builder: names not empty, no more than `max`.
@@ -234,6 +238,7 @@ impl Classes {
                 named,
                 shadows: HashMap::new(),
             })),
+            writer: Mutex::new(()),
         }
     }
 
@@ -406,18 +411,71 @@ impl Classes {
             .collect()
     }
 
-    // A new table, swapped in whole: readers see the old one or the new.
+    // A new table, swapped in whole: readers see the old one or the new. The
+    // copy, as long as the table is big, is made under `writer` alone; the
+    // readers' lock is taken for the swap only, so a new key's lookup waits
+    // a pointer's store at most.
     fn change(&self, edit: impl FnOnce(&mut Table) -> Result<(), Error>) -> Result<(), Error> {
-        let mut current = self.table.write().unwrap_or_else(PoisonError::into_inner);
-        let mut table = Table::clone(&current);
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut table = Table::clone(&self.snapshot());
         edit(&mut table)?;
-        self.default_rate
-            .store(table.default.rate.to_bits(), Ordering::Relaxed);
-        self.default_burst
-            .store(table.default.burst, Ordering::Relaxed);
-        self.has_shadows
-            .store(table.has_shadows(), Ordering::Relaxed);
-        *current = Arc::new(table);
+        let new = Arc::new(table);
+        // The atomics are stored under the write lock, with the swap, so that
+        // a reader taking the lock after it sees a table no older than them.
+        // A reader that takes no lock may see them a moment before or after
+        // the table, which the atomics' own mix of rate and burst already
+        // allows.
+        let old = {
+            let mut current = self.table.write().unwrap_or_else(PoisonError::into_inner);
+            self.default_rate
+                .store(new.default.rate.to_bits(), Ordering::Relaxed);
+            self.default_burst
+                .store(new.default.burst, Ordering::Relaxed);
+            self.has_shadows.store(new.has_shadows(), Ordering::Relaxed);
+            std::mem::replace(&mut *current, new)
+        };
+        // Dropped after the lock is let go: freeing a big table takes as long
+        // as copying it.
+        drop(old);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_class_change_does_not_hold_readers_for_the_copy() {
+        let named = (0..4096)
+            .map(|i| {
+                let limit = Limit::per_second(10);
+                (format!("class-{i}"), limit, limit.to_core().unwrap())
+            })
+            .collect();
+        let default = Limit::per_second(100);
+        let classes = Classes::new(default, default.to_core().unwrap(), named, 8192);
+        let mut ran = false;
+        classes
+            .change(|table| {
+                // The edit runs after the copy is built: a reader, or the
+                // lock itself, must not wait for it.
+                ran = true;
+                assert!(classes.table.try_read().is_ok(), "readers are locked out");
+                assert!(classes.table.try_write().is_ok(), "the lock is held");
+                assert_eq!(table.named.len(), 4096);
+                Ok(())
+            })
+            .unwrap();
+        assert!(ran);
+        // A change taking the writer lock is not reentrant for another one,
+        // yet readers still pass while one is in progress.
+        classes
+            .change(|_| {
+                assert!(classes.writer.try_lock().is_err());
+                let _ = classes.limit_of(class_hash("class-7"));
+                Ok(())
+            })
+            .unwrap();
     }
 }

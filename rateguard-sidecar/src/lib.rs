@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -90,10 +90,20 @@ impl App {
     }
 }
 
+/// The most a `/v1/check` body may hold, in bytes. A check is a key and a class
+/// name; the API is on loopback and its callers are the service next to it,
+/// so this is room for a long key and no more than that.
+pub const MAX_BODY: usize = 64 * 1024;
+
 /// The API as a router.
 pub fn app(app: App) -> Router {
     let mut router = Router::new()
-        .route("/v1/check", post(check))
+        // Only here: a bulk `PUT /v1/key_limits` is legitimately far larger,
+        // and keeps axum's own default.
+        .route(
+            "/v1/check",
+            post(check).layer(DefaultBodyLimit::max(MAX_BODY)),
+        )
         .route("/v1/stats", get(stats))
         .route("/v1/keys", get(key_stats))
         .route("/healthz", get(health));
@@ -108,7 +118,21 @@ pub fn app(app: App) -> Router {
             .route("/v1/key_limits", put(set_key_limits))
             .route("/v1/shadows", put(set_shadows));
     }
-    router.with_state(app)
+    router
+        // The limit's own refusal is plain text, from whichever extractor
+        // met it; the clients read an error out of JSON. This rewrites every
+        // 413, the admin routes' too, which is why the message names no
+        // limit: a check's is MAX_BODY, an admin route's axum's 2 MB.
+        .layer(axum::middleware::map_response(json_413))
+        .with_state(app)
+}
+
+async fn json_413(response: Response) -> Response {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    let body = axum::Json(json!({"error": "the body is too large"}));
+    (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
 }
 
 /// Health and metrics only, for an address outside loopback.
@@ -197,14 +221,14 @@ fn reload_errors() -> metrics::Counter {
 
 #[derive(Deserialize)]
 struct Check<'a> {
-    // As bytes: serde_json refuses a lone surrogate in a str but hands it
-    // over as WTF-8 here. Python and JavaScript send one as readily as any
-    // other key, and their clients take a 400 for an outage and fail open,
-    // so whoever chooses the key would go unlimited.
+    // Both as bytes: serde_json refuses a lone surrogate in a str but hands
+    // it over as WTF-8 here. Python and JavaScript send one as readily in
+    // the class as in the key, and their clients take a 400 for an outage
+    // and fail open, so whoever chooses either would go unlimited.
     #[serde(borrow, with = "serde_bytes")]
     key: Cow<'a, [u8]>,
-    #[serde(borrow, default)]
-    class: Option<Cow<'a, str>>,
+    #[serde(borrow, default, with = "serde_bytes")]
+    class: Option<Cow<'a, [u8]>>,
 }
 
 async fn check(State(app): State<App>, body: Bytes) -> Response {
@@ -213,10 +237,12 @@ async fn check(State(app): State<App>, body: Bytes) -> Response {
         Err(error) => return bad_request(error),
     };
     // Lossy, as the Go client is: two keys that differ only in their
-    // surrogates share a limit, which is stricter, never looser.
+    // surrogates share a limit, which is stricter, never looser. The same
+    // for a class, which then is one of its own or the default's.
     let key = String::from_utf8_lossy(&check.key);
-    let class = check.class.as_deref().unwrap_or("");
-    let checked = match &check.class {
+    let class_name = check.class.as_deref().map(String::from_utf8_lossy);
+    let class = class_name.as_deref().unwrap_or("");
+    let checked = match &class_name {
         Some(class) => app.guard.check_in_traced(class, &key),
         None => app.guard.check_traced(&key),
     };
@@ -293,6 +319,7 @@ async fn stats(State(app): State<App>) -> Response {
         "joining": s.joining,
         "learning": s.learning,
         "without_quorum": s.without_quorum,
+        "members_full": s.members_full,
         "since_last_round_ms": s.since_last_round.map(|d| d.as_millis() as u64),
         "running": s.running,
         "dry_run": s.dry_run,
@@ -304,7 +331,10 @@ async fn stats(State(app): State<App>) -> Response {
             "unsigned": s.rejected_datagrams.unsigned,
             "bad_tag": s.rejected_datagrams.bad_tag,
             "malformed": s.rejected_datagrams.malformed,
+            "mismatched_records": s.rejected_datagrams.mismatched_records,
         },
+        "identity_conflicts": s.identity_conflicts,
+        "members_refused": s.members_refused,
     }))
     .into_response()
 }

@@ -7,8 +7,10 @@ use rateguard_core::gcra::Nanos;
 use rateguard_core::limiter::{Config, Limit};
 use rateguard_core::node::{Footprint, SwimConfig};
 use rateguard_core::peer_demand::stale_after_rounds;
-use rateguard_proto::MAX_DEMAND_KEYS;
-use rateguard_sim::link::{Fate, Link, NetConfig, NodeIndex, SeededLink};
+use rateguard_proto::{
+    Address, DemandReport, KeyDemand, MAX_DEMAND_KEYS, Message, Status, Update, encode,
+};
+use rateguard_sim::link::{Fate, Link, NetConfig, NodeIndex, PerfectLink, SeededLink};
 use rateguard_sim::sim::Sim;
 
 const ONE_MS: Nanos = 1_000_000;
@@ -188,4 +190,125 @@ fn members_that_come_and_go_are_forgotten_with_all_kept_about_them() {
             PODS
         );
     }
+}
+
+// A stranger, outside the cluster and not signing, sends every node 20
+// datagrams a second from 20 s to 60 s, each naming 12 live members nobody
+// has ever seen, opening under a new one each time with a full report of
+// hot keys. The member table stays within its cap on every node, and
+// every collection with it. What the flood costs is availability: the
+// table fills with made-up members, and a node that refuses newcomers
+// holds every key at the floor R·β / max_members. Only signing keeps a
+// stranger out, so this asserts the bound on memory, not the shares.
+#[test]
+fn a_flood_of_strangers_is_bounded() {
+    const NODES: usize = 4;
+    const MAX_MEMBERS: usize = 16;
+    const FAKES: u64 = 12;
+
+    let mut s = Sim::new(NODES, config(), PerfectLink::new(ONE_MS));
+    s.set_max_members(MAX_MEMBERS);
+    let mut fake = 1_000;
+    for tick in 0..(40 * 20) {
+        let at = 20 * ONE_SEC + tick * 50 * ONE_MS + 3 * ONE_MS;
+        // The most a datagram carries, the first posing as its sender.
+        let mut updates = Vec::new();
+        for _ in 0..FAKES {
+            fake += 1;
+            updates.push(Update {
+                member: fake,
+                addr: Address::V4([10, 9, (fake >> 8) as u8, fake as u8], 7946),
+                incarnation: 0,
+                status: Status::Alive,
+            });
+        }
+        // The sender is the first made-up member, a new one every
+        // datagram, as the runtime takes it from the opening record; it
+        // reports a full set of hot keys of its own.
+        let sender = updates[0].member;
+        let demand = vec![DemandReport {
+            origin: sender,
+            epoch: 1,
+            round: 1,
+            keys: (0..MAX_DEMAND_KEYS as u64)
+                .map(|k| KeyDemand {
+                    key_hash: 1_000_000 + k,
+                    demand: 10_000.0,
+                    primary: true,
+                })
+                .collect(),
+        }];
+        let bytes = encode(&Message::Ack {
+            seq: tick as u32,
+            updates,
+            demand,
+        })
+        .unwrap();
+        for node in 0..NODES {
+            s.schedule_message(at, sender as NodeIndex, node, bytes.clone());
+        }
+    }
+
+    // `watch` holds the peers' demand to the members kept, 64 keys each:
+    // a refused sender's report must leave nothing.
+    let mut most = 0;
+    while s.now() < 70 * ONE_SEC {
+        let next = s.now() + PERIOD;
+        watch(&mut s, next);
+        for node in 0..NODES {
+            let known = s.node(node).members().known();
+            assert!(
+                known <= MAX_MEMBERS,
+                "node {node} at {} ms knows {known} members, over the cap of {MAX_MEMBERS}",
+                s.now() / ONE_MS
+            );
+            most = most.max(known);
+        }
+    }
+    assert_eq!(most, MAX_MEMBERS, "the flood filled the tables");
+    for node in 0..NODES {
+        assert!(
+            s.node(node).members_refused() > 0,
+            "node {node} refused nobody"
+        );
+    }
+}
+
+// A fleet bigger than the member cap: 6 nodes, each keeping at most 4.
+// Every node misses a peer or two, their demand and their share with them,
+// and would take R for shared among fewer nodes than there are. A node
+// that has refused a newcomer lately shares over max_members instead and
+// holds the key it cannot see all of to the floor, and members_refused
+// says why.
+//
+// This shows that a small overflow, in this topology and over 60 s, stays
+// within R. It does not show that a fleet over the cap is held to R: the
+// refused node itself does not hold, as its own table is not full, and a
+// node that heard of the newcomer second-hand lifts its hold after a
+// tombstone_ttl while the overflow lasts. Measured, that admitted up to
+// 1.3 R, with 10 nodes and a cap of 4.
+#[test]
+fn a_small_overflow_of_the_member_cap_is_held_within_r() {
+    const NODES: usize = 6;
+    const RUN: Nanos = 60 * ONE_SEC;
+
+    let mut s = Sim::with_seeds(NODES, config(), PerfectLink::new(ONE_MS), &[0]);
+    s.set_max_members(4);
+    for node in 0..NODES {
+        s.schedule_request_stream(node, 1, 1_000, 0, RUN);
+        s.schedule_request_stream(node, 2, 100, 0, RUN);
+    }
+    // The standard invariants hold on every admission: the admission
+    // window among them, at R a second.
+    s.run_until(RUN);
+    for node in 0..NODES {
+        assert!(
+            s.node(node).members().known() <= 4,
+            "node {node} is over its cap"
+        );
+    }
+    assert!(
+        (0..NODES).any(|node| s.node(node).members_refused() > 0),
+        "the tables never filled"
+    );
 }

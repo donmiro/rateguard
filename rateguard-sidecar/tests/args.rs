@@ -189,6 +189,48 @@ fn most_denied_flag_and_env() {
     assert!(parse(&["--limit", "1", "--most-denied", "x"]).is_err());
 }
 
+#[test]
+fn max_members_flag_and_env() {
+    use clap::CommandFactory;
+
+    assert_eq!(parse(&["--limit", "1"]).unwrap().max_members, None);
+    let args = parse(&["--limit", "1", "--max-members", "64"]).unwrap();
+    assert_eq!(args.max_members, Some(64));
+    assert!(parse(&["--limit", "1", "--max-members", "x"]).is_err());
+    let command = Args::command();
+    let flag = command
+        .get_arguments()
+        .find(|arg| arg.get_long() == Some("max-members"))
+        .unwrap();
+    assert_eq!(
+        flag.get_env().and_then(|env| env.to_str()),
+        Some("RATEGUARD_MAX_MEMBERS")
+    );
+}
+
+#[tokio::test]
+async fn max_members_out_of_range_is_an_error() {
+    for n in ["0", "65537"] {
+        let args = parse(&["--limit", "1", "--bind", "127.0.0.1:0", "--max-members", n]).unwrap();
+        let result = args.builder().unwrap().spawn();
+        assert!(
+            matches!(result, Err(rateguard::Error::TooLargeMaxMembers(m)) if m.to_string() == n),
+            "{n}: {:?}",
+            result.map(drop)
+        );
+    }
+    let args = parse(&[
+        "--limit",
+        "1",
+        "--bind",
+        "127.0.0.1:0",
+        "--max-members",
+        "65536",
+    ])
+    .unwrap();
+    assert!(args.builder().unwrap().spawn().is_ok());
+}
+
 // A file of its own per test, removed when dropped.
 struct File(std::path::PathBuf);
 impl File {
@@ -336,4 +378,28 @@ async fn a_salt_file_is_taken_as_it_is() {
         .unwrap();
     assert_eq!(guard.key_hash_in("", "k"), salted.key_hash_in("", "k"));
     assert_ne!(guard.key_hash_in("", "k"), rateguard::key_hash_in("", "k"));
+}
+
+#[test]
+fn starting_unsigned_warns_on_stderr() {
+    let args = parse(&["--limit", "10", "--bind", "10.0.0.5:7946"]).unwrap();
+    assert_eq!(args.gossip_auth(), GossipAuth::Off);
+    let warnings = args.startup_warnings();
+    assert!(
+        warnings.iter().any(|line| line.contains(
+            "gossip is not signed: anyone who can reach 10.0.0.5:7946 can join the cluster"
+        )),
+        "{warnings:?}"
+    );
+
+    let args = parse(&[
+        "--limit",
+        "10",
+        "--bind",
+        "10.0.0.5:7946",
+        "--gossip-auth",
+        "transitional",
+    ])
+    .unwrap();
+    assert!(args.startup_warnings().is_empty());
 }

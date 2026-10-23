@@ -65,6 +65,7 @@ async fn the_background_task_publishes_counts_and_state() {
         ("rateguard_held", vec![("reason", "joining")], 0.0),
         ("rateguard_held", vec![("reason", "learning")], 0.0),
         ("rateguard_held", vec![("reason", "without_quorum")], 0.0),
+        ("rateguard_held", vec![("reason", "members_full")], 0.0),
         ("rateguard_dry_run", vec![], 0.0),
         (
             "rateguard_rejected_datagrams_total",
@@ -81,6 +82,13 @@ async fn the_background_task_publishes_counts_and_state() {
             vec![("reason", "malformed")],
             1.0,
         ),
+        (
+            "rateguard_rejected_datagrams_total",
+            vec![("reason", "mismatched_records")],
+            0.0,
+        ),
+        ("rateguard_identity_conflicts_total", vec![], 0.0),
+        ("rateguard_members_refused_total", vec![], 0.0),
         ("rateguard_gossip_auth", vec![("mode", "off")], 1.0),
         ("rateguard_gossip_auth", vec![("mode", "transitional")], 0.0),
         ("rateguard_gossip_auth", vec![("mode", "required")], 0.0),

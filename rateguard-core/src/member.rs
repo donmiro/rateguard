@@ -42,6 +42,10 @@ pub enum Applied {
     /// it is this node's current `Alive`, at a higher incarnation if that
     /// was needed to win.
     Refuted(Update),
+    /// News of a stranger, refused because the table is full: nothing
+    /// changed, and the news is not passed on. See
+    /// [`MemberTable::set_max`].
+    Refused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +80,8 @@ pub struct MemberTable {
     members: BTreeMap<PeerId, Member>,
     live: Vec<PeerId>,
     changes: Vec<Change>,
+    max: usize,
+    refused: u64,
 }
 impl MemberTable {
     /// A table holding only the node itself, `Alive` at incarnation 0, listening at `addr`.
@@ -87,7 +93,33 @@ impl MemberTable {
             members: BTreeMap::new(),
             live: Vec::new(),
             changes: Vec::new(),
+            max: usize::MAX,
+            refused: 0,
         }
+    }
+
+    /// Holds the table to `max` members, the dead not yet forgotten and
+    /// this node included: news of a stranger is refused while it is full.
+    /// Unbounded unless set. The members already known are never evicted,
+    /// a lower cap included, and news of them is taken as ever; only
+    /// newcomers wait, until a forgotten member frees a slot.
+    ///
+    /// # Panics
+    ///
+    /// If `max` is 0: the table always holds this node.
+    pub fn set_max(&mut self, max: usize) {
+        assert!(max >= 1, "max_members must be at least 1: the node itself");
+        self.max = max;
+    }
+
+    /// The cap set with [`set_max`](MemberTable::set_max).
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// How many times news of a stranger was refused for a full table.
+    pub fn refused(&self) -> u64 {
+        self.refused
     }
 
     /// The members known, alive, suspect or dead and not yet forgotten,
@@ -141,6 +173,13 @@ impl MemberTable {
             && !update.supersedes(&current.update(peer))
         {
             return Applied::Ignored;
+        }
+        // A stranger is refused, not anyone evicted for it: with gossip
+        // unsigned, anyone may name members by the thousand, and a table
+        // that took them all would grow without bound.
+        if from.is_none() && self.known() >= self.max {
+            self.refused += 1;
+            return Applied::Refused;
         }
 
         let was_live = from.is_some_and(|member| member.status != Status::Dead);
@@ -742,5 +781,54 @@ mod tests {
             }
         }
         assert!(rebuilt.iter().copied().eq(t.peers().iter().copied()));
+    }
+
+    #[test]
+    fn a_full_table_refuses_strangers_but_not_news_of_its_members() {
+        let mut t = table();
+        t.set_max(3);
+        t.apply(news(1, 0, Alive), 0);
+        t.apply(news(2, 0, Dead), 0);
+        assert_eq!(t.known(), 3, "the dead count too");
+        assert_eq!(t.apply(news(3, 0, Alive), 0), Applied::Refused);
+        assert_eq!(t.apply(news(4, 0, Dead), 0), Applied::Refused);
+        assert_eq!(t.refused(), 2);
+        assert_eq!(t.status(id(3)), None);
+        assert_eq!(t.known(), 3);
+        assert!(
+            t.drain_changes()
+                .iter()
+                .all(|c| !matches!(c, Change::Joined(p) if *p == id(3)))
+        );
+
+        assert!(matches!(
+            t.apply(news(2, 1, Alive), ONE_SEC),
+            Applied::Accepted { .. }
+        ));
+        assert!(t.suspect(id(1), ONE_SEC).is_some());
+        assert!(matches!(
+            t.apply(news(0, 0, Suspect), ONE_SEC),
+            Applied::Refuted(_)
+        ));
+        assert_eq!(t.refused(), 2, "only strangers are refused");
+
+        t.apply(news(2, 1, Dead), 2 * ONE_SEC);
+        assert_eq!(t.forget_dead(2 * ONE_SEC + TIMEOUT, TIMEOUT), 1);
+        assert!(matches!(
+            t.apply(news(3, 0, Alive), 3 * ONE_SEC),
+            Applied::Accepted { from: None }
+        ));
+        assert_eq!(t.known(), 3);
+        check_contract(&t).unwrap();
+    }
+
+    #[test]
+    fn a_table_is_unbounded_unless_told() {
+        let mut t = table();
+        for member in 1..2000 {
+            t.apply(news(member, 0, Alive), 0);
+        }
+        assert_eq!(t.known(), 2000);
+        assert_eq!(t.refused(), 0);
     }
 }

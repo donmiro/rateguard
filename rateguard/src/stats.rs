@@ -45,6 +45,12 @@ pub struct Stats {
     /// Every key is at the floor because, under `Quorum`, the node has no
     /// majority, or regained it too recently to have been heard.
     pub without_quorum: bool,
+    /// Every key is at the floor `R × β / max_members` because the member
+    /// table, full, refused a live newcomer within the last
+    /// `tombstone_ttl`: there are nodes this one cannot count. See
+    /// [`members_refused`](Stats::members_refused) and
+    /// [`Builder::max_members`](crate::Builder::max_members).
+    pub members_full: bool,
     /// How long ago the last protocol round ran; `None` before the first.
     /// Far over the protocol period, the background task is stuck.
     pub since_last_round: Option<Duration>,
@@ -84,6 +90,19 @@ pub struct Stats {
     /// whose secrets do not match its peers' shows here: it hears nobody,
     /// and nobody hears it.
     pub rejected_datagrams: RejectedDatagrams,
+    /// Times this node has had to outbid an `Alive` record of itself that
+    /// it did not make: a newer incarnation of its own ID, spread by
+    /// another. A restart quicker than the peers notice adds one, as they
+    /// tell the new instance where the old one stood. Steady growth means
+    /// two instances advertise one address, and each keeps outbidding the
+    /// other.
+    pub identity_conflicts: u64,
+    /// Times news of a member not seen before was refused because the
+    /// member table was full; see
+    /// [`Builder::max_members`](crate::Builder::max_members). Steady growth
+    /// means a cluster bigger than the cap, or a stranger flooding the
+    /// gossip with made-up members.
+    pub members_refused: u64,
 }
 
 /// Datagrams refused since the node started; see
@@ -101,9 +120,16 @@ pub struct RejectedDatagrams {
     /// if signed.
     pub bad_tag: u64,
     /// No message at all: a frame cut short or of an unknown version,
-    /// bytes that do not decode, or a message that names no sender.
-    /// Counted in every mode, `Off` included.
+    /// bytes that do not decode, a message that names no sender, or one
+    /// whose sender's own record, the first, names it by an ID its address
+    /// does not give. Counted in every mode, `Off` included.
     pub malformed: u64,
+    /// Not datagrams but records: news after the sender's own record that
+    /// names a member by an ID its address does not give, dropped while
+    /// the rest of the datagram is taken. A made-up member, or a borrowed
+    /// name, that a peer passed on as it heard it; a 0.7.0 peer does that
+    /// with a forger's news. Counted in every mode, `Off` included.
+    pub mismatched_records: u64,
 }
 
 /// A key denied lately; see [`Stats::most_denied`].

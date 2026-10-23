@@ -33,10 +33,25 @@ pub(crate) fn publish(stats: &Stats, guard: &str) {
         std::slice::from_ref(&label)
     )
     .absolute(stats.shadow_denied);
+    metrics::counter!(
+        "rateguard_identity_conflicts_total",
+        std::slice::from_ref(&label)
+    )
+    .absolute(stats.identity_conflicts);
+    metrics::counter!(
+        "rateguard_members_refused_total",
+        std::slice::from_ref(&label)
+    )
+    .absolute(stats.members_refused);
     let rejected = [
         ("unsigned", stats.rejected_datagrams.unsigned),
         ("bad_tag", stats.rejected_datagrams.bad_tag),
         ("malformed", stats.rejected_datagrams.malformed),
+        // Records, not datagrams: see `RejectedDatagrams`.
+        (
+            "mismatched_records",
+            stats.rejected_datagrams.mismatched_records,
+        ),
     ];
     for (reason, count) in rejected {
         metrics::counter!(
@@ -61,6 +76,7 @@ pub(crate) fn publish(stats: &Stats, guard: &str) {
         ("joining", stats.joining),
         ("learning", stats.learning),
         ("without_quorum", stats.without_quorum),
+        ("members_full", stats.members_full),
     ];
     for (reason, on) in held {
         metrics::gauge!(

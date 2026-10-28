@@ -13,6 +13,12 @@ sidecar cannot be reached in time, or answers with anything but a decision,
 the request is allowed (``on_error="allow"``, the default): a broken limiter
 should not take the service down with it. ``on_error="deny"`` denies
 instead.
+
+The rest of the sidecar's API is here too, off the request path: ``stats``
+and ``key_stats`` read, and ``set_classes``, ``set_limit``,
+``set_key_limits``, ``set_shadows`` and ``set_dry_run`` change limits on a
+sidecar started with ``--admin``. They raise :class:`SidecarError` when the
+sidecar does not carry them out.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ import urllib.parse
 import weakref
 from dataclasses import dataclass, field
 
-__all__ = ["Client", "Decision"]
+__all__ = ["Client", "Decision", "SidecarError"]
 
 DEFAULT_URL = "http://127.0.0.1:7947"
 
@@ -45,6 +51,18 @@ class Decision:
     error: str | None = field(default=None, compare=False)
 
 
+class SidecarError(Exception):
+    """A call other than ``check`` that the sidecar did not carry out.
+
+    ``status`` is the HTTP status it answered, or ``None`` when it did not
+    answer at all; the message has the sidecar's own reason, as for a limit
+    it refused with a 400."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
 class Client:
     """Checks keys through a rateguard-sidecar on this machine.
 
@@ -54,9 +72,18 @@ class Client:
         sidecar answering in a fraction of a millisecond on loopback.
     :param on_error: ``"allow"`` or ``"deny"`` the request when the sidecar
         cannot be reached or answers badly.
+    :param admin_timeout: seconds to wait for every call but ``check``: one
+        second by default. They are not on the request path, and raise
+        :class:`SidecarError` rather than follow ``on_error``.
     """
 
-    def __init__(self, url: str | None = None, timeout: float = 0.05, on_error: str = "allow"):
+    def __init__(
+        self,
+        url: str | None = None,
+        timeout: float = 0.05,
+        on_error: str = "allow",
+        admin_timeout: float = 1.0,
+    ):
         if on_error not in ("allow", "deny"):
             raise ValueError(f'on_error is "allow" or "deny", not {on_error!r}')
         # An empty string is unset, as a blank variable in a deployment file
@@ -71,8 +98,10 @@ class Client:
         self._host = parsed.hostname
         self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
         # A path in the URL is kept, as a proxy in front of the sidecar may need.
-        self._path = parsed.path.rstrip("/") + "/v1/check"
+        self._base = parsed.path.rstrip("/")
+        self._path = self._base + "/v1/check"
         self._timeout = timeout
+        self._admin_timeout = admin_timeout
         self._allow_on_error = on_error == "allow"
         self._local = threading.local()
         # Every live thread's connection, for close(). Weak: a thread that
@@ -125,6 +154,81 @@ class Client:
     def _failed(self, error: str) -> Decision:
         return Decision(allowed=self._allow_on_error, error=error)
 
+    def stats(self) -> dict:
+        """What the sidecar admitted and denied, and why: ``/v1/stats``, as
+        the sidecar's README describes it, with the keys denied most by
+        name."""
+        return self._call("GET", "/v1/stats")
+
+    def key_stats(self, key: str, cls: str | None = None) -> dict | None:
+        """One key's rates, share, limit and shadow, in the class ``cls`` or
+        the default one; ``None`` while the sidecar keeps no state for the
+        key, as it does not for a key that is not busy there."""
+        query = {"key": key} if cls is None else {"key": key, "class": cls}
+        path = "/v1/keys?" + urllib.parse.urlencode(query)
+        return self._call("GET", path, missing_is_none=True)
+
+    def set_classes(self, classes: dict[str, dict]) -> None:
+        """Replaces every named class: ``{"pro": {"per_minute": 60000,
+        "burst": 50}}``. A limit has one of ``per_second``, ``per_minute``
+        and ``per_hour``, and an optional ``burst``."""
+        self._call("PUT", "/v1/classes", classes)
+
+    def set_limit(self, limit: dict) -> None:
+        """Sets the default class's limit: ``{"per_second": 100}``."""
+        self._call("PUT", "/v1/limit", limit)
+
+    def set_key_limits(self, key_limits: list[dict]) -> None:
+        """Replaces every key's own limit. An entry has a ``key``, the
+        ``class`` it is checked in (the default one if left out), and either
+        its own ``limit`` or ``as_class``, the class whose limit it
+        follows."""
+        self._call("PUT", "/v1/key_limits", key_limits)
+
+    def set_shadows(self, shadows: dict[str, dict | None]) -> None:
+        """Replaces every shadow limit, by class, ``""`` for the default
+        one: a limit that denies nothing, and counts what it would deny."""
+        self._call("PUT", "/v1/shadows", shadows)
+
+    def set_dry_run(self, on: bool) -> None:
+        """Admits everything while on, and counts what would be denied."""
+        self._call("PUT", "/v1/dry_run", {"on": on})
+
+    def _call(self, method: str, path: str, body=None, missing_is_none: bool = False):
+        # A connection of its own: these calls are rare, and should not
+        # disturb the one a thread keeps for its checks.
+        connection = self._connect(self._host, self._port, timeout=self._admin_timeout)
+        try:
+            if body is None:
+                connection.request(method, self._base + path)
+            else:
+                connection.request(
+                    method,
+                    self._base + path,
+                    body=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+            response = connection.getresponse()
+            data = response.read()
+        except (OSError, http.client.HTTPException) as error:
+            raise SidecarError(f"the sidecar did not answer: {error!r}") from error
+        finally:
+            connection.close()
+        if response.status == 404 and missing_is_none:
+            return None
+        if response.status == 404 and method == "PUT":
+            raise SidecarError("the sidecar has no admin routes: start it with --admin", 404)
+        if response.status not in (200, 204):
+            raise SidecarError(
+                f"the sidecar answered {response.status}: {_reason(data)}", response.status
+            )
+        if response.status == 204:
+            return None
+        try:
+            return json.loads(data)
+        except ValueError as error:
+            raise SidecarError("not JSON from the sidecar", response.status) from error
+
     def close(self) -> None:
         """Closes every thread's connection to the sidecar; the next check
         opens another."""
@@ -161,6 +265,14 @@ class Client:
             self._local.held = None
             with self._lock:
                 self._connections.discard(held)
+
+
+def _reason(data: bytes) -> str:
+    """The sidecar's ``{"error": ...}``, or the body as it is."""
+    try:
+        return str(json.loads(data)["error"])
+    except (ValueError, KeyError, TypeError):
+        return data.decode(errors="replace") or "no reason given"
 
 
 class _Held:

@@ -1,6 +1,6 @@
 {
   "name": "rateguard-client",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Client for rateguard-sidecar: one global rate limit across a fleet, enforced locally",
   "type": "module",
   "main": "index.js",

@@ -367,7 +367,7 @@ decision = Client().check("tenant:42", cls="pro")
 
 The sidecar takes limits per second, minute and hour (`--limit 1000/min`,
 `--class free=10`), and over its admin API key limits, shadows, and one key's
-counters (`GET /v1/keys`). See the
+counters (`GET /v1/keys`); the clients cover that API too. See the
 [sidecar's README](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar)
 for its flags, its API, and a Kubernetes example.
 

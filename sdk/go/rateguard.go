@@ -17,6 +17,11 @@
 // returned error says why, and the decision is to allow the request: a
 // broken limiter should not take the service down with it. OnError: Deny
 // denies instead.
+//
+// The rest of the sidecar's API is here too, off the request path: Stats
+// and KeyStats read, and SetClasses, SetLimit, SetKeyLimits, SetShadows and
+// SetDryRun change limits on a sidecar started with --admin. They return a
+// *SidecarError when the sidecar does not carry them out.
 package rateguard
 
 import (
@@ -55,6 +60,8 @@ type Options struct {
 	OnError OnError
 	// The HTTP client to send through; one of its own by default.
 	HTTPClient *http.Client
+	// How long to wait for every call but a check: one second by default.
+	AdminTimeout time.Duration
 }
 
 // Decision says whether to serve a request, and if not, how long until a
@@ -66,10 +73,12 @@ type Decision struct {
 
 // Client checks keys through a rateguard-sidecar. Safe for concurrent use.
 type Client struct {
-	url     string
-	timeout time.Duration
-	onError Decision
-	http    *http.Client
+	base         string
+	url          string
+	timeout      time.Duration
+	adminTimeout time.Duration
+	onError      Decision
+	http         *http.Client
 }
 
 // New makes a Client.
@@ -85,6 +94,10 @@ func New(o Options) *Client {
 	if timeout == 0 {
 		timeout = 50 * time.Millisecond
 	}
+	adminTimeout := o.AdminTimeout
+	if adminTimeout == 0 {
+		adminTimeout = time.Second
+	}
 	client := o.HTTPClient
 	if client == nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -93,11 +106,14 @@ func New(o Options) *Client {
 		transport.MaxIdleConnsPerHost = 64
 		client = &http.Client{Transport: transport}
 	}
+	base := strings.TrimSuffix(url, "/")
 	return &Client{
-		url:     strings.TrimSuffix(url, "/") + "/v1/check",
-		timeout: timeout,
-		onError: Decision{Allowed: o.OnError == Allow},
-		http:    client,
+		base:         base,
+		url:          base + "/v1/check",
+		timeout:      timeout,
+		adminTimeout: adminTimeout,
+		onError:      Decision{Allowed: o.OnError == Allow},
+		http:         client,
 	}
 }
 

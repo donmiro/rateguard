@@ -2,7 +2,8 @@
 # Runs each client's live tests against a real rateguard-sidecar, started
 # with a limit of 2 and a burst of 2 on free local ports, and stops it. Fails
 # if any live test fails, or is skipped: a green run must have talked to the
-# sidecar.
+# sidecar. With --admin: the clients' admin tests change limits, and put
+# each back as it was.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -27,7 +28,7 @@ http_port="$(free_port tcp)"
 gossip_port="$(free_port udp)"
 
 log="$(mktemp)"
-"$sidecar" --limit 2 --burst 2 \
+"$sidecar" --limit 2 --burst 2 --admin \
   --listen "127.0.0.1:$http_port" --bind "127.0.0.1:$gossip_port" >"$log" 2>&1 &
 pid=$!
 cleanup() {

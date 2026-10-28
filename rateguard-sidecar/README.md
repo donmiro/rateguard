@@ -244,7 +244,7 @@ each other's keys, and admit up to N times the limit between them.
 
 ## Try it
 
-[`examples/demo`](examples/demo): three sidecars and an unfair load balancer
+[`examples/demo`](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar/examples/demo): three sidecars and an unfair load balancer
 in front of them, 1500 requests a second to one, 300 and 200 to the others,
 under one limit of 1000 a second.
 
@@ -254,8 +254,11 @@ docker compose up
 ```
 
 Every second it prints what each sidecar admitted: the shares follow the
-demand, about 730, 160 and 110, and the fleet holds 1000. `docker compose
-stop c` in another terminal, and the other two take its share at once.
+demand, about 730, 160 and 110, and the fleet holds 1000. The same, as
+graphs, is a Grafana dashboard at <http://localhost:3000>, no login. `docker
+compose stop c` in another terminal, and the other two take its share at once.
+
+![The demo's dashboard: three sidecars admit 730, 160 and 110 a second, together the limit of 1000; c leaves and comes back, and the fleet stays at 1000 throughout](https://raw.githubusercontent.com/donmiro/rateguard/main/rateguard-sidecar/examples/demo/dashboard.png)
 
 ## In Kubernetes
 

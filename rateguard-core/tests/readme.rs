@@ -1,6 +1,6 @@
-// The README's example of the core on its own, word for word between the
-// markers, so that it cannot go stale unnoticed. The test in the rateguard
-// crate checks that the README still says the same.
+// The guide's example of the core on its own (guide/without-the-network.md),
+// word for word between the markers, so that it cannot go stale unnoticed.
+// The test in the rateguard crate checks that the guide still says the same.
 
 use rateguard_proto::Address;
 

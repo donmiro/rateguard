@@ -1,5 +1,5 @@
 //! The accuracy report of spec §6.3: every named scenario on the settings
-//! the runtime ships with, measured, as a markdown table for the README.
+//! the runtime ships with, measured, as a markdown table for guide/how-it-works.md.
 //!
 //! Five nodes, R = 1000 a second on one key, the other settings at their
 //! defaults: β = 0.05, 64 hot keys, 4096 tracked, a burst of R / 20 on each
@@ -452,13 +452,13 @@ pub fn rows() -> Vec<Row> {
     ]
 }
 
-/// The whole report as the README holds it: the table of every scenario,
+/// The whole report as the guide holds it: the table of every scenario,
 /// then the shadow line.
 pub fn report() -> String {
     format!("{}\n{}", markdown(&rows()), shadow_markdown(&shadow()))
 }
 
-/// The shadow line as the README's.
+/// The shadow line as the guide's.
 pub fn shadow_markdown(line: &ShadowLine) -> String {
     // Rounded to a tenth of a percent first, and `+ 0.0` turns a -0.0 into
     // 0.0.
@@ -470,7 +470,7 @@ pub fn shadow_markdown(line: &ShadowLine) -> String {
     )
 }
 
-/// The rows as the README's table.
+/// The rows as the guide's table.
 pub fn markdown(rows: &[Row]) -> String {
     let mut out = String::from(
         "| Scenario | Design bound | Admitted, steady | Peak second | Seconds over 1.01 R | Settles in |\n\

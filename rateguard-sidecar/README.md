@@ -127,7 +127,7 @@ under the pod's `terminationGracePeriodSeconds`.
 ## Stats
 
 `/v1/stats` is `Guard::stats` as JSON: the fields of the
-[`rateguard` README](https://github.com/donmiro/rateguard#observability),
+[`rateguard` guide](https://github.com/donmiro/rateguard/blob/main/guide/observability.md),
 `gossip_auth` as `"off"`, `"transitional"` or `"required"`,
 `rejected_datagrams` as
 `{"unsigned": 0, "bad_tag": 0, "malformed": 0, "mismatched_records": 0}`
@@ -187,7 +187,7 @@ Gossip is unsigned by default, and anyone who reaches the UDP port can join
 the cluster. A secret shared by every instance signs it; a key salt keeps a
 client who picks the keys from choosing one that shares another's limit.
 What each protects, and what it does not, is in the
-[`rateguard` README](https://github.com/donmiro/rateguard#security).
+[`rateguard` guide](https://github.com/donmiro/rateguard/blob/main/guide/security.md).
 
 Both come from files, so that they show neither in `ps` nor in the
 environment: in Kubernetes, a Secret mounted as a volume.

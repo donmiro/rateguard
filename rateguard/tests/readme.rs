@@ -1,5 +1,6 @@
-// The README's examples, so that they cannot go stale unnoticed: the
-// getting-started one compiles as written, and runs on loopback.
+// The examples of the README and the guide, so that they cannot go stale
+// unnoticed: the getting-started one compiles as written, and runs on
+// loopback.
 
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ async fn getting_started() -> Result<(), rateguard::Error> {
     Ok(())
 }
 
-// The Security section's, as above.
+// guide/security.md's, as above.
 #[allow(dead_code)]
 async fn signed_gossip() -> Result<(), Box<dyn std::error::Error>> {
     // README: begin
@@ -67,14 +68,18 @@ async fn getting_started_runs_on_loopback() {
 }
 
 // Every snippet between the markers, in the sources that compile and run
-// it, must stand in the README as it is there, indentation aside.
+// it, must stand in the README or a page of the guide as it is there,
+// indentation aside.
 #[test]
 fn the_readme_says_what_the_tested_examples_do() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     // A packaged crate has no workspace around it; nothing to compare.
-    let Ok(readme) = std::fs::read_to_string(root.join("README.md")) else {
+    let Ok(mut readme) = std::fs::read_to_string(root.join("README.md")) else {
         return;
     };
+    for page in std::fs::read_dir(root.join("guide")).unwrap() {
+        readme += &std::fs::read_to_string(page.unwrap().path()).unwrap();
+    }
     for source in [
         "rateguard/tests/readme.rs",
         "rateguard/examples/axum.rs",
@@ -111,6 +116,6 @@ fn check_snippet(readme: &str, source: &str, body: &str) {
         .collect();
     assert!(
         readme.contains(&snippet),
-        "{source}: the README no longer shows\n{snippet}"
+        "{source}: neither the README nor the guide shows\n{snippet}"
     );
 }

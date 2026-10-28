@@ -21,7 +21,7 @@ const BUSY: u64 = u64::MAX;
 
 /// One key's state: its GCRA, the attempts and denials since the last tick,
 /// its class, and its class's shadow with the shadow's denials. One cache
-/// line a slot, exactly 64 bytes, as the README's memory bound (guarantee
+/// line a slot, exactly 64 bytes, as the guide's memory bound (guarantee
 /// 4) counts: no two keys share a line, and the shadow's load on the
 /// request path is in the line the check has just read.
 #[derive(Debug)]
@@ -326,7 +326,7 @@ mod tests {
         }
     }
 
-    // The README's memory bound counts 64 bytes a slot (guarantee 4), one
+    // The guide's memory bound counts 64 bytes a slot (guarantee 4), one
     // cache line each.
     #[test]
     fn a_slot_is_a_cache_line() {

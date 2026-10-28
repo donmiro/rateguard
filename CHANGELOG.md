@@ -18,6 +18,13 @@ follow [Semantic Versioning](https://semver.org/).
 - `rateguard-sidecar/examples/demo`: the same with three sidecars, in
   `docker compose up`.
 
+### Changed
+
+- The README is a quarter of its length, with a comparison to Redis,
+  Gubernator, Envoy and governor; the rest, unchanged, is in `guide/`:
+  usage, observability, how it works with the accuracy report, security,
+  the core without the network, and the FAQ.
+
 ## [0.7.1] - 2026-10-22
 
 Fixes from an audit of 0.7.0, and a cap on the members a node keeps. The

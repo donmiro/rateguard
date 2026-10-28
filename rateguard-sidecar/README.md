@@ -7,7 +7,7 @@ the sidecars find each other and share the limit, as `rateguard` does in a
 Rust process.
 
 ```sh
-cargo install rateguard-sidecar
+cargo install rateguard-sidecar   # or: docker pull ghcr.io/donmiro/rateguard-sidecar:0.7
 
 rateguard-sidecar --limit 1000 \
   --bind 0.0.0.0:7946 --advertise 10.0.0.3:7946 \
@@ -242,16 +242,38 @@ when the cluster is created; change it only by restarting every pod at
 once, never by a rolling update: instances whose salts differ do not know
 each other's keys, and admit up to N times the limit between them.
 
+## Try it
+
+[`examples/demo`](examples/demo): three sidecars and an unfair load balancer
+in front of them, 1500 requests a second to one, 300 and 200 to the others,
+under one limit of 1000 a second.
+
+```sh
+cd rateguard-sidecar/examples/demo
+docker compose up
+```
+
+Every second it prints what each sidecar admitted: the shares follow the
+demand, about 730, 160 and 110, and the fleet holds 1000. `docker compose
+stop c` in another terminal, and the other two take its share at once.
+
 ## In Kubernetes
 
 [`examples/kubernetes.yaml`](examples/kubernetes.yaml): the sidecar as a
 second container of each pod, a headless service for the seeds, the gossip
 secret and the key salt mounted from a Secret, which you create first with
 the commands in its header, probes and Prometheus on `--metrics-listen`.
-The image:
+The image, for amd64 and arm64, is published with every release:
 
 ```sh
-docker build -f rateguard-sidecar/Dockerfile -t rateguard-sidecar:0.7.0 .
+docker pull ghcr.io/donmiro/rateguard-sidecar:0.7
+```
+
+Tags are the version (`0.7.1`), the minor version (`0.7`, the latest
+patch) and `latest`. To build it yourself, from the repository root:
+
+```sh
+docker build -f rateguard-sidecar/Dockerfile -t rateguard-sidecar .
 ```
 
 ## License

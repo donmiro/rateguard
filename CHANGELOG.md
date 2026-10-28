@@ -7,6 +7,17 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `examples/cluster.rs`: three instances in one process under one limit,
+  behind an unfair load balancer, printing every second what each admits;
+  its output opens the README.
+- The `rateguard-sidecar` image on `ghcr.io/donmiro/rateguard-sidecar`,
+  for amd64 and arm64, published by CI with every release tag; the
+  Kubernetes example uses it.
+- `rateguard-sidecar/examples/demo`: the same with three sidecars, in
+  `docker compose up`.
+
 ## [0.7.1] - 2026-10-22
 
 Fixes from an audit of 0.7.0, and a cap on the members a node keeps. The

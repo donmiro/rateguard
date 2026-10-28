@@ -11,6 +11,9 @@ COPY . .
 RUN cargo build --release --locked -p rateguard-sidecar
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+# Links the package on ghcr.io to the repository.
+LABEL org.opencontainers.image.source="https://github.com/donmiro/rateguard"
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 COPY --from=build /src/target/release/rateguard-sidecar /usr/local/bin/rateguard-sidecar
 # Gossip between instances, and the API on loopback; 9090 for health and
 # metrics when --metrics-listen is set.

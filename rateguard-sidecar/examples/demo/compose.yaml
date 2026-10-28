@@ -1,0 +1,58 @@
+# Three sidecars sharing one limit, and an unfair load balancer in front:
+#
+#     docker compose up
+#
+# load sends 1500 requests a second to a, 300 to b and 200 to c, all on one
+# key with a limit of 1000 a second across the fleet, and prints every second
+# what each sidecar admitted. In another terminal, try:
+#
+#     docker compose stop c     # c leaves: a and b take its share at once,
+#                               # while c answers at the floor for 10 s
+#                               # of drain, then stops
+#     docker compose start c    # c joins again
+#     docker compose down       # done
+#
+# Not a deployment to copy: here the API listens on the compose network so
+# that one container can drive all three, and the gossip is unsigned. In
+# production the API stays on each pod's loopback and the gossip is signed;
+# see ../kubernetes.yaml.
+
+x-sidecar: &sidecar
+  image: ghcr.io/donmiro/rateguard-sidecar:0.7
+  # Without the published image, compose builds it from this repository.
+  build:
+    context: ../../..
+    dockerfile: rateguard-sidecar/Dockerfile
+  # Over the sidecar's 10 s of drain, which compose's default would cut.
+  stop_grace_period: 15s
+
+services:
+  a:
+    <<: *sidecar
+    command: --limit 1000 --listen 0.0.0.0:7947 --advertise 10.79.46.11:7946 --seeds b:7946,c:7946
+    networks: { fleet: { ipv4_address: 10.79.46.11 } }
+  b:
+    <<: *sidecar
+    command: --limit 1000 --listen 0.0.0.0:7947 --advertise 10.79.46.12:7946 --seeds a:7946,c:7946
+    networks: { fleet: { ipv4_address: 10.79.46.12 } }
+  c:
+    <<: *sidecar
+    command: --limit 1000 --listen 0.0.0.0:7947 --advertise 10.79.46.13:7946 --seeds a:7946,b:7946
+    networks: { fleet: { ipv4_address: 10.79.46.13 } }
+
+  load:
+    image: python:3.12-alpine
+    command: python -u /demo/load.py
+    environment:
+      TARGETS: a:7947=1500,b:7947=300,c:7947=200
+      LIMIT: "1000"
+    volumes:
+      - ./load.py:/demo/load.py:ro
+    depends_on: [a, b, c]
+    networks: [fleet]
+
+networks:
+  fleet:
+    ipam:
+      config:
+        - subnet: 10.79.46.0/24

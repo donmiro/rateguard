@@ -26,6 +26,31 @@ if guard.check("api:tenant-42").is_allowed() {
 }
 ```
 
+## See it work
+
+Three instances under one limit of 1000 a second, behind a load balancer
+that sends 1500 requests a second to A, 300 to B and 200 to C:
+
+```console
+$ cargo run -p rateguard --release --example cluster
+   t       A       B       C   fleet  nodes
+  1s     161      66      68     295      3
+  2s     670     120      83     873      3
+  3s     764     164     111    1039      3
+  4s     697     150     107     954      3
+  ...
+ 12s     757     165     115    1037      3
+      C leaves
+ 13s     729     159       -     888      2
+ 14s     817     184       -    1001      2
+```
+
+The first second sits at the floor while the instances learn each other's
+demand; then each takes a share in proportion to its demand, and the fleet
+holds 1000. When C leaves, A and B take its share at once. The same with the
+sidecar, in Docker, is `docker compose up` in
+[`rateguard-sidecar/examples/demo`](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar/examples/demo).
+
 ## Features
 
 - **One limit for the whole fleet.** Run ten instances of your service, keep a

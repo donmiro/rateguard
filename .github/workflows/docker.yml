@@ -1,0 +1,78 @@
+name: Docker
+
+# The rateguard-sidecar image, on ghcr.io, for every release tag: v0.7.1
+# gives 0.7.1, 0.7 and latest. Run by hand to publish a tag pushed before
+# this workflow existed.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build, as v0.7.1
+        required: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/rateguard-sidecar
+
+jobs:
+  # Each architecture on a runner of its own: arm64 under QEMU would compile
+  # the release build for most of an hour.
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Version
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "VERSION=${tag#v}" >> "$GITHUB_ENV"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: rateguard-sidecar/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  # One tag for both architectures: docker pull picks the right one.
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          minor="${version%.*}"
+          for name in "$version" "$minor" latest; do
+            docker buildx imagetools create -t "$IMAGE:$name" \
+              "$IMAGE:$version-amd64" "$IMAGE:$version-arm64"
+          done

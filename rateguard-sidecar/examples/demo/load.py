@@ -11,6 +11,8 @@ with the rate; a service would use a client from sdk/ instead.
 import http.client
 import json
 import os
+import signal
+import sys
 import threading
 import time
 
@@ -76,6 +78,9 @@ class Target:
 
 
 def main():
+    # As PID 1 of a container, Python has no handler for SIGTERM: without
+    # this, docker stop and Kubernetes wait out their grace period.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     targets = [Target(spec) for spec in os.environ["TARGETS"].split(",")]
     for target in targets:
         threading.Thread(target=target.run, daemon=True).start()

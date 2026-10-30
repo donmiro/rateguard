@@ -1,0 +1,16 @@
+# ../kubernetes.yaml as it is, with a load generator for the app and a
+# watcher that reads every replica's metrics. Built by demo.sh with
+# `kubectl kustomize --load-restrictor LoadRestrictionsNone`, since the
+# manifest and load.py sit outside this directory.
+resources:
+  - ../kubernetes.yaml
+  - watch.yaml
+
+patches:
+  - path: app.yaml
+
+configMapGenerator:
+  - name: rateguard-demo
+    files:
+      - ../demo/load.py
+      - watch.py

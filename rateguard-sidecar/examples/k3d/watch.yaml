@@ -1,0 +1,58 @@
+# Lists the api pods through the Kubernetes API, reads every one's /metrics
+# and prints, every second, what the fleet was offered and what it
+# admitted: `kubectl logs -f deploy/watch`.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: watch
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: watch
+subjects:
+  - kind: ServiceAccount
+    name: watch
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: watch
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: watch
+  template:
+    metadata:
+      labels:
+        app: watch
+    spec:
+      serviceAccountName: watch
+      containers:
+        - name: watch
+          image: python:3.12-alpine
+          command: [python, -u, /demo/watch.py]
+          env:
+            - name: SELECTOR
+              value: app=api
+          volumeMounts:
+            - name: demo
+              mountPath: /demo
+      volumes:
+        - name: demo
+          configMap:
+            name: rateguard-demo

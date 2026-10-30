@@ -1,0 +1,25 @@
+# In place of your service: each replica offers 600 checks a second on one
+# key to its own sidecar, over loopback, as an app would.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: python:3.12-alpine
+          command: [python, -u, /demo/load.py]
+          env:
+            - name: TARGETS
+              value: 127.0.0.1:7947=600
+            - name: LIMIT
+              value: "1000"
+          volumeMounts:
+            - name: demo
+              mountPath: /demo
+      volumes:
+        - name: demo
+          configMap:
+            name: rateguard-demo

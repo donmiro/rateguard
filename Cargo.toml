@@ -3,7 +3,7 @@ resolver = "3"
 members = ["rateguard-core", "rateguard-sim", "rateguard-proto", "rateguard", "rateguard-sidecar"]
 
 [workspace.package]
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"

@@ -20,7 +20,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
-rateguard = { version = "0.7.2", path = "../rateguard", features = ["metrics"] }
+rateguard = { version = "0.7.3", path = "../rateguard", features = ["metrics"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"

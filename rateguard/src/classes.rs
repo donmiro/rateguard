@@ -445,6 +445,50 @@ impl Classes {
 mod tests {
     use super::*;
 
+    // The rule of which limit a slot takes is written twice, once for the
+    // core and once for reading back: the two agree on every case.
+    #[test]
+    fn resolve_and_resolve_given_agree() {
+        let core = |limit: Limit| limit.to_core().unwrap();
+        let default = Limit::per_second(100);
+        let pro = Limit::per_minute(600).burst(20);
+        let free = Limit::per_hour(50);
+        let classes = Classes::new(
+            default,
+            core(default),
+            vec![
+                ("pro".to_owned(), pro, core(pro)),
+                ("free".to_owned(), free, core(free)),
+            ],
+            MAX_CLASSES,
+        );
+        classes
+            .set_shadow("pro", Some(Limit::per_second(5)))
+            .unwrap();
+        classes.set_shadow("", Some(Limit::per_second(50))).unwrap();
+        let own = Limit::per_second(7);
+        let overrides: HashMap<u64, Entry> = [
+            (1, KeyLimit::from(own)),
+            (2, KeyLimit::class("pro")),
+            (3, KeyLimit::class("free")),
+            (4, KeyLimit::class("gone")),
+        ]
+        .into_iter()
+        .map(|(key, limit)| (key, (String::new(), key.to_string(), limit)))
+        .collect();
+        let table = classes.snapshot();
+        for class in ["", "pro", "free", "gone"].map(class_hash) {
+            // Key 0 has no limit of its own.
+            for key in 0..=4 {
+                let resolved = table.resolve(&overrides, class, key);
+                let (limit, shadow) = table.resolve_given(&overrides, class, key);
+                let case = format!("class {class:x}, key {key}");
+                assert_eq!(resolved.limit, core(limit), "{case}");
+                assert_eq!(resolved.shadow, shadow.map(core), "{case}");
+            }
+        }
+    }
+
     #[test]
     fn a_class_change_does_not_hold_readers_for_the_copy() {
         let named = (0..4096)

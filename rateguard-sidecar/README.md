@@ -60,7 +60,8 @@ of N admits up to N times the burst back to back.
 An entry of `PUT /v1/key_limits` is the exception of one key: `class` is
 the class your service checks it in (`""` or left out for the default), and
 it has either its own `limit` or `as_class`, the name of the class whose
-limit it follows, tariff changes included; an `as_class` the sidecar does
+limit it follows, tariff changes included (a field that is `null` is one
+left out); an `as_class` the sidecar does
 not have is accepted, and gives the default limit, counted in
 `unknown_class`. The key keeps its identity and
 its debt: moving it from 500 to 2000 a second gives it no fresh burst, and

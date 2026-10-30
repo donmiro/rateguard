@@ -340,7 +340,40 @@ async fn a_refused_change_says_why() {
     .await;
     assert_eq!(status, 400);
     assert!(body["error"].as_str().unwrap().contains("0"), "{body}");
-    assert_eq!(guard.classes().len(), 1, "nothing changed");
+    let unchanged = [("pro".to_owned(), Limit::per_second(10).burst(5))];
+    assert_eq!(guard.classes(), unchanged, "nothing changed");
+    // All or nothing: one bad class among good ones changes none of them.
+    let (status, body) = send(
+        &router,
+        "PUT",
+        "/v1/classes",
+        Some(json!({"team": {"per_second": 30}, "free": {"per_hour": 0}})),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("free"), "{body}");
+    assert_eq!(guard.classes(), unchanged, "nothing changed");
+}
+
+#[tokio::test]
+async fn a_refused_default_limit_says_why_and_keeps_the_old_one() {
+    let guard = guard();
+    let router = router(&guard, true);
+    for bad in [
+        json!({"per_second": 0}),
+        json!({"per_second": 1, "per_minute": 60}),
+        json!({"burst": 5}),
+        json!(5),
+    ] {
+        let (status, body) = send(&router, "PUT", "/v1/limit", Some(bad.clone())).await;
+        assert_eq!(status, 400, "{bad}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+    // Still 40 a second with a burst of 3.
+    for _ in 0..3 {
+        assert_eq!(check(&router, json!({"key": "a"})).await["allowed"], true);
+    }
+    assert_eq!(check(&router, json!({"key": "a"})).await["allowed"], false);
 }
 
 #[tokio::test]
@@ -500,6 +533,23 @@ async fn key_limits_route_refuses_both_limit_and_as_class() {
 }
 
 #[tokio::test]
+async fn a_null_limit_in_a_key_limit_is_no_limit() {
+    let guard = guard();
+    let router = router(&guard, true);
+    // As with as_class, class and burst: null is the field left out.
+    let body = json!([{"key": "k", "limit": null, "as_class": "pro"}]);
+    assert_eq!(
+        send(&router, "PUT", "/v1/key_limits", Some(body)).await.0,
+        204
+    );
+    assert_eq!(guard.key_limits().len(), 1);
+    let bad = json!([{"key": "k", "limit": null, "as_class": null}]);
+    let (status, body) = send(&router, "PUT", "/v1/key_limits", Some(bad)).await;
+    assert_eq!(status, 400);
+    assert!(body["error"].is_string(), "{body}");
+}
+
+#[tokio::test]
 async fn shadows_route_sets_and_clears() {
     let guard = guard();
     let router = router(&guard, true);
@@ -593,6 +643,32 @@ async fn keys_route_names_a_tracked_key() {
         "{body}"
     );
     assert_eq!(body["shadow"]["per_second"], 7, "{body}");
+}
+
+#[tokio::test]
+async fn keys_route_takes_a_percent_encoded_key() {
+    let guard = guard();
+    let router = router(&guard, true);
+    let key = "tenant 42/a&b=c+d";
+    let put = json!([{"class": "pro", "key": key, "limit": {"per_minute": 600}}]);
+    assert_eq!(
+        send(&router, "PUT", "/v1/key_limits", Some(put)).await.0,
+        204
+    );
+    check(&router, json!({"key": key, "class": "pro"})).await;
+    let uri = "/v1/keys?key=tenant%2042%2Fa%26b%3Dc%2Bd&class=pro";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let (status, body) = send(&router, "GET", uri, None).await;
+        if status == 200 {
+            break body;
+        }
+        assert_eq!(status, 404, "{body}");
+        assert!(tokio::time::Instant::now() < deadline, "never tracked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // The key's own limit: the decoded key is the key that was set.
+    assert_eq!(body["limit"]["per_minute"], 600, "{body}");
 }
 
 #[tokio::test]

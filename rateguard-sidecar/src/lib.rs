@@ -22,7 +22,8 @@
 //! `per_second`, `per_minute` or `per_hour`, such as
 //! `{"per_minute": 600, "burst": 20}`; `burst` is optional. In
 //! `/v1/key_limits` an entry has exactly one of `limit` and `as_class`, and
-//! `class` may be left out for the default class. An `as_class` this node
+//! `class` may be left out for the default class; a field that is `null` is
+//! one left out. An `as_class` this node
 //! does not have is taken: the key gets the default limit, and its checks
 //! are counted in `unknown_class`, as with [`rateguard::KeyLimit::Class`].
 //!
@@ -398,7 +399,8 @@ pub(crate) fn limit_to_json(limit: Limit) -> Value {
     let key = match limit.period().as_secs() {
         1 => "per_second",
         60 => "per_minute",
-        _ => "per_hour",
+        3600 => "per_hour",
+        other => unreachable!("a limit per {other} s: a period limit_to_json does not name"),
     };
     json!({key: limit.count(), "burst": limit.burst_size()})
 }
@@ -426,9 +428,13 @@ async fn set_limit(State(app): State<App>, body: Bytes) -> Response {
         Ok(value) => value,
         Err(error) => return bad_request(error),
     };
-    match limit_from_json(&value).map(|limit| app.guard.set_limit(limit)) {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(error)) => bad_request(error),
+    let set = limit_from_json(&value).and_then(|limit| {
+        app.guard
+            .set_limit(limit)
+            .map_err(|error| error.to_string())
+    });
+    match set {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => bad_request(error),
     }
 }
@@ -463,7 +469,9 @@ fn key_limit_from_json(entry: &Value) -> Result<(String, String, KeyLimit), Stri
     };
     let key = text("key")?.ok_or("an entry needs a key")?;
     let class = text("class")?.unwrap_or_default();
-    let limit = match (object.get("limit"), text("as_class")?) {
+    // Null is the field left out, here as for every other field.
+    let limit = object.get("limit").filter(|limit| !limit.is_null());
+    let limit = match (limit, text("as_class")?) {
         (Some(limit), None) => KeyLimit::from(limit_from_json(limit)?),
         (None, Some(name)) => KeyLimit::class(name),
         _ => return Err("an entry has exactly one of limit and as_class".into()),
@@ -544,4 +552,21 @@ async fn set_dry_run(State(app): State<App>, body: Bytes) -> Response {
 fn bad_request(error: impl std::fmt::Display) -> Response {
     let body = axum::Json(json!({"error": error.to_string()}));
     (StatusCode::BAD_REQUEST, body).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every period a limit can have is named, and reads back as it was.
+    #[test]
+    fn a_limit_of_each_period_reads_back_from_its_json() {
+        for limit in [
+            Limit::per_second(100),
+            Limit::per_minute(600).burst(20),
+            Limit::per_hour(5).burst(1),
+        ] {
+            assert_eq!(limit_from_json(&limit_to_json(limit)), Ok(limit));
+        }
+    }
 }

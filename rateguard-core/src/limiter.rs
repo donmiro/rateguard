@@ -747,8 +747,10 @@ mod tests {
         };
         let quota = l.new_key_quota(limit, 4);
         let expected = config().alpha * limit.rate / 4.0;
+        // The interval, about 0.48 s, is rounded up to a whole nanosecond:
+        // the rate is off by less than one part in 4.8 × 10^8 of it.
         assert!(
-            (quota.rate_per_sec() - expected).abs() < 1e-9,
+            ((quota.rate_per_sec() - expected) / expected).abs() < 1e-8,
             "{} against {expected}",
             quota.rate_per_sec()
         );

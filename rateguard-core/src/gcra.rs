@@ -473,6 +473,14 @@ mod tests {
         assert_eq!((q.rate_per_sec(), q.burst()), (2.5, 7));
     }
 
+    // Code 3 of the unit is unused: a word holding it is not a quota.
+    #[test]
+    #[should_panic(expected = "the interval's unit is unknown")]
+    fn a_word_with_an_unknown_unit_is_refused() {
+        let word = Quota::per_second(10.0, 1).pack() | (3 << UNIT_SHIFT);
+        Quota::unpack(word);
+    }
+
     #[test]
     #[should_panic]
     fn negative_rps_or_burst_schould_panic() {

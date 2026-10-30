@@ -111,7 +111,8 @@ sends to one instance in practice, but not free.
 
 Every scenario below runs in the simulator on the settings `rateguard` ships
 with: five instances, a limit of 1000 per second on one key, `β = 0.05`,
-64 hot keys, a burst of 50 on each instance. The table is generated, not
+64 hot keys, a burst of 50 on each instance; the last table alone, a limit
+per minute, runs on ten and forty. The table is generated, not
 written: `cargo run -p rateguard-sim --release --bin accuracy -- --write`,
 and CI fails if it falls out of date.
 
@@ -137,7 +138,14 @@ and CI fails if it falls out of date.
 | Limit lowered to R/2, one node a second | ≤ R in passing, R/2 after | 0.50 R | 1.00 R | 0 | 3 s |
 | Limit raised from R/2 to R, one node a second | ≤ R, then R | 1.00 R | 1.00 R | 0 | 3 s |
 
-Shadow at R/5, skewed demand on R: shadow denials vs. enforced, 1600.0 vs. 1600.0 a second (+0.0%).
+- Shadow at R/5 on R, skewed demand over both, 1200 + 4 × 150: shadow denials vs. enforced, 1600.0 vs. 1600.0 a second (+0.0%).
+- Shadow at R/5 on R, demand between the two, hot on one node, 300 + 4 × 50: shadow denials vs. enforced, 300.0 vs. 300.0 a second (+0.0%).
+- Shadow at R/5 on R, demand between the two, cold under R everywhere, 5 × 60: shadow denials vs. enforced, 200.0 vs. 100.0 a second (+100.0%).
+
+| R = 600 a minute, skewed | Bound, R + N × burst | Admitted, steady | Peak minute | Minutes over 1.01 R |
+|---|---|---|---|---|
+| 10 nodes | 1.50 R | 0.89 R | 1.34 R | 1 |
+| 40 nodes | 3.00 R | 0.80 R | 2.68 R | 1 |
 <!-- accuracy: end -->
 
 *Admitted, steady* is the rate once the scenario has settled, over a window
@@ -151,3 +159,19 @@ is the `ε` of `R + ε`: 2% here. And after a GC pause the paused instance
 works through the requests that queued up meanwhile, its demand estimate
 jumps, and the others give way for a few seconds: the cluster dips *under*
 the limit, never over it.
+
+The shadow lines compare a shadow limit with the same limit enforced. A
+shadow errs only on the strict side, and only where a key is cold under the
+real limit on every instance and hot under the shadow's: the shadow then
+keeps the small share a cold key gets, where enforcing it would share it by
+demand, and counts more denials than enforcing would give, here twice as
+many. Hot on one instance is enough to make the key hot on all of them, and
+the shadow is exact again.
+
+The last table is a limit per minute, `Limit::per_minute(600)` with its
+default burst of 30, on ten and forty instances under skewed demand: 15 a
+second on one instance and 1 on each other. Its first minute is the one over
+`R`: every instance starts with its burst, and a fleet of N may admit
+`R + N × burst`, within the bound in the table. In steady state it admits
+less than `R`, more so on forty instances, where each one's share is a
+request every few seconds: under the limit, never over it.

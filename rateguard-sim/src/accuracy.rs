@@ -334,10 +334,12 @@ pub struct ShadowLine {
     pub denied: f64,
 }
 
-/// Skewed demand on R = 1000 with a shadow at R/5, and the same with R/5
-/// enforced: the key is hot under either, so the shadow's share is the
-/// enforced one, scaled.
-pub fn shadow() -> ShadowLine {
+/// Demand `rates` on R = 1000 with a shadow at R/5, and the same with R/5
+/// enforced. Where the key is hot under either limit on every node, the
+/// shadow's share is the enforced one, scaled; on a node where it is cold
+/// under R and hot under R/5 the shadow keeps the cold share of R/5, where
+/// enforcing R/5 would give its share by demand, and so denies more.
+pub fn shadow(rates: [u32; NODES]) -> ShadowLine {
     let run = 40 * ONE_SEC;
     let (from, until) = (20 * ONE_SEC, run);
     let fifth = Limit {
@@ -350,14 +352,14 @@ pub fn shadow() -> ShadowLine {
     let mut shadowed = Sim::new(NODES, defaults(), PerfectLink::new(ONE_MS));
     shadowed.remove_invariant("admission-window");
     shadowed.set_shadow(KEY, Some(fifth));
-    streams(&mut shadowed, SKEWED, run);
+    streams(&mut shadowed, rates, run);
     shadowed.run_until(run);
     let shadow_denied = shadowed.shadow_denials().iter().filter(in_window).count();
 
     let mut enforced = Sim::new(NODES, defaults(), PerfectLink::new(ONE_MS));
     enforced.remove_invariant("admission-window");
     enforced.set_key_limit(KEY, fifth);
-    streams(&mut enforced, SKEWED, run);
+    streams(&mut enforced, rates, run);
     enforced.run_until(run);
     let denied = enforced
         .admissions()
@@ -452,22 +454,115 @@ pub fn rows() -> Vec<Row> {
     ]
 }
 
+/// Demand between R/5 and R, hot under R on node 0: 300 there, 50 on each
+/// other. R admits all of it. Node 0 is over the cold share α × R / 5 =
+/// 100, and the key turns hot on every node through the gossip, so the
+/// shadow's share is the enforced one, scaled.
+pub const BETWEEN_HOT: [u32; NODES] = [300, 50, 50, 50, 50];
+
+/// Demand between R/5 and R, cold under R everywhere: 60 on each node,
+/// under the cold share of R, 100, and over that of R/5, 20. The shadow
+/// keeps the cold share of R/5 where enforcing it gives shares by demand:
+/// it denies more, the strict side it errs on.
+pub const BETWEEN_COLD: [u32; NODES] = [60; NODES];
+
 /// The whole report as the guide holds it: the table of every scenario,
-/// then the shadow line.
+/// the shadow lines, then the table of limits per minute.
 pub fn report() -> String {
-    format!("{}\n{}", markdown(&rows()), shadow_markdown(&shadow()))
+    format!(
+        "{}\n{}{}{}\n{}",
+        markdown(&rows()),
+        shadow_markdown("skewed demand over both, 1200 + 4 × 150", &shadow(SKEWED)),
+        shadow_markdown(
+            "demand between the two, hot on one node, 300 + 4 × 50",
+            &shadow(BETWEEN_HOT)
+        ),
+        shadow_markdown(
+            "demand between the two, cold under R everywhere, 5 × 60",
+            &shadow(BETWEEN_COLD)
+        ),
+        per_minute_markdown(&[per_minute(10), per_minute(40)]),
+    )
 }
 
-/// The shadow line as the guide's.
-pub fn shadow_markdown(line: &ShadowLine) -> String {
+/// A shadow line as the guide's.
+pub fn shadow_markdown(demand: &str, line: &ShadowLine) -> String {
     // Rounded to a tenth of a percent first, and `+ 0.0` turns a -0.0 into
     // 0.0.
     let off = ((line.shadow_denied / line.denied - 1.0) * 1000.0).round() / 10.0 + 0.0;
     format!(
-        "Shadow at R/5, skewed demand on R: shadow denials vs. enforced, \
+        "- Shadow at R/5 on R, {demand}: shadow denials vs. enforced, \
          {:.1} vs. {:.1} a second ({off:+.1}%).\n",
         line.shadow_denied, line.denied
     )
+}
+
+/// A limit of 600 a minute, its burst 30, on `nodes` nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerMinute {
+    /// How many nodes.
+    pub nodes: usize,
+    /// Admitted a minute over the steady window, as a share of R.
+    pub admitted: f64,
+    /// The busiest minute of the whole run, as a share of R.
+    pub peak: f64,
+    /// Whole minutes of the run that admitted more than 1.01 R.
+    pub minutes_over: usize,
+}
+
+/// 600 a minute, `Limit::per_minute(600)`, on `nodes` nodes for eight
+/// minutes, skewed: 15 a second on node 0 and 1 on each other, 27 a
+/// second on ten nodes and 54 on forty, against a limit of 10. The steady
+/// window is the last five minutes.
+pub fn per_minute(nodes: usize) -> PerMinute {
+    const ONE_MIN: Nanos = 60 * ONE_SEC;
+    const R: f64 = 600.0;
+    let run = 8 * ONE_MIN;
+    let config = Config {
+        limit: Limit {
+            rate: R / 60.0,
+            burst: 30,
+        },
+        ..defaults()
+    };
+    let mut s = Sim::new(nodes, config, PerfectLink::new(ONE_MS));
+    s.remove_invariant("admission-window");
+    for node in 0..nodes {
+        s.schedule_request_stream(node, KEY, if node == 0 { 15 } else { 1 }, 0, run);
+    }
+    s.run_until(run);
+    let mut minutes = vec![0.0; (run / ONE_MIN) as usize];
+    for a in s.admissions() {
+        if a.key == KEY
+            && a.decision == Decision::Allow
+            && let Some(minute) = minutes.get_mut((a.at / ONE_MIN) as usize)
+        {
+            *minute += 1.0;
+        }
+    }
+    let steady = &minutes[3..];
+    PerMinute {
+        nodes,
+        admitted: steady.iter().sum::<f64>() / steady.len() as f64 / R,
+        peak: minutes.iter().copied().fold(0.0, f64::max) / R,
+        minutes_over: minutes.iter().filter(|&&n| n > 1.01 * R).count(),
+    }
+}
+
+/// The limits per minute as the guide's table.
+pub fn per_minute_markdown(lines: &[PerMinute]) -> String {
+    let mut out = String::from(
+        "| R = 600 a minute, skewed | Bound, R + N × burst | Admitted, steady | Peak minute | Minutes over 1.01 R |\n\
+         |---|---|---|---|---|\n",
+    );
+    for l in lines {
+        let bound = 1.0 + l.nodes as f64 * 30.0 / 600.0;
+        out.push_str(&format!(
+            "| {} nodes | {bound:.2} R | {:.2} R | {:.2} R | {} |\n",
+            l.nodes, l.admitted, l.peak, l.minutes_over
+        ));
+    }
+    out
 }
 
 /// The rows as the guide's table.

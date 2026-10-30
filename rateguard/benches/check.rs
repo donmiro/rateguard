@@ -64,10 +64,16 @@ fn single_thread(c: &mut Criterion) {
     let lone = guard(&rt, false, false);
     let hung = guard(&rt, true, false);
     let salted = guard(&rt, false, true);
-    // A shadow on the default class: a second GCRA step on every check.
+    // A shadow on the default class: a second GCRA step on every check,
+    // one that admits; and one that denies past its burst, so the check
+    // also counts a shadow denial, as under a limit tried out too low.
     let shadowed = guard(&rt, false, false);
     shadowed
         .set_shadow("", Some(Limit::per_second(u32::MAX)))
+        .unwrap();
+    let shadow_denying = guard(&rt, false, false);
+    shadow_denying
+        .set_shadow("", Some(Limit::per_second(1)))
         .unwrap();
     let keys: Vec<String> = (0..4096).map(|i| format!("tenant:{i}")).collect();
 
@@ -87,6 +93,9 @@ fn single_thread(c: &mut Criterion) {
     });
     group.bench_function("one hot key, shadowed", |b| {
         b.iter(|| black_box(shadowed.check(black_box("api:tenant-42"))))
+    });
+    group.bench_function("one hot key, shadow denying", |b| {
+        b.iter(|| black_box(shadow_denying.check(black_box("api:tenant-42"))))
     });
     group.bench_function("one hot key, salted", |b| {
         b.iter(|| black_box(salted.check(black_box("api:tenant-42"))))

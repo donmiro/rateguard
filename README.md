@@ -51,6 +51,14 @@ holds 1000. When C leaves, A and B take its share at once. The same with the
 sidecar, in Docker, is `docker compose up` in
 [`rateguard-sidecar/examples/demo`](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar/examples/demo).
 
+And in Kubernetes, while `kubectl scale` takes the deployment from 3
+replicas to 6, 2 and 4, each offered 600 requests a second on one key: the
+fleet holds 1000 throughout, the shares following the replicas
+([`rateguard-sidecar/examples/k3d`](https://github.com/donmiro/rateguard/tree/main/rateguard-sidecar/examples/k3d),
+`./demo.sh up && ./demo.sh scale`).
+
+![The fleet holding 1000 a second while the deployment scales](https://raw.githubusercontent.com/donmiro/rateguard/main/rateguard-sidecar/examples/k3d/demo.gif)
+
 ## Features
 
 - **One limit for the whole fleet.** Ten instances of your service, one limit

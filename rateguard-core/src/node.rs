@@ -149,6 +149,9 @@ pub struct Node {
     // Peers whose last message announced them alive at an incarnation
     // below the one we hold: restarted, and nobody told them.
     behind: BTreeSet<PeerId>,
+    // Newcomers being told of the live members, with the last one told;
+    // see `outgoing`. Live members only: no larger than the table.
+    introducing: BTreeMap<PeerId, Option<PeerId>>,
     recent_shares: BTreeMap<u64, [f64; RISE_DELAY_ROUNDS]>,
     left: bool,
     held: Held,
@@ -278,6 +281,7 @@ impl Node {
             last_heard: BTreeMap::new(),
             reported: VecDeque::new(),
             behind: BTreeSet::new(),
+            introducing: BTreeMap::new(),
             recent_shares: BTreeMap::new(),
             left: false,
             held: Held::default(),
@@ -648,6 +652,10 @@ impl Node {
                 {
                     self.gossip.push(dead);
                 }
+                let members = &self.members;
+                self.introducing.retain(|&peer, _| {
+                    matches!(members.status(peer), Some(Status::Alive | Status::Suspect))
+                });
                 if self.members.forget_dead(now, self.swim.tombstone_ttl) > 0 {
                     let members = &self.members;
                     self.last_heard
@@ -911,12 +919,24 @@ impl Node {
         } else {
             self.behind.remove(&from);
         }
+        let newcomer = !matches!(
+            self.members.status(from),
+            Some(Status::Alive | Status::Suspect)
+        );
         for &update in message.updates() {
             self.learn(update, now);
         }
         if let Message::Leave { .. } = message {
             self.depart(from);
             return;
+        }
+        // A newcomer, or a member back from the dead, heard first hand. News
+        // of a join is sent a few times and dropped: the members that joined
+        // while it was away may be news it will never hear, and it would
+        // count the cluster short, take the share of a smaller one, and
+        // never ping them to be counted in turn. It is told of them all.
+        if newcomer && self.members.status(from) == Some(Status::Alive) {
+            self.introducing.insert(from, None);
         }
         // Only members are heard of: a stranger that does not introduce
         // itself would grow the table without bound.
@@ -964,6 +984,7 @@ impl Node {
             return;
         }
         self.behind.remove(&peer);
+        self.introducing.remove(&peer);
         self.peer_demand.forget(peer);
         self.last_heard.remove(&peer);
         if let Some(since) = self.members.joined_at(peer) {
@@ -1142,6 +1163,27 @@ impl Node {
             && !updates.contains(&accusation)
         {
             updates.push(accusation);
+        }
+        // A newcomer hears of every live member, in the room the message
+        // has left, from where the last message to it stopped.
+        if let Some(&start) = self.introducing.get(&to) {
+            let mut last = start;
+            let mut all_told = false;
+            while updates.len() < proto::MAX_UPDATES {
+                let Some(update) = self.members.next_live_after(last) else {
+                    all_told = true;
+                    break;
+                };
+                last = Some(PeerId::new(update.member));
+                if update.member != to.get() && updates.iter().all(|u| u.member != update.member) {
+                    updates.push(update);
+                }
+            }
+            if all_told {
+                self.introducing.remove(&to);
+            } else {
+                self.introducing.insert(to, last);
+            }
         }
         updates
     }
@@ -2007,6 +2049,96 @@ mod tests {
             "an echo of known news must not restart the count, \
              and the one reconnect to the dead carries the buffered copy"
         );
+    }
+
+    // A node that knows `peers`, with every piece of news about them spent:
+    // what a newcomer would find after the news of the others' joins has
+    // run out.
+    fn settled_with(peers: impl IntoIterator<Item = u64>) -> Node {
+        let quiet = SwimConfig {
+            reconnect_interval: 1000 * PERIOD,
+            tombstone_ttl: 1000 * PERIOD,
+            ..SWIM
+        };
+        let mut n = Node::new(config(), quiet, LOCAL, addr(LOCAL.get()), 1);
+        for peer in peers {
+            n.introduce(PeerId::new(peer), addr(peer));
+        }
+        for k in 0..100 {
+            answered_round(&mut n, k);
+        }
+        assert_eq!(n.gossip.len(), 0, "the news is spent");
+        n
+    }
+
+    fn opening(seq: u32, from: u64) -> Message {
+        Message::Ping {
+            seq,
+            updates: vec![news(from, 0, Alive)],
+            demand: Vec::new(),
+        }
+    }
+
+    // The members that `messages` to `to` name, the sender and `to` left out.
+    fn told(messages: &[(PeerId, Message)], to: u64) -> Vec<u64> {
+        let mut members: Vec<u64> = messages
+            .iter()
+            .filter(|(peer, _)| peer.get() == to)
+            .flat_map(|(_, message)| message.updates())
+            .map(|update| update.member)
+            .filter(|&member| member != LOCAL.get() && member != to)
+            .collect();
+        members.sort_unstable();
+        members
+    }
+
+    // News of a join is sent a few times and then dropped: a node that
+    // joins after it has run out would never hear of the members that
+    // joined before it, and would count the cluster short. Whoever first
+    // hears from a newcomer tells it of every member it knows.
+    #[test]
+    fn a_newcomer_is_told_of_the_members_whose_news_ran_out() {
+        let mut n = settled_with([1, 2]);
+        let answer = deliver(&mut n, 9, opening(1, 9), 100 * PERIOD + ONE_MS);
+        assert_eq!(told(&answer, 9), [1, 2]);
+    }
+
+    #[test]
+    fn a_member_already_known_is_told_nothing_it_knows() {
+        let mut n = settled_with([1, 2]);
+        let answer = deliver(&mut n, 1, opening(1, 1), 100 * PERIOD + ONE_MS);
+        assert_eq!(told(&answer, 1), [] as [u64; 0]);
+    }
+
+    // More members than a message has room for: they go out over the
+    // messages to the newcomer, each once, and then no more.
+    #[test]
+    fn a_long_roster_goes_out_over_several_messages_each_member_once() {
+        let peers: Vec<u64> = (1..=30).collect();
+        let mut n = settled_with(peers.clone());
+        let mut messages = deliver(&mut n, 99, opening(1, 99), 100 * PERIOD + ONE_MS);
+        for seq in 2..=10 {
+            messages.extend(deliver(&mut n, 99, opening(seq, 99), 100 * PERIOD + ONE_MS));
+        }
+        assert_eq!(told(&messages, 99), peers, "each member once");
+    }
+
+    // A newcomer that leaves before it has heard all is told no more, and
+    // nothing of it is kept.
+    #[test]
+    fn a_newcomer_that_leaves_is_told_no_more() {
+        let peers: Vec<u64> = (1..=30).collect();
+        let mut n = settled_with(peers);
+        deliver(&mut n, 99, opening(1, 99), 100 * PERIOD + ONE_MS);
+        assert!(
+            n.introducing.contains_key(&PeerId::new(99)),
+            "still telling"
+        );
+        let leave = Message::Leave {
+            updates: vec![news(99, 0, Dead)],
+        };
+        deliver(&mut n, 99, leave, 100 * PERIOD + 2 * ONE_MS);
+        assert!(n.introducing.is_empty());
     }
 
     #[test]

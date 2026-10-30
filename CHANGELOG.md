@@ -7,6 +7,30 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Two instances joining a running cluster through the same seeds, about a
+  second apart, could each never learn of the other: news of a join is
+  sent a few times and then dropped, and if the news of the first had run
+  out before the second arrived, nobody told either. Each counted the
+  cluster one short and took the share of a smaller one: on two instances
+  scaled to four, the fleet admitted 1.17 R, for good with seeds given as
+  addresses, until the next lookup of a seed name, 30 s, with names. Now
+  whoever first hears from a newcomer, or from a member back from the
+  dead, tells it of every live member it knows, in the room its messages
+  to it have left: no datagram more, and the wire format is unchanged, so
+  nodes of 0.7.3 and of this release run side by side, the fix working
+  wherever the node a newcomer first reaches has it. Found by the
+  Kubernetes demo below, reproduced in the simulator, where a pair joining
+  1.16 to 1.35 s apart split every time.
+
+### Added
+
+- `rateguard-sidecar/examples/k3d`: `kubernetes.yaml` as it is on a local
+  k3d cluster, with a load generator in place of the app and a watcher of
+  what the fleet admits while the deployment scales; `demo.sh up`,
+  `scale`, `down`.
+
 ## [0.7.3] - 2026-10-30
 
 Hygiene after 0.7: one change in the sidecar's API, the rest is tests and

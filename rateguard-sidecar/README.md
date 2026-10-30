@@ -280,6 +280,20 @@ patch) and `latest`. To build it yourself, from the repository root:
 docker build -f rateguard-sidecar/Dockerfile -t rateguard-sidecar .
 ```
 
+To try that manifest on your machine,
+[`examples/k3d`](examples/k3d) runs it as it is on a local
+[k3d](https://k3d.io) cluster, with a load generator in place of your app
+and a watcher of what the whole fleet admits, while the deployment scales
+from 3 replicas to 6, 2 and 4. It needs k3d, kubectl and openssl, and
+leaves your kubeconfig alone:
+
+```sh
+cd rateguard-sidecar/examples/k3d
+./demo.sh up       # a cluster of its own, the manifest, the watcher
+./demo.sh scale    # what the fleet admits while it scales
+./demo.sh down
+```
+
 ## License
 
 MIT OR Apache-2.0, as `rateguard`.

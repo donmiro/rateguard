@@ -21,6 +21,7 @@
 
 use rateguard_proto::{Address, Status, Update};
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::boundary::PeerId;
 use crate::gcra::Nanos;
@@ -267,6 +268,19 @@ impl MemberTable {
     /// forgotten member, or this node.
     pub fn joined_at(&self, peer: PeerId) -> Option<Nanos> {
         self.members.get(&peer).map(|member| member.joined)
+    }
+
+    /// The record of the first member after `after` in the order of IDs,
+    /// from the first with `None`, that is not dead: a walk over the live
+    /// and the suspect that needs no more than the place it stopped at.
+    pub fn next_live_after(&self, after: Option<PeerId>) -> Option<Update> {
+        let rest = match after {
+            Some(after) => self.members.range((Excluded(after), Unbounded)),
+            None => self.members.range(..),
+        };
+        rest.filter(|(_, member)| member.status != Status::Dead)
+            .map(|(&peer, member)| member.update(peer))
+            .next()
     }
 
     /// Members known to be dead and not yet forgotten.

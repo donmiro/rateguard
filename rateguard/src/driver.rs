@@ -66,7 +66,8 @@ pub(crate) fn screen(bytes: &[u8]) -> Option<Screened<'_>> {
         Message::Ping { updates, .. }
         | Message::Ack { updates, .. }
         | Message::PingReq { updates, .. }
-        | Message::Leave { updates } => updates,
+        | Message::Leave { updates }
+        | Message::Full { updates, .. } => updates,
         // A message of a later version this one cannot take apart: whole
         // or not at all, and with a record failing the check, not at all.
         _ => return None,

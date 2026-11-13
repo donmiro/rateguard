@@ -15,6 +15,13 @@ follow [Semantic Versioning](https://semver.org/).
   is ignored. Peers added with `introduce` count at once. The wire format
   is unchanged, so a node with this and a node without it still talk; the
   one without it counts the newcomer a round sooner.
+- A ping a full member table refuses is answered with `Full`, echoing the
+  ping's sequence. The refused node holds every key at the floor over
+  `max_members`, and the nodes that refused it keep that hold while the
+  refused addresses still answer. A fleet over the cap stays within the
+  limit. A node from before this version drops `Full` and can still admit
+  over its share. `rateguard-proto` gains the variant; older messages are
+  unchanged.
 
 ## [0.7.4] - 2026-10-30
 

@@ -61,9 +61,10 @@ pub struct Args {
     /// The most members one instance keeps track of, the dead not yet
     /// forgotten and itself included: 8192 by default, from 1 to 65536.
     /// Over it newcomers are refused, counted in `members_refused`, and
-    /// every key is held at the floor over it for 10 minutes. Size it for
-    /// the fleet and the addresses that churned in the last 10 minutes:
-    /// over it the limit is not guaranteed, and the hold only softens that.
+    /// every key is held at the floor over it while newcomers are being
+    /// refused or still answer. Size it for the fleet and the addresses
+    /// that churned in the last 10 minutes: over it the fleet stays within
+    /// the limit by sitting at that floor.
     #[arg(long, env = "RATEGUARD_MAX_MEMBERS")]
     pub max_members: Option<usize>,
     /// Admit every request, counting those that would be denied.

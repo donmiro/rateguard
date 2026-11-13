@@ -96,9 +96,9 @@ sends to one instance in practice, but not free.
 
 1. `check()` performs no I/O and takes no lock shared with a network task. Its
    latency is independent of cluster state, including a fully collapsed one.
-2. A healthy cluster in steady state admits between `R × (1 − ε)` and `R`,
-   as long as it fits in `max_members(n)`; over it `R` is not guaranteed,
-   see [Security](security.md).
+2. A healthy cluster in steady state admits between `R × (1 − ε)` and `R`.
+   Over `max_members(n)` it stays within `R` by holding at the floor; see
+   [Security](security.md).
 3. Under partition, the bounds above, according to the selected policy.
 4. Memory is bounded by configuration: the coordination state is
    `O(hot_keys × N)`, and the per-key table is allocated once: two 64-byte
@@ -134,7 +134,7 @@ and CI fails if it falls out of date.
 | Node 4 crashes for good (the other four) | R once the suspicion and the hold are over | 1.00 R | 1.00 R | 0 | 17 s |
 | Node 4 leaves for good (the other four) | R at once | 1.00 R | 1.00 R | 0 | 1 s |
 | Traffic jumps 100×, cold to hot | R | 1.00 R | 1.00 R | 0 | 3 s |
-| A node joins 10 s late | R | 1.00 R | 1.01 R | 0 | 1 s |
+| A node joins 10 s late | R | 1.00 R | 1.01 R | 0 | 0 s |
 | Limit lowered to R/2, one node a second | ≤ R in passing, R/2 after | 0.50 R | 1.00 R | 0 | 3 s |
 | Limit raised from R/2 to R, one node a second | ≤ R, then R | 1.00 R | 1.00 R | 0 | 3 s |
 

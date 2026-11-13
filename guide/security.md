@@ -77,21 +77,16 @@ while its table is full, and counted in `members_refused`. Size it for the
 fleet plus every address that churned in the last 10 minutes, as the dead
 keep their slots that long: about twice the fleet for rolling deploys that
 give pods new IPs; the default covers fleets up to about 4000 instances
-under rolling deploys. **Over the cap the limit is not guaranteed.** The
-instances that refused a newcomer count the fleet short, and some can
-admit more than their share. While its table refuses newcomers, an
-instance cannot count them, so it shares the limit as if `max_members`
-nodes were up and holds every key at the floor `R × β / max_members`
-(`members_full`, with `members_refused` and
-`rateguard_held{reason="members_full"}` to show it). That softens an
-overflow but does not close it, for two reasons. The refused instance
-itself never holds: its own table is not full, so it shares the limit over
-the small view it has. And an instance that heard of the newcomer only
-second-hand lifts its hold after `tombstone_ttl` while the overflow lasts,
-because the gossip about the refused one has run out of retransmits. In
-the simulator, ten instances with a cap of 4 admitted 1501 a second
-against a bound of 1300, and a fleet over its cap went up to 1.3 times
-the limit. Treat any growth
+under rolling deploys. **Over the cap the fleet stays within the limit
+by holding at the floor.** An instance that cannot count a newcomer
+shares the limit as if `max_members` nodes were up and holds every key at
+`R × β / max_members` (`members_full`, with `members_refused` and
+`rateguard_held{reason="members_full"}` to show it). A ping it refuses is
+answered, so the refused instance holds too, and the refused addresses
+are probed again: the hold lasts while they still answer and lapses once
+they do not. In the simulator, ten instances with a cap of 4 stay within
+1000 a second. A node from before this version drops that answer and can
+still admit over its share. Treat any growth
 of `members_refused` in a legitimate fleet as a reason to raise the cap
 now. That cap bounds memory, not availability. A stranger can still fill the table with
 made-up members at addresses of its choosing. An address that never answers a ping this

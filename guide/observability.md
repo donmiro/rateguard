@@ -14,7 +14,7 @@ println!("{} admitted, {} denied", stats.admitted, stats.denied);
 |---|---|
 | `admitted`, `denied` | What this instance decided; in a dry run, `denied` counts what it would have denied |
 | `overflowed` | Checks on keys with no place of their own in the key table: if it grows, raise `tracked_keys` |
-| `cluster_size`, `counted_size` | Members seen, and the N the limit is shared over. A member heard of but not yet answered to a ping counts in `cluster_size` only. `counted_size` stays higher under `HoldDown` while a lost member is held, and is at least `max_members` while `members_full`; that is a floor on this node's shares, not a guarantee for the fleet, see `max_members(n)` |
+| `cluster_size`, `counted_size` | Members seen, and the N the limit is shared over. A member heard of but not yet answered to a ping counts in `cluster_size` only. `counted_size` stays higher under `HoldDown` while a lost member is held, and is at least `max_members` while `members_full`; every key is then at the floor, see `max_members(n)` |
 | `suspects` | Members not heard from lately; many of them, a network in trouble |
 | `joining`, `learning`, `without_quorum`, `members_full` | Why every key is held at the floor `R × β / N`, if one is true: no peer reached yet, peers not yet told this node's demand, no majority under `Quorum`, or a newcomer refused for a full member table in the last 10 minutes (N is then at least `max_members`) |
 | `tracked_keys`, `hot_keys` | Keys with state here, and keys coordinated with the peers |

@@ -176,14 +176,26 @@ pub enum Message {
         /// The sender's own record, `Dead`, and nothing else.
         updates: Vec<Update>,
     },
+    /// The sender's member table is full: it refused the recipient and
+    /// will not count it. Echoes the `seq` of the ping it answers, so a
+    /// stranger cannot invent one. A version that predates the variant
+    /// drops the datagram and suspects the sender, as if it had not
+    /// answered.
+    Full {
+        /// The `seq` of the `Ping` answered.
+        seq: u32,
+        /// The sender's own record, and nothing else.
+        updates: Vec<Update>,
+    },
 }
 impl Message {
     /// The `seq` of any message; none for a `Leave`.
     pub fn seq(&self) -> Option<u32> {
         match self {
-            Message::Ping { seq, .. } | Message::Ack { seq, .. } | Message::PingReq { seq, .. } => {
-                Some(*seq)
-            }
+            Message::Ping { seq, .. }
+            | Message::Ack { seq, .. }
+            | Message::PingReq { seq, .. }
+            | Message::Full { seq, .. } => Some(*seq),
             Message::Leave { .. } => None,
         }
     }
@@ -194,7 +206,8 @@ impl Message {
             Message::Ping { updates, .. }
             | Message::Ack { updates, .. }
             | Message::PingReq { updates, .. }
-            | Message::Leave { updates } => updates,
+            | Message::Leave { updates }
+            | Message::Full { updates, .. } => updates,
         }
     }
 
@@ -204,7 +217,7 @@ impl Message {
             Message::Ping { demand, .. }
             | Message::Ack { demand, .. }
             | Message::PingReq { demand, .. } => demand,
-            Message::Leave { .. } => &[],
+            Message::Leave { .. } | Message::Full { .. } => &[],
         }
     }
 }
@@ -405,6 +418,10 @@ mod tests {
             },
             Message::Leave {
                 updates: vec![update(3, Status::Dead)],
+            },
+            Message::Full {
+                seq: 4,
+                updates: vec![update(3, Status::Alive)],
             },
         ] {
             let bytes = encode(&message).unwrap();
@@ -688,6 +705,7 @@ mod tests {
                     }
                 ),
                 updates().prop_map(|updates| Message::Leave { updates }),
+                (any::<u32>(), updates()).prop_map(|(seq, updates)| Message::Full { seq, updates }),
             ]
         }
 

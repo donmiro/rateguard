@@ -158,6 +158,15 @@ pub struct Node {
     identity_conflicts: u64,
     // When the full table last refused news of a live newcomer.
     last_refused_at: Option<Nanos>,
+    // When a peer last answered our ping with "my table is full".
+    excluded_at: Option<Nanos>,
+    // Live newcomers the full table refused, so they can be pinged again.
+    // Capped at max_members: a flood cannot grow it. An answer refreshes
+    // the hold; silence lets it lapse after tombstone_ttl.
+    denied: BTreeMap<PeerId, Address>,
+    // The sender just refused, for the reply about to be sent. Gone at the
+    // next event: the caller looks the address up before then.
+    reply_to: Option<(PeerId, Address)>,
 }
 
 /// Why a node holds every key at the floor `R·β/N`, if it does; see
@@ -172,8 +181,9 @@ pub struct Held {
     /// Under `Quorum`, it has lost its majority, or regained it too
     /// recently to have been heard.
     pub without_quorum: bool,
-    /// Its member table refused a live newcomer for being full, within the
-    /// last `tombstone_ttl`: there are nodes it cannot count, nor see the
+    /// Its member table refused a live newcomer for being full, or a peer
+    /// answered its ping with a full table, within the last
+    /// `tombstone_ttl`: there are nodes it cannot count, nor see the
     /// demand of. See [`Node::set_max_members`].
     pub members_full: bool,
 }
@@ -202,6 +212,8 @@ pub struct Footprint {
     pub relays: usize,
     /// Peers in the probe order.
     pub probe_order: usize,
+    /// Newcomers refused for a full table, kept so they can be probed again.
+    pub denied: usize,
 }
 
 impl Node {
@@ -287,6 +299,9 @@ impl Node {
             held: Held::default(),
             identity_conflicts: 0,
             last_refused_at: None,
+            excluded_at: None,
+            denied: BTreeMap::new(),
+            reply_to: None,
         }
     }
 
@@ -405,14 +420,23 @@ impl Node {
         self.limiter.tracked(key)
     }
 
-    /// Where to send to `peer`: a member's own address, or a seed's.
+    /// Where to send to `peer`: a member's own address, a seed's, or one
+    /// the full table just refused, so the refusal can be told back.
     pub fn address(&self, peer: PeerId) -> Option<Address> {
-        self.members.address(peer).or_else(|| {
-            self.seeds
-                .iter()
-                .find(|&&(seed, _)| seed == peer)
-                .map(|&(_, addr)| addr)
-        })
+        self.members
+            .address(peer)
+            .or_else(|| {
+                self.seeds
+                    .iter()
+                    .find(|&&(seed, _)| seed == peer)
+                    .map(|&(_, addr)| addr)
+            })
+            .or_else(|| self.denied.get(&peer).copied())
+            .or_else(|| {
+                self.reply_to
+                    .filter(|(id, _)| *id == peer)
+                    .map(|(_, addr)| addr)
+            })
     }
 
     /// How many members are live, alive or suspect, this node included.
@@ -449,15 +473,15 @@ impl Node {
     /// last `tombstone_ttl`: the dead keep their slots until forgotten, so
     /// about twice the fleet for rolling deploys that give pods new
     /// addresses. For a `tombstone_ttl` after it refused a live newcomer,
-    /// the node shares the limit as if `n` nodes were up and holds every
-    /// key at the floor `R·β/n` (see [`Held::members_full`]): there are
-    /// nodes it cannot count. That softens an overflow but does not close
-    /// it, so over the cap the limit is **not guaranteed**: the refused
-    /// node itself does not hold, as its own table is not full, and a node
-    /// that heard of the newcomer only second-hand lifts its hold after
-    /// `tombstone_ttl` while the overflow lasts. Raise the cap when
+    /// or after a peer answered its ping with a full table, the node
+    /// shares the limit as if `n` nodes were up and holds every key at the
+    /// floor `R·β/n` (see [`Held::members_full`]): there are nodes it
+    /// cannot count. A ping the full table refuses is answered with
+    /// [`Message::Full`](rateguard_proto::Message::Full), and the refused
+    /// addresses are probed again, so the hold lasts while they still
+    /// answer and lapses once they do not. Raise the cap when
     /// [`members_refused`](Node::members_refused) grows in a legitimate
-    /// fleet.
+    /// fleet: over it the fleet stays within R by sitting at that floor.
     ///
     /// The cap bounds memory, not availability: with unsigned gossip a
     /// stranger can fill the table with made-up members. One that never
@@ -511,17 +535,13 @@ impl Node {
     //
     // A flood of made-up members no longer moves the shares by being
     // counted: an address that never answers our ping stays out of N.
-    // What remains is the table. Once it is full the hold above applies,
-    // and a host that answers on many ports is confirmed up to the cap.
-    // A legitimate overflow, a fleet that outgrew the cap or churned
-    // through it, is softened by this and not closed, and members_refused
-    // says why. Two gaps stay, so R is not guaranteed over the cap: the
-    // refused node itself never holds, as its own table is not full, and
-    // a node that heard of the newcomer second-hand lifts the hold after a
-    // tombstone_ttl while the overflow lasts, the gossip about the refused
-    // one having run out of retransmits. Not used to time staleness: that would
-    // keep the peers' demand and this node's past reports as long as a
-    // fleet of max_members needs, for a refusal.
+    // Once the table is full the hold above applies, on a node that was
+    // itself refused as well as on one that did the refusing. The refused
+    // addresses are probed again, so a newcomer that is still up refreshes
+    // the hold by answering, and one that is gone lets it lapse. A host
+    // that answers on many ports is confirmed up to the cap. Not used to
+    // time staleness: that would keep the peers' demand and this node's
+    // past reports as long as a fleet of max_members needs, for a refusal.
     fn share_size(&self) -> usize {
         let size = self.allocation_size();
         if self.refusing(self.last_now) {
@@ -534,8 +554,10 @@ impl Node {
     // Whether a live newcomer was refused for a full table within the last
     // tombstone_ttl.
     fn refusing(&self, now: Nanos) -> bool {
-        self.last_refused_at
-            .is_some_and(|at| now < at.saturating_add(self.swim.tombstone_ttl))
+        let fresh = |at: Option<Nanos>| {
+            at.is_some_and(|at| now < at.saturating_add(self.swim.tombstone_ttl))
+        };
+        fresh(self.last_refused_at) || fresh(self.excluded_at)
     }
 
     /// The N the limit is shared out over. A peer counts once it has
@@ -585,6 +607,7 @@ impl Node {
             recent_shares: self.recent_shares.len(),
             relays: self.relays.len(),
             probe_order: self.order.len(),
+            denied: self.denied.len(),
         }
     }
 
@@ -655,6 +678,9 @@ impl Node {
     pub fn handle(&mut self, event: Event<'_>, now: Nanos) -> &[Action] {
         self.advance(now);
         self.actions.clear();
+        // The address of a sender refused during the previous event has
+        // been used, or was never needed.
+        self.reply_to = None;
         if self.left {
             return &self.actions;
         }
@@ -786,6 +812,12 @@ impl Node {
                     .iter()
                     .map(|&(seed, _)| seed)
                     .filter(|&seed| self.members.status(seed).is_none()),
+            )
+            .chain(
+                self.denied
+                    .keys()
+                    .copied()
+                    .filter(|&peer| self.members.status(peer).is_none()),
             )
             .collect();
         if lost.is_empty() {
@@ -942,8 +974,15 @@ impl Node {
             self.members.status(from),
             Some(Status::Alive | Status::Suspect)
         );
+        let mut refused_sender = false;
         for &update in message.updates() {
-            self.learn(update, now);
+            if self.learn(update, now) == Applied::Refused
+                && update.member == from.get()
+                && update.status != Status::Dead
+            {
+                refused_sender = true;
+                self.reply_to = Some((from, update.addr));
+            }
         }
         if let Message::Leave { .. } = message {
             self.depart(from);
@@ -989,11 +1028,13 @@ impl Node {
             self.peer_demand.apply(from, report, now);
         }
         match message {
+            Message::Ping { seq, .. } if refused_sender => self.tell_full(from, seq),
             Message::Ping { seq, .. } => self.ack(from, seq),
             Message::Ack {
                 seq, ref demand, ..
             } => self.acknowledged(from, seq, demand, now),
             Message::PingReq { seq, target, .. } => self.relay(from, seq, PeerId::new(target), now),
+            Message::Full { seq, .. } => self.told_full(from, seq),
             Message::Leave { .. } => unreachable!("handled above"),
             // A message this version does not know changes nothing.
             _ => {}
@@ -1137,23 +1178,28 @@ impl Node {
         self.seq
     }
 
-    fn learn(&mut self, update: Update, now: Nanos) {
-        match self.members.apply(update, now) {
+    fn learn(&mut self, update: Update, now: Nanos) -> Applied {
+        let applied = self.members.apply(update, now);
+        match applied {
             Applied::Ignored => {}
             // A refused stranger is not passed on either: the peers have
             // tables of their own to keep. A live one may be serving
             // requests this node cannot count, and from now on N is held
             // up for it (see `share_size`). A dead one serves nothing, and
             // a tombstone echoed past its forgetting must not hold N up.
+            // The address is kept, capped, so a later probe can see whether
+            // it is still up and refresh the hold.
             Applied::Refused => {
                 if update.status != Status::Dead {
                     self.last_refused_at = Some(now);
+                    self.remember_denied(PeerId::new(update.member), update.addr);
                     if !self.held.members_full {
                         self.refresh_cap(now);
                     }
                 }
             }
             Applied::Accepted { .. } => {
+                self.denied.remove(&PeerId::new(update.member));
                 self.gossip.push(update);
             }
             Applied::Refuted(alive) => {
@@ -1164,6 +1210,48 @@ impl Node {
                 }
                 self.gossip.push(alive);
             }
+        }
+        applied
+    }
+
+    // At most max_members refused addresses: the table bounds memory, and
+    // this list must not become a second unbounded one. One already kept is
+    // updated. Past the cap a new one is still answered, through `reply_to`,
+    // but not probed again.
+    fn remember_denied(&mut self, peer: PeerId, addr: Address) {
+        if peer == self.members.local() {
+            return;
+        }
+        if self.denied.contains_key(&peer) || self.denied.len() < self.members.max() {
+            self.denied.insert(peer, addr);
+        }
+    }
+
+    // "My table is full." Echoes the ping's seq, so only the node we probed
+    // can say it. The probe is done: they are alive, and not to be suspected
+    // for skipping the Ack.
+    fn tell_full(&mut self, to: PeerId, seq: u32) {
+        let own = self
+            .members
+            .update_about(self.members.local())
+            .expect("a node always knows itself");
+        self.send(
+            to,
+            &Message::Full {
+                seq,
+                updates: vec![own],
+            },
+        );
+    }
+
+    fn told_full(&mut self, from: PeerId, seq: u32) {
+        if !self.direct_probe_ack(from, seq) {
+            return;
+        }
+        self.excluded_at = Some(self.last_now);
+        self.probe = None;
+        if !self.held.members_full {
+            self.refresh_cap(self.last_now);
         }
     }
 
@@ -4146,5 +4234,62 @@ mod tests {
         assert_eq!(n.counted_size(), n.cluster_size());
         assert!(n.counted_size() < 4);
         assert!(!n.held().members_full);
+    }
+
+    #[test]
+    fn a_full_table_tells_the_sender_its_ping_was_refused() {
+        let mut n = node_with([1]);
+        n.set_max_members(2);
+        let ping = Message::Ping {
+            seq: 7,
+            updates: vec![news(3, 0, Alive)],
+            demand: Vec::new(),
+        };
+        let replies = deliver(&mut n, 3, ping, 0);
+        assert_eq!(
+            replies,
+            [(
+                PeerId::new(3),
+                Message::Full {
+                    seq: 7,
+                    updates: vec![news(0, 0, Alive)],
+                }
+            )]
+        );
+        assert_eq!(n.address(PeerId::new(3)), Some(addr(3)));
+        assert!(n.held().members_full);
+        assert!(n.footprint().denied <= n.max_members());
+    }
+
+    #[test]
+    fn a_node_told_the_table_is_full_holds_every_key_at_the_floor() {
+        let mut n = node_with([1]);
+        n.set_max_members(4);
+        let (target, seq) = round(&mut n, 0);
+        assert_eq!(target, PeerId::new(1));
+
+        let ignored = Message::Full {
+            seq: seq.wrapping_add(1),
+            updates: vec![news(1, 0, Alive)],
+        };
+        deliver(&mut n, 1, ignored, ONE_MS);
+        assert!(
+            !n.held().members_full,
+            "a seq we did not send proves nothing"
+        );
+
+        let notice = Message::Full {
+            seq,
+            updates: vec![news(1, 0, Alive)],
+        };
+        deliver(&mut n, 1, notice, 2 * ONE_MS);
+        assert!(n.held().members_full);
+        assert_eq!(n.counted_size(), 4);
+        assert!(n.new_key_factor() <= config().floor_factor / 4.0);
+        assert_eq!(
+            n.awaiting_ack(),
+            None,
+            "they answered, so they are not suspected"
+        );
     }
 }

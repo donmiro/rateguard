@@ -71,6 +71,8 @@ fn assert_bounded(node: NodeIndex, now: Nanos, f: &Footprint) {
         ("recent shares", f.recent_shares, c.hot_set_size),
         ("relays", f.relays, known),
         ("probe order", f.probe_order, known),
+        // The absolute cap of max_members. A node's own cap is at most this.
+        ("denied", f.denied, 65_536),
     ];
     for (what, have, bound) in checks {
         assert!(
@@ -310,5 +312,30 @@ fn a_small_overflow_of_the_member_cap_is_held_within_r() {
     assert!(
         (0..NODES).any(|node| s.node(node).members_refused() > 0),
         "the tables never filled"
+    );
+}
+
+// Ten nodes, each keeping four. The ones that fit share R as a smaller
+// cluster, and a node none of them had room for shares R over the few it
+// could join: together they used to admit about 1.3 R, and 1501 a second
+// against a bound of 1300. Both ends now hold, so the steady rate stays
+// at R.
+#[test]
+fn a_fleet_over_the_member_cap_stays_within_the_limit() {
+    const NODES: usize = 10;
+    const RUN: Nanos = 40 * ONE_SEC;
+    const SETTLE: Nanos = 20 * ONE_SEC;
+
+    let mut s = Sim::with_seeds(NODES, config(), PerfectLink::new(ONE_MS), &[0]);
+    s.set_max_members(4);
+    s.remove_invariant("admission-window");
+    for node in 0..NODES {
+        s.schedule_request_stream(node, 1, 1_000, 0, RUN);
+    }
+    s.run_until(RUN);
+    let per_sec = s.admitted_between(SETTLE, RUN) as f64 / 20.0;
+    assert!(
+        per_sec <= 1_010.0,
+        "the fleet admitted {per_sec:.0}/s over the cap, the limit is 1000"
     );
 }

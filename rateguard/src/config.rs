@@ -290,18 +290,16 @@ impl Builder {
     /// refused and counted in
     /// [`Stats::members_refused`](crate::Stats::members_refused); nobody
     /// is evicted for it, and a slot frees when a dead member is forgotten.
-    /// For 10 minutes after it refused a live newcomer, an instance shares
-    /// the limit as if `n` nodes were up and holds every key at the floor
-    /// `R × β / n`
+    /// For 10 minutes after it refused a live newcomer, or a peer answered
+    /// its ping with a full table, an instance shares the limit as if `n`
+    /// nodes were up and holds every key at the floor `R × β / n`
     /// ([`Stats::members_full`](crate::Stats::members_full)): there are
-    /// nodes it cannot count. That softens an overflow but does not close
-    /// it, so over the cap the limit is **not guaranteed**: the refused
-    /// node itself does not hold, as its own table is not full, and a node
-    /// that heard of the newcomer only second-hand lifts its hold after
-    /// `tombstone_ttl` while the overflow lasts. Size the cap with room
-    /// (the default covers fleets up to about 4000 instances under rolling
-    /// deploys), and treat any growth of `members_refused` in a legitimate
-    /// fleet as a reason to raise it now.
+    /// nodes it cannot count. The refusal is answered, and those addresses
+    /// are probed again, so the hold lasts while they still answer. Over
+    /// the cap the fleet stays within the limit by sitting at that floor.
+    /// Size the cap with room (the default covers fleets up to about 4000
+    /// instances under rolling deploys), and treat any growth of
+    /// `members_refused` in a legitimate fleet as a reason to raise it now.
     /// The cap bounds memory, not availability: with unsigned gossip a
     /// stranger who reaches the port can fill the table with made-up
     /// members. One that never answers a ping is not part of N, so the

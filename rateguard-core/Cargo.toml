@@ -1,7 +1,7 @@
 [package]
 name = "rateguard-core"
 description = "The sans-I/O core of rateguard: distributed rate limiting as pure state machines"
-version = "0.7.2"
+version = "0.7.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ keywords = ["rate-limit", "distributed", "gossip", "swim", "sans-io"]
 categories = ["algorithms", "network-programming"]
 
 [dependencies]
-rateguard-proto = { version = "0.6.0", path = "../rateguard-proto" }
+rateguard-proto = { version = "0.6.1", path = "../rateguard-proto" }
 
 [dev-dependencies]
 proptest = "1.11.0"

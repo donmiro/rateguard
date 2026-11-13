@@ -477,7 +477,7 @@ impl Node {
     /// shares the limit as if `n` nodes were up and holds every key at the
     /// floor `R·β/n` (see [`Held::members_full`]): there are nodes it
     /// cannot count. A ping the full table refuses is answered with
-    /// [`Message::Full`](rateguard_proto::Message::Full), and the refused
+    /// [`Message::Full`], and the refused
     /// addresses are probed again, so the hold lasts while they still
     /// answer and lapses once they do not. Raise the cap when
     /// [`members_refused`](Node::members_refused) grows in a legitimate

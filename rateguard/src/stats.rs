@@ -26,9 +26,10 @@ pub struct Stats {
     /// Members this node sees, itself included, as
     /// [`Guard::cluster_size`](crate::Guard::cluster_size).
     pub cluster_size: usize,
-    /// The N the limit is shared out over: `cluster_size`, or more under
-    /// `HoldDown` while a member lost is still held, which keeps the fleet
-    /// under the limit, not over it.
+    /// The N the limit is shared out over. A member merely seen does not
+    /// count until it has answered a ping sent to its address, so this can
+    /// sit below `cluster_size`. It sits above it under `HoldDown` while a
+    /// member lost is still held, which keeps the fleet under the limit.
     pub counted_size: usize,
     /// Members under suspicion: not heard from, not yet declared dead.
     pub suspects: usize,

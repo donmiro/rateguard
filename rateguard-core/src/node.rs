@@ -305,6 +305,10 @@ impl Node {
         if self.members.apply(update, now) == Applied::Refused {
             self.last_refused_at = Some(now);
             self.refresh_cap(now);
+        } else {
+            // Static membership is not discovered: there is no address to
+            // check, and the caller already trusts the peer.
+            self.members.confirm(peer);
         }
     }
 
@@ -412,6 +416,9 @@ impl Node {
     }
 
     /// How many members are live, alive or suspect, this node included.
+    /// A peer heard of but not yet answered is live here, so it gets
+    /// probed, and is not in N until it answers; see
+    /// [`counted_size`](Node::counted_size).
     pub fn cluster_size(&self) -> usize {
         self.members.cluster_size()
     }
@@ -453,8 +460,10 @@ impl Node {
     /// fleet.
     ///
     /// The cap bounds memory, not availability: with unsigned gossip a
-    /// stranger can fill the table with made-up members, and the real
-    /// newcomers wait for slots. Only signing keeps strangers out.
+    /// stranger can fill the table with made-up members. One that never
+    /// answers a ping is not part of N; a host that answers on many ports
+    /// is, up to the cap, and the real newcomers then wait for slots.
+    /// Only signing keeps strangers out.
     ///
     /// # Panics
     ///
@@ -480,11 +489,13 @@ impl Node {
         self.policy
     }
 
-    // N as allocation sees it: the membership's, or under HoldDown the
-    // largest of the hold. It times how long the peers' demand is kept,
-    // and how long learning lasts; the limit is shared over `share_size`.
+    // N as allocation sees it: members this node has checked, or under
+    // HoldDown the largest of the hold. A peer merely heard of is not in
+    // it: naming an address is free, answering a ping sent there is not.
+    // It times how long the peers' demand is kept, and how long learning
+    // lasts; the limit is shared over `share_size`.
     fn allocation_size(&self) -> usize {
-        self.members.cluster_size().max(self.held_size)
+        self.members.verified().max(self.held_size)
     }
 
     // N as the limit is shared over it, cold and hot keys alike (spec
@@ -498,8 +509,10 @@ impl Node {
     // the hold here. The refused node's demand is unseen as well, so every
     // key is held at the floor over this N meanwhile (see refresh_cap).
     //
-    // Under a flood of made-up members this changes little: the table
-    // fills with them and the shares already fall toward R / max_members.
+    // A flood of made-up members no longer moves the shares by being
+    // counted: an address that never answers our ping stays out of N.
+    // What remains is the table. Once it is full the hold above applies,
+    // and a host that answers on many ports is confirmed up to the cap.
     // A legitimate overflow, a fleet that outgrew the cap or churned
     // through it, is softened by this and not closed, and members_refused
     // says why. Two gaps stay, so R is not guaranteed over the cap: the
@@ -525,11 +538,13 @@ impl Node {
             .is_some_and(|at| now < at.saturating_add(self.swim.tombstone_ttl))
     }
 
-    /// The N the limit is shared out over: the [cluster
-    /// size](Node::cluster_size), or more under `HoldDown` while a lost
-    /// member is still held, and at least
-    /// [`max_members`](Node::max_members) for a `tombstone_ttl` after the
-    /// full table refused a live newcomer.
+    /// The N the limit is shared out over. A peer counts once it has
+    /// answered a ping this node sent to its address, or was introduced;
+    /// one merely heard of does not, however large
+    /// [`cluster_size`](Node::cluster_size) has grown. Under `HoldDown` a
+    /// lost member is still held for the hold, and for a `tombstone_ttl`
+    /// after the full table refused a live newcomer N is at least
+    /// [`max_members`](Node::max_members).
     pub fn counted_size(&self) -> usize {
         self.share_size()
     }
@@ -816,7 +831,11 @@ impl Node {
             .peers()
             .iter()
             .copied()
-            .filter(|&peer| peer != target && self.members.status(peer) == Some(Status::Alive))
+            .filter(|&peer| {
+                peer != target
+                    && self.members.status(peer) == Some(Status::Alive)
+                    && self.members.is_confirmed(peer)
+            })
             .collect();
         self.rng.shuffle(&mut helpers);
         helpers.truncate(self.swim.indirect_probes);
@@ -946,13 +965,21 @@ impl Node {
         // Demand comes first hand and whole, in every message; an empty
         // report says the peer has no hot key. A message with no report
         // has no round to order it by, and changes nothing. One sent before
-        // a leave may arrive after it, and is too late. Only members are
-        // heard, as for `last_heard`: a sender the full table refused would
-        // otherwise leave its keys behind, and one opening under a new ID
-        // every datagram would grow them with the flood and lower every
-        // share. A newcomer with room is a member by now, its opening
-        // record learned above.
-        if self.members.status(from).is_some()
+        // a leave may arrive after it, and is too late. A sender the full
+        // table refused is not a member and leaves nothing behind.
+        // An ACK to our own ping is the check that `from` receives at the
+        // address we sent it to. It has to land before the demand below:
+        // the same datagram both proves the peer and carries its report.
+        // A peer merely heard of stays out, or one opening under a new ID
+        // every datagram would lower every share.
+        if let Message::Ack { seq, .. } = &message
+            && self.direct_probe_ack(from, *seq)
+        {
+            self.members.confirm(from);
+        }
+        // Only a checked peer's demand moves a share. A report from an
+        // address we have not reached would otherwise hand it part of R.
+        if self.members.is_confirmed(from)
             && !self.members.has_departed(from)
             && let Some(report) = message
                 .demand()
@@ -998,12 +1025,21 @@ impl Node {
     // The members a majority is counted against: the live, and the dead
     // that may yet be serving on the other side of a split.
     fn known_for_quorum(&self) -> usize {
-        self.members.cluster_size()
+        self.members.verified()
             + self
                 .members
                 .dead()
-                .filter(|&peer| !self.members.has_departed(peer))
+                .filter(|&peer| !self.members.has_departed(peer) && self.members.is_confirmed(peer))
                 .count()
+    }
+
+    // The ACK in hand answers the ping we sent to `from` itself, not one a
+    // helper forwarded. A helper can invent that answer; the address we
+    // pinged cannot hide that it saw the sequence.
+    fn direct_probe_ack(&self, from: PeerId, seq: u32) -> bool {
+        self.probe
+            .as_ref()
+            .is_some_and(|probe| probe.target == from && probe.seq == seq)
     }
 
     // An ACK relayed by a helper carries the target's report: the one way
@@ -1020,6 +1056,7 @@ impl Node {
                 .is_some_and(|helpers| helpers.contains(&from));
             if from == target || by_helper {
                 if by_helper
+                    && self.members.is_confirmed(target)
                     && !self.members.has_departed(target)
                     && let Some(report) = demand.iter().find(|r| r.origin == target.get())
                 {
@@ -1204,7 +1241,7 @@ impl Node {
     // split and, until it hears it again, still hands all of R out among
     // itself.
     fn apply_policy(&mut self, now: Nanos) {
-        let size = self.members.cluster_size();
+        let size = self.members.verified();
         self.held_size = self.sizes.record(now, size);
         if size > 1 && self.joined_at.is_none() {
             self.joined_at = Some(now);
@@ -1218,7 +1255,9 @@ impl Node {
             .members
             .peers()
             .iter()
-            .filter(|&&peer| self.members.status(peer) == Some(Status::Alive))
+            .filter(|&&peer| {
+                self.members.status(peer) == Some(Status::Alive) && self.members.is_confirmed(peer)
+            })
             .count();
         let known = self.known_for_quorum();
         let mut counted = known.max(self.quorum_size);
@@ -2017,6 +2056,64 @@ mod tests {
 
         let (_, _, updates) = round_with_news(&mut n, 0);
         assert_eq!(updates, [news(0, 0, Alive), news(7, 0, Alive)]);
+    }
+
+    // A datagram can name any address. Until that address answers a ping we
+    // sent there, it is not in N: otherwise one stranger, naming members by
+    // the thousand, would shrink every share toward zero. Hearing of it
+    // still puts it in the table, so it gets probed.
+    #[test]
+    fn a_peer_heard_of_counts_only_after_it_answers_our_ping() {
+        let mut n = node_with([1]);
+        let heard = Message::Ack {
+            seq: 999,
+            updates: vec![news(7, 0, Alive)],
+            demand: Vec::new(),
+        };
+        deliver(&mut n, 1, heard, 0);
+        assert_eq!(n.cluster_size(), 3, "heard of, so it will be probed");
+        assert_eq!(n.counted_size(), 2, "not in N until it answers us");
+        assert_eq!(
+            measured_interval(&mut n, 0),
+            4_000_000,
+            "the cold share of the two nodes already checked"
+        );
+
+        let claiming = Message::Ping {
+            seq: 4,
+            updates: vec![news(7, 0, Alive)],
+            demand: vec![DemandReport {
+                origin: 7,
+                epoch: 1,
+                round: 1,
+                keys: vec![KeyDemand {
+                    key_hash: KEY,
+                    demand: 10_000.0,
+                    primary: true,
+                }],
+            }],
+        };
+        deliver(&mut n, 7, claiming, ONE_MS);
+        assert_eq!(
+            n.peer_demand().get(PeerId::new(7), KEY),
+            None,
+            "demand from an address we have not reached is not a peer's"
+        );
+        assert_eq!(n.counted_size(), 2);
+
+        let mut answered = false;
+        for k in 1..9 {
+            let (target, seq) = round(&mut n, k);
+            let at = k * PERIOD + ONE_MS;
+            if target == PeerId::new(7) {
+                deliver(&mut n, 7, ack(seq), at);
+                answered = true;
+                break;
+            }
+            deliver(&mut n, target.get(), ack(seq), at);
+        }
+        assert!(answered, "a peer we have heard of is probed");
+        assert_eq!(n.counted_size(), 3, "its answer puts it in N");
     }
 
     #[test]
@@ -3018,13 +3115,17 @@ mod tests {
     #[test]
     fn joining_lifts_the_floor() {
         let mut n = waiting_for(PartitionPolicy::default());
-        n.handle(Event::Tick, 0);
+        let ping = sent(n.handle(Event::Tick, 0));
+        let (peer, seq) = match ping.as_slice() {
+            [(peer, Message::Ping { seq, .. })] => (*peer, *seq),
+            other => panic!("a round must send exactly one PING, sent {other:?}"),
+        };
         let hello = Message::Ack {
-            seq: 1,
-            updates: vec![news(1, 0, Alive)],
+            seq,
+            updates: vec![news(peer.get(), 0, Alive)],
             demand: Vec::new(),
         };
-        deliver(&mut n, 1, hello, 1);
+        deliver(&mut n, peer.get(), hello, 1);
         assert_eq!(n.cluster_size(), 2);
         assert_eq!(
             cold_rate_after_round(&mut n, 1),
@@ -3083,7 +3184,7 @@ mod tests {
     #[test]
     fn held_says_a_node_waits_to_join_then_learns_then_is_free() {
         let mut n = waiting_for(PartitionPolicy::default());
-        n.handle(Event::Tick, 0);
+        let ping = sent(n.handle(Event::Tick, 0));
         assert_eq!(
             n.held(),
             Held {
@@ -3091,13 +3192,16 @@ mod tests {
                 ..Held::default()
             }
         );
-
+        let (peer, seq) = match ping.as_slice() {
+            [(peer, Message::Ping { seq, .. })] => (*peer, *seq),
+            other => panic!("a round must send exactly one PING, sent {other:?}"),
+        };
         let hello = Message::Ack {
-            seq: 1,
-            updates: vec![news(1, 0, Alive)],
+            seq,
+            updates: vec![news(peer.get(), 0, Alive)],
             demand: Vec::new(),
         };
-        deliver(&mut n, 1, hello, 1);
+        deliver(&mut n, peer.get(), hello, 1);
         n.handle(Event::Tick, PERIOD);
         assert_eq!(
             n.held(),
@@ -3937,27 +4041,52 @@ mod tests {
         assert_eq!(n.peer_demand().total(KEY), 500.0);
     }
 
-    // A newcomer with room in the table is a member by the time its report
-    // is read: its opening record is learned first.
+    // A newcomer's opening record makes it a member, so it can be probed.
+    // The demand in that same datagram waits: an address counts, and its
+    // report is kept, only once it answers a ping we sent there.
     #[test]
-    fn a_newcomers_first_report_is_kept() {
+    fn a_newcomers_report_waits_until_it_answers_our_ping() {
         let mut n = node_with([1]);
-        let message = Message::Ping {
-            seq: 7,
-            updates: vec![news(5, 0, Alive)],
-            demand: vec![DemandReport {
-                origin: 5,
-                epoch: 1,
-                round: 1,
-                keys: vec![KeyDemand {
-                    key_hash: KEY,
-                    demand: 300.0,
-                    primary: true,
-                }],
+        let report = DemandReport {
+            origin: 5,
+            epoch: 1,
+            round: 1,
+            keys: vec![KeyDemand {
+                key_hash: KEY,
+                demand: 300.0,
+                primary: true,
             }],
         };
-        deliver(&mut n, 5, message, 0);
+        let announcing = Message::Ping {
+            seq: 7,
+            updates: vec![news(5, 0, Alive)],
+            demand: vec![report.clone()],
+        };
+        deliver(&mut n, 5, announcing, 0);
         assert_eq!(n.members().status(PeerId::new(5)), Some(Alive));
+        assert_eq!(n.peer_demand().total(KEY), 0.0, "not checked yet");
+
+        let mut answered = false;
+        for k in 1..9 {
+            let (target, seq) = round(&mut n, k);
+            let at = k * PERIOD + ONE_MS;
+            if target == PeerId::new(5) {
+                deliver(
+                    &mut n,
+                    5,
+                    Message::Ack {
+                        seq,
+                        updates: vec![news(5, 0, Alive)],
+                        demand: vec![report],
+                    },
+                    at,
+                );
+                answered = true;
+                break;
+            }
+            deliver(&mut n, target.get(), ack(seq), at);
+        }
+        assert!(answered, "the newcomer is probed");
         assert_eq!(n.peer_demand().total(KEY), 300.0);
     }
 

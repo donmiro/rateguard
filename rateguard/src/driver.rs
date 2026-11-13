@@ -1042,6 +1042,10 @@ mod tests {
         use rateguard_proto::{DemandReport, KeyDemand};
 
         let mut node = node_at(1);
+        // Already checked, so a report that survives screening is kept.
+        // A first datagram from an unknown address is dropped later, for
+        // a different reason, and this test would not see it.
+        node.introduce(id(2), at(2).into());
         let mut rejected = RejectedDatagrams::default();
         let genuine = |host: u8| {
             let addr = Address::from(at(host));

@@ -7,6 +7,15 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- A member learned from gossip is probed, and shows in `cluster_size`, but
+  is not part of the N the limit is shared over until it answers a ping
+  this node sent to its address. Demand from an address not yet checked
+  is ignored. Peers added with `introduce` count at once. The wire format
+  is unchanged, so a node with this and a node without it still talk; the
+  one without it counts the newcomer a round sooner.
+
 ## [0.7.4] - 2026-10-30
 
 A fix in membership, found by the new Kubernetes demo. The wire format is

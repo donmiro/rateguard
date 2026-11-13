@@ -106,9 +106,11 @@ async fn two_nodes_count_each_other() {
         .limit(100)
         .spawn()
         .unwrap();
-    // The floor lifts at the round after the news, not with it.
+    // Heard of each other is not enough: each counts the other once that
+    // one has answered its ping.
     for guard in [&a, &b] {
-        let free = |s: &Stats| s.cluster_size == 2 && !s.joining && !s.learning;
+        let free =
+            |s: &Stats| s.cluster_size == 2 && s.counted_size == 2 && !s.joining && !s.learning;
         let stats = until(guard, free).await;
         assert_eq!((stats.counted_size, stats.suspects), (2, 0));
     }

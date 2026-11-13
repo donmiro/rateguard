@@ -304,8 +304,10 @@ impl Builder {
     /// fleet as a reason to raise it now.
     /// The cap bounds memory, not availability: with unsigned gossip a
     /// stranger who reaches the port can fill the table with made-up
-    /// members, each counted in the cluster size, and the shares fall with
-    /// it. Only [`gossip_auth`](Builder::gossip_auth) keeps strangers out.
+    /// members. One that never answers a ping is not part of N, so the
+    /// shares do not follow it; a host that answers on many ports is, up
+    /// to the cap, and once the table is full real newcomers wait for a
+    /// slot. Only [`gossip_auth`](Builder::gossip_auth) keeps strangers out.
     pub fn max_members(mut self, n: usize) -> Self {
         self.max_members = Some(n);
         self

@@ -582,7 +582,9 @@ impl Guard {
         Ok(())
     }
 
-    /// The nodes this one counts in the cluster, itself included.
+    /// The nodes this one sees, itself included. A node it has only heard
+    /// of is here, and not yet in the N the limit is shared over; that N is
+    /// [`Stats::counted_size`](crate::Stats::counted_size).
     pub fn cluster_size(&self) -> usize {
         self.shared.cluster_size.load(Ordering::Relaxed)
     }

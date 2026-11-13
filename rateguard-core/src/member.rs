@@ -60,6 +60,10 @@ struct Member {
     /// Dead because it said it was leaving, not because it stopped
     /// answering.
     departed: bool,
+    /// Answered a ping this node sent to its address, or was introduced.
+    /// Until then it is probed but not part of N: a datagram can name any
+    /// address, and only whoever receives there can complete the ping.
+    confirmed: bool,
 }
 impl Member {
     fn update(&self, peer: PeerId) -> Update {
@@ -197,6 +201,7 @@ impl MemberTable {
                     _ => now,
                 },
                 departed: false,
+                confirmed: from.is_some_and(|member| member.confirmed),
             },
         );
 
@@ -262,6 +267,38 @@ impl MemberTable {
         self.members
             .get(&peer)
             .is_some_and(|member| member.departed)
+    }
+
+    /// Marks `peer` confirmed: it answered this node's own ping, or the
+    /// node introduced it. A stranger or a dead member is left as it is.
+    /// Confirmation survives suspicion and death, and is cleared when the
+    /// member is forgotten and learned again.
+    pub fn confirm(&mut self, peer: PeerId) {
+        if let Some(member) = self.members.get_mut(&peer)
+            && member.status != Status::Dead
+        {
+            member.confirmed = true;
+        }
+    }
+
+    /// Whether `peer` has been [confirmed](MemberTable::confirm). This node
+    /// itself has, and a stranger has not.
+    pub fn is_confirmed(&self, peer: PeerId) -> bool {
+        peer == self.local
+            || self
+                .members
+                .get(&peer)
+                .is_some_and(|member| member.confirmed)
+    }
+
+    /// Live members that count toward N: this node, and every confirmed
+    /// peer that is not dead. A peer merely heard of does not.
+    pub fn verified(&self) -> usize {
+        1 + self
+            .members
+            .values()
+            .filter(|member| member.confirmed && member.status != Status::Dead)
+            .count()
     }
 
     /// When the member last became live; `None` for a stranger, a
@@ -399,6 +436,28 @@ mod tests {
 
     fn table() -> MemberTable {
         MemberTable::new(id(0), addr(0))
+    }
+
+    #[test]
+    fn a_member_counts_toward_n_only_once_confirmed() {
+        let mut t = table();
+        assert_eq!(t.verified(), 1);
+        t.apply(news(1, 0, Alive), 0);
+        assert!(!t.is_confirmed(id(1)));
+        assert_eq!(t.verified(), 1, "heard of, not checked");
+        assert!(t.is_confirmed(id(0)), "this node");
+        t.confirm(id(1));
+        assert!(t.is_confirmed(id(1)));
+        assert_eq!(t.verified(), 2);
+        t.apply(news(1, 0, Suspect), ONE_SEC);
+        assert_eq!(t.verified(), 2, "a suspicion is still the same peer");
+        t.apply(news(1, 0, Dead), 2 * ONE_SEC);
+        assert_eq!(t.verified(), 1, "the dead leave N");
+        assert!(t.is_confirmed(id(1)), "death does not forget the check");
+        t.confirm(id(1));
+        assert_eq!(t.verified(), 1, "a dead member is not confirmed again");
+        t.apply(news(1, 1, Alive), 3 * ONE_SEC);
+        assert_eq!(t.verified(), 2, "coming back keeps the check");
     }
 
     #[test]

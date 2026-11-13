@@ -94,9 +94,11 @@ against a bound of 1300, and a fleet over its cap went up to 1.3 times
 the limit. Treat any growth
 of `members_refused` in a legitimate fleet as a reason to raise the cap
 now. That cap bounds memory, not availability. A stranger can still fill the table with
-made-up members at addresses of its choosing, and every key falls to that
-floor; real newcomers wait for a slot until the made-up ones are found dead
-and forgotten. Only signing keeps strangers out. Steady growth of
+made-up members at addresses of its choosing. An address that never answers a ping this
+instance sent there is not part of N, so the shares do not follow the announcement; a
+host that answers on many ports is, up to the cap. Once the table is full every key is
+held at the floor above, and real newcomers wait for a slot until the made-up ones are
+found dead and forgotten. Only signing keeps strangers out. Steady growth of
 `members_refused` means either a fleet bigger than the cap or such a
 flood.
 

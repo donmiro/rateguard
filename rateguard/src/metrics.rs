@@ -52,10 +52,7 @@ pub(crate) fn publish(stats: &Stats, guard: &str) {
             "mismatched_records",
             stats.rejected_datagrams.mismatched_records,
         ),
-        (
-            "mismatched_salt",
-            stats.rejected_datagrams.mismatched_salt,
-        ),
+        ("mismatched_salt", stats.rejected_datagrams.mismatched_salt),
     ];
     for (reason, count) in rejected {
         metrics::counter!(

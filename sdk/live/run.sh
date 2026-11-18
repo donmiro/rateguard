@@ -28,7 +28,9 @@ http_port="$(free_port tcp)"
 gossip_port="$(free_port udp)"
 
 log="$(mktemp)"
-"$sidecar" --limit 2 --burst 2 --admin \
+# One process on loopback: nothing to sign, and 0.8 refuses to start without
+# a secret unless this is set.
+"$sidecar" --limit 2 --burst 2 --admin --insecure-gossip \
   --listen "127.0.0.1:$http_port" --bind "127.0.0.1:$gossip_port" >"$log" 2>&1 &
 pid=$!
 cleanup() {

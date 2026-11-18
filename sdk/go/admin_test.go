@@ -147,7 +147,7 @@ func eventually[T any](t *testing.T, read func() (T, error), done func(T) bool) 
 	}
 }
 
-// Against a real `rateguard-sidecar --limit 2 --burst 2 --admin`: see
+// Against a real `rateguard-sidecar --limit 2 --burst 2 --admin --insecure-gossip`: see
 // sdk/live/run.sh. Each change is put back as it was.
 func TestLiveAdmin(t *testing.T) {
 	url := os.Getenv("RATEGUARD_LIVE_URL")

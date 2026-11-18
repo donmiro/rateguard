@@ -215,7 +215,7 @@ if __name__ == "__main__":
 
 @unittest.skipUnless(os.environ.get("RATEGUARD_LIVE_URL"), "RATEGUARD_LIVE_URL is not set")
 class LiveTest(unittest.TestCase):
-    """Against a real `rateguard-sidecar --limit 2 --burst 2`: see
+    """Against a real `rateguard-sidecar --limit 2 --burst 2 --insecure-gossip`: see
     sdk/live/run.sh."""
 
     def client(self):

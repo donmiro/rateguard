@@ -128,7 +128,7 @@ def eventually(read, done):
 
 @unittest.skipUnless(os.environ.get("RATEGUARD_LIVE_URL"), "RATEGUARD_LIVE_URL is not set")
 class LiveAdminTest(unittest.TestCase):
-    """Against a real `rateguard-sidecar --limit 2 --burst 2 --admin`: see
+    """Against a real `rateguard-sidecar --limit 2 --burst 2 --admin --insecure-gossip`: see
     sdk/live/run.sh. Each change is put back as it was."""
 
     def setUp(self):

@@ -171,7 +171,7 @@ func TestFailingChecksKeepTheirConnection(t *testing.T) {
 	}
 }
 
-// Against a real `rateguard-sidecar --limit 2 --burst 2`: see
+// Against a real `rateguard-sidecar --limit 2 --burst 2 --insecure-gossip`: see
 // sdk/live/run.sh. Go cannot send a lone surrogate (its JSON encoder
 // replaces it), so that live case is left to the other clients.
 func TestLiveTheBurstIsAllowedAndTheNextDenied(t *testing.T) {

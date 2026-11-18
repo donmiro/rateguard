@@ -1,4 +1,4 @@
-// The client against a real `rateguard-sidecar --limit 2 --burst 2`; see
+// The client against a real `rateguard-sidecar --limit 2 --burst 2 --insecure-gossip`; see
 // sdk/live/run.sh. Skipped unless RATEGUARD_LIVE_URL is set.
 
 import { test } from "node:test";

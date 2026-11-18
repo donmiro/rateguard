@@ -43,7 +43,7 @@ fn checks(guard: &Guard, key: &str, n: usize) -> usize {
 
 #[tokio::test]
 async fn stats_count_what_was_admitted_and_what_denied() {
-    let guard = builder(100, 5).spawn().unwrap();
+    let guard = builder(100, 5).insecure_gossip(true).spawn().unwrap();
     assert_eq!(checks(&guard, "k", 8), 5);
     let stats = until(&guard, |s| s.admitted + s.denied == 8).await;
     assert_eq!((stats.admitted, stats.denied), (5, 3));
@@ -52,7 +52,7 @@ async fn stats_count_what_was_admitted_and_what_denied() {
 
 #[tokio::test]
 async fn a_fresh_node_has_counted_nothing() {
-    let guard = builder(100, 5).spawn().unwrap();
+    let guard = builder(100, 5).insecure_gossip(true).spawn().unwrap();
     let stats = guard.stats();
     assert_eq!((stats.admitted, stats.denied, stats.overflowed), (0, 0, 0));
     assert!(stats.running);
@@ -61,7 +61,12 @@ async fn a_fresh_node_has_counted_nothing() {
 #[tokio::test]
 async fn checks_crowded_into_the_overflow_slot_are_counted_apart() {
     // One bucket of slots for the whole table: most of 200 keys overflow.
-    let guard = builder(100, 5).hot_keys(1).tracked_keys(1).spawn().unwrap();
+    let guard = builder(100, 5)
+        .hot_keys(1)
+        .tracked_keys(1)
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     for i in 0..200 {
         let _ = guard.check(&format!("k{i}"));
     }
@@ -71,7 +76,7 @@ async fn checks_crowded_into_the_overflow_slot_are_counted_apart() {
 
 #[tokio::test]
 async fn a_lone_node_tells_its_cluster_and_keys() {
-    let guard = builder(100, 5).spawn().unwrap();
+    let guard = builder(100, 5).insecure_gossip(true).spawn().unwrap();
     // One check, before the first tick: its attempt reaches the node in the
     // tick of the first round, and the key must not be dropped with it.
     let _ = guard.check("k");
@@ -87,6 +92,7 @@ async fn a_lone_node_tells_its_cluster_and_keys() {
 async fn a_node_with_a_seed_nobody_answers_says_it_waits_to_join() {
     let guard = builder(100, 5)
         .seeds([format!("127.0.0.1:{}", free_port())])
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     until(&guard, |s| s.joining).await;
@@ -98,12 +104,14 @@ async fn two_nodes_count_each_other() {
     let a = Guard::builder()
         .bind(format!("127.0.0.1:{pa}"))
         .limit(100)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let b = Guard::builder()
         .bind(format!("127.0.0.1:{pb}"))
         .seeds([format!("127.0.0.1:{pa}")])
         .limit(100)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     // Heard of each other is not enough: each counts the other once that
@@ -118,14 +126,14 @@ async fn two_nodes_count_each_other() {
 
 #[tokio::test]
 async fn a_node_that_left_says_it_no_longer_runs() {
-    let guard = builder(100, 5).spawn().unwrap();
+    let guard = builder(100, 5).insecure_gossip(true).spawn().unwrap();
     guard.leave().await;
     assert!(!guard.stats().running);
 }
 
 #[tokio::test]
 async fn share_tells_the_rate_a_key_gets_here() {
-    let guard = builder(100, 5).spawn().unwrap();
+    let guard = builder(100, 5).insecure_gossip(true).spawn().unwrap();
     assert_eq!(guard.share("k"), None, "no state yet");
     let _ = guard.check("k");
     // Alone, a cold key gets α × R = 50 a second.
@@ -136,7 +144,11 @@ async fn share_tells_the_rate_a_key_gets_here() {
 
 #[tokio::test]
 async fn a_dry_run_admits_what_it_would_deny_and_counts_it() {
-    let guard = builder(100, 5).dry_run(true).spawn().unwrap();
+    let guard = builder(100, 5)
+        .dry_run(true)
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     assert_eq!(checks(&guard, "k", 8), 8);
     let stats = until(&guard, |s| s.admitted + s.denied == 8).await;
     assert_eq!((stats.admitted, stats.denied), (5, 3));
@@ -145,7 +157,11 @@ async fn a_dry_run_admits_what_it_would_deny_and_counts_it() {
 
 #[tokio::test]
 async fn a_dry_run_can_be_ended_on_the_fly_by_any_clone() {
-    let guard = builder(100, 5).dry_run(true).spawn().unwrap();
+    let guard = builder(100, 5)
+        .dry_run(true)
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     let clone = guard.clone();
     assert_eq!(checks(&guard, "k", 5), 5, "the burst");
     assert!(guard.check("k").is_allowed(), "would be denied");
@@ -159,7 +175,7 @@ async fn a_dry_run_can_be_ended_on_the_fly_by_any_clone() {
 // never seen must start at the floor too, not at a share nobody counts.
 #[tokio::test]
 async fn after_leaving_a_new_key_starts_at_the_floor() {
-    let guard = builder(1000, 5).spawn().unwrap();
+    let guard = builder(1000, 5).insecure_gossip(true).spawn().unwrap();
     guard.leave().await;
     let _ = guard.check("new");
     // R × β / 1: 1000 × 0.05.
@@ -170,7 +186,11 @@ async fn after_leaving_a_new_key_starts_at_the_floor() {
 // keys, Guard::key_hash_in can.
 #[tokio::test]
 async fn most_denied_matches_guard_key_hash_in_with_a_salt() {
-    let guard = builder(100, 5).key_salt([7; 16]).spawn().unwrap();
+    let guard = builder(100, 5)
+        .key_salt([7; 16])
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     assert_eq!(checks(&guard, "busy", 30), 5);
     let stats = until(&guard, |s| !s.most_denied.is_empty()).await;
     assert_eq!(stats.most_denied[0].key_hash, guard.key_hash_in("", "busy"));
@@ -180,7 +200,7 @@ async fn most_denied_matches_guard_key_hash_in_with_a_salt() {
 // Without a salt the node's hashes are the free functions'.
 #[tokio::test]
 async fn an_unsalted_guard_hashes_as_key_hash_in() {
-    let guard = builder(100, 5).spawn().unwrap();
+    let guard = builder(100, 5).insecure_gossip(true).spawn().unwrap();
     assert_eq!(guard.key_hash_in("", "busy"), key_hash("busy"));
     assert_eq!(
         guard.key_hash_in("pro", "busy"),
@@ -190,7 +210,7 @@ async fn an_unsalted_guard_hashes_as_key_hash_in() {
 
 #[tokio::test]
 async fn most_denied_tells_requests_too() {
-    let guard = builder(100, 5).spawn().unwrap();
+    let guard = builder(100, 5).insecure_gossip(true).spawn().unwrap();
     assert_eq!(checks(&guard, "busy", 30), 5);
     let stats = until(&guard, |s| !s.most_denied.is_empty()).await;
     let busy = &stats.most_denied[0];
@@ -206,7 +226,11 @@ async fn most_denied_tells_requests_too() {
 
 #[tokio::test]
 async fn most_denied_takes_k() {
-    let guard = builder(100, 1).most_denied(20).spawn().unwrap();
+    let guard = builder(100, 1)
+        .most_denied(20)
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     for i in 0..30 {
         // The more a key asks, the more it is denied.
         let _ = checks(&guard, &format!("key{i}"), 5 + i);
@@ -216,20 +240,33 @@ async fn most_denied_takes_k() {
     assert!(rates.windows(2).all(|w| w[0] >= w[1]), "{rates:?}");
     assert_eq!(guard.stats().most_denied.len(), 20);
 
-    let none = builder(100, 1).most_denied(0).spawn().unwrap();
+    let none = builder(100, 1)
+        .most_denied(0)
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     let _ = checks(&none, "k", 10);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(none.stats().most_denied.is_empty());
-    assert!(builder(100, 1).most_denied(1024).spawn().is_ok());
+    assert!(
+        builder(100, 1)
+            .most_denied(1024)
+            .insecure_gossip(true)
+            .spawn()
+            .is_ok()
+    );
     assert!(matches!(
-        builder(100, 1).most_denied(1025).spawn(),
+        builder(100, 1)
+            .most_denied(1025)
+            .insecure_gossip(true)
+            .spawn(),
         Err(Error::TooManyMostDenied(1025))
     ));
 }
 
 #[tokio::test]
 async fn most_shadow_denied_lists_the_shadowed_keys() {
-    let guard = builder(1000, 100).spawn().unwrap();
+    let guard = builder(1000, 100).insecure_gossip(true).spawn().unwrap();
     guard
         .set_shadow("", Some(Limit::per_second(1).burst(1)))
         .unwrap();
@@ -248,6 +285,7 @@ async fn key_stats_answers_for_a_tracked_key_only() {
     let guard = Guard::builder()
         .bind("127.0.0.1:0")
         .default_limit(Limit::per_minute(600))
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     assert!(guard.key_stats("", "never").await.is_none());
@@ -288,7 +326,7 @@ async fn key_stats_answers_for_a_tracked_key_only() {
 
 #[tokio::test]
 async fn key_stats_gives_up_with_the_task() {
-    let guard = builder(100, 5).spawn().unwrap();
+    let guard = builder(100, 5).insecure_gossip(true).spawn().unwrap();
     let _ = guard.check("k");
     guard.leave().await;
     let answered = tokio::time::timeout(Duration::from_secs(5), guard.key_stats("", "k")).await;
@@ -301,7 +339,11 @@ async fn an_alive_of_its_own_it_did_not_make_is_an_identity_conflict() {
     // says who it is.
     let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let at = peer.local_addr().unwrap();
-    let guard = builder(100, 5).seeds([at.to_string()]).spawn().unwrap();
+    let guard = builder(100, 5)
+        .seeds([at.to_string()])
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     assert_eq!(guard.stats().identity_conflicts, 0);
     let mut buf = [0u8; 1500];
     let (len, from) = tokio::time::timeout(Duration::from_secs(10), peer.recv_from(&mut buf))
@@ -310,6 +352,11 @@ async fn an_alive_of_its_own_it_did_not_make_is_an_identity_conflict() {
         .unwrap();
     let knock = rateguard_proto::decode(&buf[..len]).unwrap();
     let own = knock.updates()[0];
+    assert!(
+        own.incarnation > 1_600_000_000,
+        "a run starts at Unix seconds, not at 0: {}",
+        own.incarnation
+    );
 
     // The peer holds the node alive above its own incarnation, as when a
     // second instance runs under its address.
@@ -349,6 +396,7 @@ async fn a_stranger_over_the_member_cap_is_refused_and_counted() {
         .bind(format!("127.0.0.1:{port}"))
         .limit(100)
         .max_members(1)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     assert_eq!(guard.stats().members_refused, 0);

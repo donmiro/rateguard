@@ -1,8 +1,6 @@
-// A node restarted under the same ID starts again at incarnation 0, while
-// its peers may hold it alive at a higher one: a pause it had to refute
-// raised it. A restart too quick for any probe to miss goes unnoticed, and
-// unless someone tells the node where it stands, its next leave is older
-// than what the cluster holds and is dropped as stale.
+// A node restarted under the same ID starts one incarnation above the run
+// it replaces, so a leave it sends is newer than the record its peers hold
+// even when the restart was too quick for any probe to miss.
 
 use rateguard_core::gcra::Nanos;
 use rateguard_core::limiter::{Config, Limit};
@@ -39,8 +37,8 @@ fn status(s: &Sim<impl Link>, viewer: NodeIndex, subject: NodeIndex) -> Option<S
 }
 
 // Node 2 is paused long enough to be suspected and refutes, which takes it
-// to incarnation 1 in everyone's table; then it restarts, at 0, between
-// two probes.
+// to incarnation 1 in everyone's table; then it restarts, one above the
+// incarnation that run had reached, between two probes.
 fn quick_restart(s: &mut Sim<impl Link>, up_at: Nanos) {
     s.pause(2, 2 * ONE_SEC, 3 * ONE_SEC);
     s.run_until(8 * ONE_SEC);
@@ -88,12 +86,15 @@ fn scaling_down_under_quorum_after_a_quick_restart_keeps_the_quorum() {
 }
 
 #[test]
-fn a_single_quick_restart_is_one_identity_conflict() {
+fn a_quick_restart_is_not_an_identity_conflict() {
     let mut s = cluster();
     quick_restart(&mut s, 10 * ONE_SEC + 1);
     s.run_until(14 * ONE_SEC);
-    assert_eq!(s.node(2).identity_conflicts(), 1);
-    for node in [0, 1] {
-        assert_eq!(s.node(node).identity_conflicts(), 0);
+    for node in 0..3 {
+        assert_eq!(
+            s.node(node).identity_conflicts(),
+            0,
+            "node {node} outbid a record of itself"
+        );
     }
 }

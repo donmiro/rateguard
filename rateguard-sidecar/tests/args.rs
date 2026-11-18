@@ -108,8 +108,22 @@ async fn a_burst_flag_fills_in_only_where_the_limit_has_none() {
     // A slow limit earns nothing back while the test runs, so what a key
     // is admitted is its burst.
     let admitted = |limit: &'static str| {
-        let args = parse(&["--limit", limit, "--burst", "7", "--bind", "127.0.0.1:0"]).unwrap();
-        let guard = args.builder().unwrap().spawn().unwrap();
+        let args = parse(&[
+            "--limit",
+            limit,
+            "--burst",
+            "7",
+            "--bind",
+            "127.0.0.1:0",
+            "--insecure-gossip",
+        ])
+        .unwrap();
+        let guard = args
+            .builder()
+            .unwrap()
+            .insecure_gossip(true)
+            .spawn()
+            .unwrap();
         (0..20).filter(|_| guard.check("k").is_allowed()).count()
     };
     assert_eq!(admitted("100/h"), 7);
@@ -154,9 +168,15 @@ async fn the_flags_make_a_guard() {
         "--partition-policy",
         "quorum",
         "--dry-run",
+        "--insecure-gossip",
     ])
     .unwrap();
-    let guard = args.builder().unwrap().spawn().unwrap();
+    let guard = args
+        .builder()
+        .unwrap()
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     assert_eq!(
         guard.classes(),
         [("pro".to_owned(), Limit::per_second(1000).burst(50))]
@@ -168,9 +188,9 @@ async fn the_flags_make_a_guard() {
 
 #[tokio::test]
 async fn flags_the_library_refuses_are_refused_at_start() {
-    let args = parse(&["--limit", "0", "--bind", "127.0.0.1:0"]).unwrap();
+    let args = parse(&["--limit", "0", "--bind", "127.0.0.1:0", "--insecure-gossip"]).unwrap();
     assert!(matches!(
-        args.builder().unwrap().spawn(),
+        args.builder().unwrap().insecure_gossip(true).spawn(),
         Err(rateguard::Error::ZeroLimit)
     ));
 }
@@ -211,8 +231,17 @@ fn max_members_flag_and_env() {
 #[tokio::test]
 async fn max_members_out_of_range_is_an_error() {
     for n in ["0", "65537"] {
-        let args = parse(&["--limit", "1", "--bind", "127.0.0.1:0", "--max-members", n]).unwrap();
-        let result = args.builder().unwrap().spawn();
+        let args = parse(&[
+            "--limit",
+            "1",
+            "--bind",
+            "127.0.0.1:0",
+            "--max-members",
+            n,
+            "--insecure-gossip",
+        ])
+        .unwrap();
+        let result = args.builder().unwrap().insecure_gossip(true).spawn();
         assert!(
             matches!(result, Err(rateguard::Error::TooLargeMaxMembers(m)) if m.to_string() == n),
             "{n}: {:?}",
@@ -226,9 +255,16 @@ async fn max_members_out_of_range_is_an_error() {
         "127.0.0.1:0",
         "--max-members",
         "65536",
+        "--insecure-gossip",
     ])
     .unwrap();
-    assert!(args.builder().unwrap().spawn().is_ok());
+    assert!(
+        args.builder()
+            .unwrap()
+            .insecure_gossip(true)
+            .spawn()
+            .is_ok()
+    );
 }
 
 // A file of its own per test, removed when dropped.
@@ -296,6 +332,17 @@ fn off_with_a_secret_file_is_allowed() {
     ])
     .unwrap();
     assert_eq!(args.gossip_auth(), GossipAuth::Off);
+    assert!(args.builder().is_err(), "off still needs --insecure-gossip");
+    let args = parse(&[
+        "--limit",
+        "1",
+        "--gossip-secret-file",
+        file.path(),
+        "--gossip-auth",
+        "off",
+        "--insecure-gossip",
+    ])
+    .unwrap();
     assert!(args.builder().is_ok());
 }
 
@@ -311,7 +358,12 @@ async fn a_secret_file_signs_the_gossip() {
         file.path(),
     ])
     .unwrap();
-    let guard = args.builder().unwrap().spawn().unwrap();
+    let guard = args
+        .builder()
+        .unwrap()
+        .insecure_gossip(true)
+        .spawn()
+        .unwrap();
     assert_eq!(guard.stats().gossip_auth, GossipAuth::Required);
 }
 
@@ -367,6 +419,7 @@ async fn a_salt_file_is_taken_as_it_is() {
         "127.0.0.1:0",
         "--key-salt-file",
         file.path(),
+        "--insecure-gossip",
     ])
     .unwrap();
     let guard = args.builder().unwrap().spawn().unwrap();
@@ -374,6 +427,7 @@ async fn a_salt_file_is_taken_as_it_is() {
         .bind("127.0.0.1:0")
         .limit(1)
         .key_salt(&b"fifteen bytes!!\n"[..])
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     assert_eq!(guard.key_hash_in("", "k"), salted.key_hash_in("", "k"));
@@ -382,7 +436,16 @@ async fn a_salt_file_is_taken_as_it_is() {
 
 #[test]
 fn starting_unsigned_warns_on_stderr() {
-    let args = parse(&["--limit", "10", "--bind", "10.0.0.5:7946"]).unwrap();
+    let refused = parse(&["--limit", "10", "--bind", "10.0.0.5:7946"]).unwrap();
+    assert!(refused.builder().is_err());
+    let args = parse(&[
+        "--limit",
+        "10",
+        "--bind",
+        "10.0.0.5:7946",
+        "--insecure-gossip",
+    ])
+    .unwrap();
     assert_eq!(args.gossip_auth(), GossipAuth::Off);
     let warnings = args.startup_warnings();
     assert!(

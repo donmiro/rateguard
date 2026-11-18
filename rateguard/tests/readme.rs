@@ -22,6 +22,7 @@ async fn getting_started() -> Result<(), rateguard::Error> {
         .limit(1_000)
         .burst(50)
         .partition_policy(PartitionPolicy::HoldDown(Duration::from_secs(30)))
+        .insecure_gossip(true)
         .spawn()?;
 
     match guard.check("api:tenant-42") {
@@ -59,6 +60,7 @@ async fn getting_started_runs_on_loopback() {
         .limit(1_000)
         .burst(50)
         .partition_policy(PartitionPolicy::HoldDown(Duration::from_secs(30)))
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let allowed = (0..100)

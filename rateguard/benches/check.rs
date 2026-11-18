@@ -43,10 +43,11 @@ fn guard(runtime: &tokio::runtime::Runtime, hung: bool, salted: bool) -> Guard {
             builder
                 .bind("10.0.0.1:7946")
                 .seeds(["10.0.0.2:7946", "10.0.0.3:7946"])
+                .insecure_gossip(true)
                 .spawn_on(Hung)
                 .unwrap()
         } else {
-            builder.spawn().unwrap()
+            builder.insecure_gossip(true).spawn().unwrap()
         }
     })
 }

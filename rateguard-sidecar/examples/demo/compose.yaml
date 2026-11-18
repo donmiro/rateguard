@@ -19,7 +19,7 @@
 # see ../kubernetes.yaml.
 
 x-sidecar: &sidecar
-  image: ghcr.io/donmiro/rateguard-sidecar:0.7
+  image: ghcr.io/donmiro/rateguard-sidecar:0.8
   # Without the published image, compose builds it from this repository.
   build:
     context: ../../..
@@ -30,15 +30,15 @@ x-sidecar: &sidecar
 services:
   a:
     <<: *sidecar
-    command: --limit 1000 --listen 0.0.0.0:7947 --metrics-listen 0.0.0.0:9090 --advertise 10.79.46.11:7946 --seeds b:7946,c:7946
+    command: --limit 1000 --listen 0.0.0.0:7947 --metrics-listen 0.0.0.0:9090 --advertise 10.79.46.11:7946 --seeds b:7946,c:7946 --insecure-gossip
     networks: { fleet: { ipv4_address: 10.79.46.11 } }
   b:
     <<: *sidecar
-    command: --limit 1000 --listen 0.0.0.0:7947 --metrics-listen 0.0.0.0:9090 --advertise 10.79.46.12:7946 --seeds a:7946,c:7946
+    command: --limit 1000 --listen 0.0.0.0:7947 --metrics-listen 0.0.0.0:9090 --advertise 10.79.46.12:7946 --seeds a:7946,c:7946 --insecure-gossip
     networks: { fleet: { ipv4_address: 10.79.46.12 } }
   c:
     <<: *sidecar
-    command: --limit 1000 --listen 0.0.0.0:7947 --metrics-listen 0.0.0.0:9090 --advertise 10.79.46.13:7946 --seeds a:7946,b:7946
+    command: --limit 1000 --listen 0.0.0.0:7947 --metrics-listen 0.0.0.0:9090 --advertise 10.79.46.13:7946 --seeds a:7946,b:7946 --insecure-gossip
     networks: { fleet: { ipv4_address: 10.79.46.13 } }
 
   load:

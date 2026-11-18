@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .bind(format!("127.0.0.1:{port}"))
                 .seeds(seeds)
                 .limit(LIMIT)
+                .insecure_gossip(true)
                 .spawn()?,
         );
     }

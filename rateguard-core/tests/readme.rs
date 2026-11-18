@@ -13,6 +13,7 @@ fn without_the_network() {
     let my_address = Address::V4([10, 0, 0, 1], 7946);
     let seed_address = Address::V4([10, 0, 0, 2], 7946);
     let rng_seed = 7;
+    let incarnation: u32 = 1_700_000_000;
     let key_hash = 42;
     let now_nanos = 0;
     let from = rateguard_core::boundary::PeerId::new(0);
@@ -45,6 +46,7 @@ fn without_the_network() {
         PeerId::new(1), // this node
         my_address,     // a rateguard_proto::Address, gossiped so others can reach it
         rng_seed,       // drives its random choices: same seed, same run
+        incarnation,    // this run's, seconds since the Unix epoch
     );
     node.add_seed(PeerId::new(0), seed_address); // N comes from membership
 

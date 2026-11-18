@@ -12,6 +12,7 @@ fn guard(limit: u32, burst: u32) -> Guard {
         .bind("127.0.0.1:0")
         .limit(limit)
         .burst(burst)
+        .insecure_gossip(true)
         .spawn()
         .unwrap()
 }
@@ -131,6 +132,7 @@ async fn a_key_function_may_name_the_class_too() {
         .limit(100)
         .burst(5)
         .class("pro", rateguard::Limit::per_second(100).burst(2))
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let inner = service_fn(|_: Request<String>| async {

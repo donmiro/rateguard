@@ -91,10 +91,21 @@ pub struct MemberTable {
 impl MemberTable {
     /// A table holding only the node itself, `Alive` at incarnation 0, listening at `addr`.
     pub fn new(local: PeerId, addr: Address) -> Self {
+        Self::at(local, addr, 0)
+    }
+
+    /// This run's incarnation, before any news. It only rises from here.
+    /// `u32::MAX` is held back by one, so a suspicion of this node can
+    /// still be refuted.
+    pub(crate) fn start_at(&mut self, incarnation: u32) {
+        self.incarnation = incarnation.min(u32::MAX - 1);
+    }
+
+    fn at(local: PeerId, addr: Address, incarnation: u32) -> Self {
         Self {
             local,
             addr,
-            incarnation: 0,
+            incarnation,
             members: BTreeMap::new(),
             live: Vec::new(),
             changes: Vec::new(),

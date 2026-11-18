@@ -12,6 +12,7 @@ async fn served(header_timeout: Duration) -> std::net::SocketAddr {
     let guard = Guard::builder()
         .bind("127.0.0.1:0")
         .limit(10)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let router = public_app(App::new(guard, false, None));

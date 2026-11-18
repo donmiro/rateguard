@@ -222,9 +222,15 @@ impl<L: Link> Sim<L> {
         sim
     }
 
-    // A restarted node keeps its ID and address but nothing else: a new
-    // incarnation 0, an empty table, the same bootstrap as at the start.
+    // A restarted node keeps its ID and address but nothing else: an
+    // empty table and the same bootstrap as at the start. Its incarnation
+    // is one past the run it replaces, so a leave from that run is older
+    // than this one. The first run starts at 0.
     fn fresh_node(&self, index: NodeIndex) -> Node {
+        self.fresh_node_at(index, 0)
+    }
+
+    fn fresh_node_at(&self, index: NodeIndex, incarnation: u32) -> Node {
         let node_count = self.generations.len();
         let seed = (self.generations[index] << 32) | index as u64;
         let mut node = Node::new(
@@ -233,6 +239,7 @@ impl<L: Link> Sim<L> {
             peer_of(index),
             address_of(index),
             seed,
+            incarnation,
         );
         node.set_partition_policy(self.policy);
         if let Some(memory) = self.quorum_memory {
@@ -539,8 +546,9 @@ impl<L: Link> Sim<L> {
                 return;
             }
             Kind::Restart => {
+                let next = self.nodes[target].members().incarnation().saturating_add(1);
                 self.generations[target] += 1;
-                self.nodes[target] = self.fresh_node(target);
+                self.nodes[target] = self.fresh_node_at(target, next);
                 self.down[target] = false;
                 let generation = self.generations[target];
                 self.schedule(now, target, Kind::Tick { generation });

@@ -53,6 +53,7 @@ async fn a_replaced_secret_file_is_picked_up() {
         .bind(format!("127.0.0.1:{pa}"))
         .limit(100)
         .gossip_auth(GossipAuth::Required, secrets(&[A]))
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     tokio::spawn(reload_secrets(
@@ -72,6 +73,7 @@ async fn a_replaced_secret_file_is_picked_up() {
         .seeds([format!("127.0.0.1:{pa}")])
         .limit(100)
         .gossip_auth(GossipAuth::Required, secrets(&[B, A]))
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     until_both_see_two(&a, &b).await;
@@ -126,6 +128,7 @@ fn a_failed_reload_is_counted() {
                 .bind("127.0.0.1:0")
                 .limit(100)
                 .gossip_auth(GossipAuth::Required, secrets(&[A]))
+                .insecure_gossip(true)
                 .spawn()
                 .unwrap();
             let reload = reload_secrets(

@@ -10,7 +10,7 @@
 //!     .advertise("10.0.0.3:7946")
 //!     .seeds(["10.0.0.1:7946"])
 //!     .limit(1_000)
-//!     .spawn()?;
+//!     .insecure_gossip(true).spawn()?;
 //!
 //! // One limit per tenant; a request with no tenant is not limited.
 //! let layer = RateLimitLayer::new(guard, |req: &http::Request<String>| {

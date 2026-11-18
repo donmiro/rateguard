@@ -97,10 +97,15 @@ pub struct Args {
     #[arg(long, env = "RATEGUARD_GOSSIP_SECRET_FILE")]
     pub gossip_secret_file: Option<PathBuf>,
     /// `off`, `transitional` or `required`: whether gossip is signed, and
-    /// what unsigned gossip is let in. `required` with a secret file,
-    /// `off` without, by default.
+    /// what unsigned gossip is let in. `required` with a secret file.
+    /// Without a secret file the process refuses to start, unless
+    /// `--insecure-gossip` is set, which is `off`.
     #[arg(long = "gossip-auth", env = "RATEGUARD_GOSSIP_AUTH")]
     pub gossip_auth_mode: Option<Mode>,
+    /// Start with unsigned gossip. Without a secret file, and without
+    /// this, the process refuses to start.
+    #[arg(long, env = "RATEGUARD_INSECURE_GOSSIP", action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
+    pub insecure_gossip: bool,
     /// A file whose bytes, as they are, salt the hashes of keys: at least
     /// 16. The same at every instance; changed only by restarting them all
     /// at once.
@@ -114,7 +119,7 @@ impl Args {
         match (self.gossip_auth_mode, &self.gossip_secret_file) {
             (Some(Mode(mode)), _) => mode,
             (None, Some(_)) => GossipAuth::Required,
-            (None, None) => GossipAuth::Off,
+            (None, None) => GossipAuth::Off, // refused at start unless --insecure-gossip
         }
     }
 
@@ -122,9 +127,9 @@ impl Args {
     /// reaches the port may join, and sign nothing.
     pub fn startup_warnings(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        if self.gossip_auth() == GossipAuth::Off {
+        if self.gossip_auth() == GossipAuth::Off && self.insecure_gossip {
             lines.push(format!(
-                "rateguard-sidecar: warning: gossip is not signed: anyone who can reach {} can join the cluster; see --gossip-secret-file",
+                "rateguard-sidecar: warning: gossip is not signed: anyone who can reach {} can join the cluster",
                 self.bind
             ));
         }
@@ -191,6 +196,12 @@ impl Args {
             }
             builder = builder.key_salt(salt);
         }
+        if mode == GossipAuth::Off && !self.insecure_gossip {
+            return Err(ArgsError::UnsignedGossip);
+        }
+        if self.insecure_gossip {
+            builder = builder.insecure_gossip(true);
+        }
         Ok(builder)
     }
 }
@@ -212,6 +223,8 @@ pub enum ArgsError {
     SaltUnreadable(std::io::Error),
     /// A salt file of this many bytes, fewer than 16.
     ShortSalt(usize),
+    /// Unsigned gossip, and `--insecure-gossip` was not set.
+    UnsignedGossip,
 }
 impl fmt::Display for ArgsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -229,6 +242,10 @@ impl fmt::Display for ArgsError {
             ArgsError::ShortSalt(n) => write!(
                 f,
                 "--key-salt-file: {n} bytes, at least {MIN_SALT} are needed"
+            ),
+            ArgsError::UnsignedGossip => write!(
+                f,
+                "gossip is not signed: pass --gossip-secret-file, or --insecure-gossip"
             ),
         }
     }

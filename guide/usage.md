@@ -45,6 +45,7 @@ let guard = Guard::builder()
     .seeds(["10.0.0.1:7946"])
     .limit(100) // the default class
     .class("pro", Limit::per_second(1_000).burst(50))
+    .insecure_gossip(true) // or sign the gossip: see Security
     .spawn()?;
 
 let by_ip = guard.check("ip:203.0.113.7"); // 100 a second
@@ -238,5 +239,5 @@ To check in a class, return it with the key, as a pair:
 | `max_key_limits(n)` | `4096` | How many exceptions for single keys an instance keeps, at most 1,048,576; see [Limits for one key](#limits-for-one-key) |
 | `most_denied(k)` | `10` | How long `most_denied` and `most_shadow_denied` are, at most 1024, `0` for none |
 | `max_members(n)` | `8192` | How many members an instance keeps track of, the dead not yet forgotten and itself included, from 1 to 65,536. Over it newcomers are refused and counted in `members_refused`. Size it for the fleet plus every address that churned in the last 10 minutes, the time the dead are remembered: about twice the fleet for rolling deploys that give pods new IPs. While the table refuses newcomers, or a peer reports a full table, every instance shares the limit as if `n` nodes were up and holds every key at the floor `R × β / n`. Over the cap the fleet stays within the limit by sitting at that floor: raise the cap when `members_refused` grows. The default covers fleets up to about 4000 instances under rolling deploys; see [Security](security.md) |
-| `gossip_auth(mode, secrets)` | `Off`, no secret | Whether gossip is signed, with at most two secrets of 32 bytes or more; see [Security](security.md) |
+| `gossip_auth(mode, secrets)` | refuses to start | Whether gossip is signed, with at most two secrets of 32 bytes or more. Unsigned gossip starts only with `insecure_gossip(true)`; see [Security](security.md) |
 | `key_salt(bytes)` | none | A salt of 16 bytes or more for the hashes of keys, the same on every node; see [Security](security.md) |

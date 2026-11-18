@@ -73,6 +73,7 @@ async fn spawn(
         .limit(LIMIT)
         .burst(BURST)
         .partition_policy(PartitionPolicy::HoldDown(Duration::from_secs(60)))
+        .insecure_gossip(true)
         .gossip_auth(mode, secrets);
     Ok(if rewrite {
         builder.spawn_on(Rewriting(socket))?
@@ -200,6 +201,7 @@ fn listed(names: &[&'static str]) -> (turmoil::Sim<'static>, Vec<Log>) {
                     .limit(LIMIT)
                     .burst(BURST)
                     .partition_policy(PartitionPolicy::HoldDown(Duration::from_secs(60)))
+                    .insecure_gossip(true)
                     .spawn_on(Listed(socket, service.clone()))?;
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(3)).await;

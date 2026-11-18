@@ -255,6 +255,7 @@ mod tests {
             PeerId::new(0),
             address_of(0),
             0,
+            0,
         );
         for _ in 0..5000 {
             node.check(KEY, 0);
@@ -285,6 +286,7 @@ mod tests {
             SwimConfig::default(),
             PeerId::new(0),
             address_of(0),
+            0,
             0,
         );
         for key in 0..3 {
@@ -330,6 +332,7 @@ mod tests {
             PeerId::new(0),
             address_of(0),
             0,
+            0,
         )];
         let config = config();
         let mut window = AdmissionWindow::new(ONE_SEC);
@@ -355,6 +358,7 @@ mod tests {
             PeerId::new(0),
             address_of(0),
             0,
+            0,
         )];
         let config = config();
         let mut window = AdmissionWindow::new(ONE_SEC);
@@ -378,6 +382,7 @@ mod tests {
             SwimConfig::default(),
             PeerId::new(0),
             address_of(0),
+            0,
             0,
         )];
         let config = config();
@@ -409,6 +414,7 @@ mod tests {
             SwimConfig::default(),
             PeerId::new(0),
             address_of(0),
+            0,
             0,
         );
         let accusation = rateguard_proto::encode(&rateguard_proto::Message::Ping {
@@ -442,6 +448,7 @@ mod tests {
             SwimConfig::default(),
             PeerId::new(0),
             address_of(0),
+            0,
             0,
         )];
 
@@ -479,6 +486,7 @@ mod tests {
             SwimConfig::default(),
             PeerId::new(0),
             address_of(0),
+            0,
             0,
         );
         node.introduce(PeerId::new(2), address_of(2));

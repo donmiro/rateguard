@@ -19,6 +19,7 @@ fn guard() -> Guard {
         .limit(40)
         .burst(3)
         .class("pro", Limit::per_second(10).burst(5))
+        .insecure_gossip(true)
         .spawn()
         .unwrap()
 }
@@ -235,6 +236,7 @@ async fn stats_tell_the_gossip_auth_and_the_rejected_datagrams() {
     let guard = Guard::builder()
         .bind(format!("127.0.0.1:{port}"))
         .limit(40)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let router = router(&guard, false);
@@ -267,6 +269,7 @@ async fn stats_tell_the_gossip_auth_and_the_rejected_datagrams() {
             GossipAuth::Transitional,
             vec![Secret::new([0xA1; 32].to_vec()).unwrap()],
         )
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let signing = app(App::new(signing, false, None));

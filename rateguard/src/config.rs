@@ -90,6 +90,7 @@ pub struct Builder {
     // builder shows none either.
     gossip_auth: GossipAuth,
     secrets: Vec<Secret>,
+    insecure_gossip: bool,
     // Taken in at once, the bytes not kept: KeySalt's Debug shows none of
     // its own, and a salt too short is only its length until it is refused.
     salt: Option<Result<KeySalt, usize>>,
@@ -228,10 +229,13 @@ impl Builder {
     /// `[B, A]`, `[B]`, each step on every node before the next. The gossip
     /// is not encrypted all the same: whoever sees the traffic reads it.
     ///
-    /// [`GossipAuth::Off`], the default, sends the bytes of 0.5 and keeps
-    /// no secret it is given. A cluster starts signing in two steps, every
-    /// node on 0.6 first: [`GossipAuth::Transitional`], then
-    /// [`GossipAuth::Required`]. What is refused is counted in
+    /// [`GossipAuth::Off`] sends the bytes of 0.5 and keeps no secret it
+    /// is given. It does not start unless
+    /// [`insecure_gossip`](Builder::insecure_gossip) is set: anyone who can
+    /// reach the port could otherwise join. A cluster starts signing in
+    /// two steps, every node on 0.6 first:
+    /// [`GossipAuth::Transitional`], then [`GossipAuth::Required`]. What
+    /// is refused is counted in
     /// [`Stats::rejected_datagrams`](crate::Stats::rejected_datagrams).
     /// Changed on the fly with
     /// [`Guard::set_gossip_auth`](crate::Guard::set_gossip_auth).
@@ -242,6 +246,14 @@ impl Builder {
     pub fn gossip_auth(mut self, mode: GossipAuth, secrets: Vec<Secret>) -> Self {
         self.gossip_auth = mode;
         self.secrets = secrets;
+        self
+    }
+
+    /// Starts with unsigned gossip. Without this, and without a secret in
+    /// [`gossip_auth`](Builder::gossip_auth), [`Builder::spawn`] refuses:
+    /// the port would otherwise trust whoever can reach it.
+    pub fn insecure_gossip(mut self, yes: bool) -> Self {
+        self.insecure_gossip = yes;
         self
     }
 
@@ -423,6 +435,9 @@ impl Builder {
         if period / 4 == 0 {
             return Err(Error::ZeroPeriod);
         }
+        if self.gossip_auth == GossipAuth::Off && !self.insecure_gossip {
+            return Err(Error::UnsignedGossip);
+        }
         let auth = Auth::new(self.gossip_auth, self.secrets.clone()).map_err(Error::GossipAuth)?;
         let salt = self.salt.clone().transpose().map_err(Error::ShortSalt)?;
 
@@ -495,16 +510,22 @@ fn start<T: crate::Transport>(
 
     let me = Address::from(settings.advertise);
     let local = crate::key::peer_id(me);
-    // Only the order of probes depends on it; any value will do.
-    let entropy = std::time::SystemTime::now()
+    // The seed mixes in wall-clock entropy, so a replayed reply from an
+    // earlier run matches no probe of this one. The incarnation is the
+    // seconds of that same clock: a restart is newer than any leave the
+    // previous run sent.
+    let since = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos() as u64);
+        .unwrap_or_default();
+    let entropy = since.as_nanos() as u64;
+    let incarnation = u32::try_from(since.as_secs()).unwrap_or(u32::MAX - 1);
     let mut node = Node::new(
         settings.core,
         settings.swim,
         local,
         me,
         local.get() ^ entropy,
+        incarnation,
     );
     node.set_partition_policy(settings.policy);
     node.set_quorum_memory(settings.quorum_memory);
@@ -706,6 +727,8 @@ pub enum Error {
     /// A [`Builder::key_salt`] of this many bytes, fewer than the 16 a
     /// salt takes.
     ShortSalt(usize),
+    /// Gossip is unsigned, and [`Builder::insecure_gossip`] was not set.
+    UnsignedGossip,
     /// A shadow for a class this node does not have: see
     /// [`Guard::set_shadow`](crate::Guard::set_shadow).
     UnknownClass(String),
@@ -772,6 +795,10 @@ impl fmt::Display for Error {
                 KeySalt::MIN_LEN
             ),
             Error::UnknownClass(name) => write!(f, "no class named {name:?}"),
+            Error::UnsignedGossip => write!(
+                f,
+                "gossip is not signed: pass a secret to gossip_auth, or insecure_gossip(true)"
+            ),
         }
     }
 }
@@ -794,13 +821,17 @@ mod tests {
             .bind("127.0.0.1:0")
             .limit(1000)
             .protocol_period(Duration::from_secs(601))
+            .insecure_gossip(true)
             .spawn()
             .unwrap();
         guard.leave().await;
     }
 
     fn valid() -> Builder {
-        Builder::new().bind("10.0.0.1:7946").limit(1000)
+        Builder::new()
+            .bind("10.0.0.1:7946")
+            .limit(1000)
+            .insecure_gossip(true)
     }
 
     fn secret() -> Secret {
@@ -877,6 +908,17 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_gossip_does_not_start() {
+        let error = Builder::new()
+            .bind("10.0.0.1:7946")
+            .limit(1000)
+            .settings()
+            .unwrap_err();
+        assert!(matches!(error, Error::UnsignedGossip));
+        assert!(error.to_string().contains("insecure_gossip"), "{error}");
+    }
+
+    #[test]
     fn gossip_is_unsigned_unless_asked() {
         assert_eq!(valid().settings().unwrap().auth.mode(), GossipAuth::Off);
         let s = valid()
@@ -913,6 +955,7 @@ mod tests {
         let s = Builder::new()
             .bind("10.0.0.1:1")
             .limit(u32::MAX)
+            .insecure_gossip(true)
             .settings()
             .unwrap();
         assert_eq!(s.core.limit.burst, rateguard_core::gcra::MAX_BURST);
@@ -943,6 +986,7 @@ mod tests {
         let s = Builder::new()
             .bind("10.0.0.1:1")
             .limit(7)
+            .insecure_gossip(true)
             .settings()
             .unwrap();
         assert_eq!(s.core.limit.burst, 1);

@@ -7,11 +7,11 @@ the sidecars find each other and share the limit, as `rateguard` does in a
 Rust process.
 
 ```sh
-cargo install rateguard-sidecar   # or: docker pull ghcr.io/donmiro/rateguard-sidecar:0.7
+cargo install rateguard-sidecar   # or: docker pull ghcr.io/donmiro/rateguard-sidecar:0.8
 
 rateguard-sidecar --limit 1000 \
   --bind 0.0.0.0:7946 --advertise 10.0.0.3:7946 \
-  --seeds 10.0.0.1:7946,10.0.0.2:7946 \
+  --seeds 10.0.0.1:7946,10.0.0.2:7946 --insecure-gossip \
   --class pro=5000/250
 
 curl -s -X POST -d '{"key": "tenant:42", "class": "pro"}' http://127.0.0.1:7947/v1/check
@@ -109,7 +109,8 @@ Every flag is also a variable, for Kubernetes: `--limit` is
 | `--most-denied` | `10` | How many keys `most_denied` and `most_shadow_denied` list in `/v1/stats`, at most 1024, `0` for none (`RATEGUARD_MOST_DENIED`) |
 | `--max-members` | `8192` | How many members an instance keeps track of, the dead not yet forgotten and itself included, from 1 to 65536; newcomers over it are refused and counted in `members_refused`. Size it for the fleet plus the addresses that churned in the last 10 minutes, about twice the fleet for rolling deploys with new pod IPs: while it refuses newcomers, or a peer reports a full table, the instance holds every key at the floor `R × β / max-members` (`members_full`). Over the cap the fleet stays within the limit by sitting at that floor; raise the cap when `members_refused` grows (`RATEGUARD_MAX_MEMBERS`) |
 | `--gossip-secret-file` | none | Gossip secrets, one per line in base64, at most two: the first signs, either verifies. Reread every 10 s; see [Signed gossip](#signed-gossip) |
-| `--gossip-auth` | `required` with a secret file, else `off` | `off`, `transitional` or `required` |
+| `--insecure-gossip` | off | Start with unsigned gossip. Without a secret file, and without this, the process refuses to start (`RATEGUARD_INSECURE_GOSSIP`) |
+| `--gossip-auth` | `required` with a secret file; otherwise refuses to start | `off`, `transitional` or `required`. `off` still needs `--insecure-gossip` |
 | `--key-salt-file` | none | A salt for the hashes of keys, its bytes as they are, at least 16; read once, at start |
 
 Switches take `true`, `1`, `yes` or `on` as variables, and their opposites.
@@ -133,8 +134,9 @@ under the pod's `terminationGracePeriodSeconds`.
 `rejected_datagrams` as
 `{"unsigned": 0, "bad_tag": 0, "malformed": 0, "mismatched_records": 0}`
 (the last counts records dropped from datagrams otherwise taken), and
-`identity_conflicts`: one after a restart quicker than the peers noticed,
-growing steadily when two instances advertise one address; and
+`identity_conflicts`: times an `Alive` of this instance had to be outbid.
+A second instance on its address makes it grow; a restart that starts
+above the incarnation the cluster still holds adds nothing; and
 `members_refused`: newcomers refused for a full member table, growing
 steadily in a fleet bigger than `--max-members` or under a flood of unsigned
 gossip, which only a secret file keeps out; `members_full` is true while
@@ -270,10 +272,10 @@ the commands in its header, probes and Prometheus on `--metrics-listen`.
 The image, for amd64 and arm64, is published with every release:
 
 ```sh
-docker pull ghcr.io/donmiro/rateguard-sidecar:0.7
+docker pull ghcr.io/donmiro/rateguard-sidecar:0.8
 ```
 
-Tags are the version (`0.7.1`), the minor version (`0.7`, the latest
+Tags are the version (`0.8.0`), the minor version (`0.8`, the latest
 patch) and `latest`. To build it yourself, from the repository root:
 
 ```sh

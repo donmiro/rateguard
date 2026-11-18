@@ -256,14 +256,14 @@ fn a_long_restart_under_the_same_id_rejoins_over_its_own_grave() {
         Some(Status::Dead),
         "the cluster buried it"
     );
-    assert_eq!(s.node(2).members().incarnation(), 0, "a fresh start");
+    assert_eq!(
+        s.node(2).members().incarnation(),
+        1,
+        "one above the run that was buried, so the grave is already older"
+    );
 
     s.run_until(up + 5 * ONE_SEC);
     everyone_sees_everyone(&s);
-    assert!(
-        s.node(2).members().incarnation() >= 1,
-        "it had to refute its own death to come back"
-    );
 }
 
 #[test]

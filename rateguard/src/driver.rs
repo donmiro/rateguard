@@ -669,7 +669,7 @@ mod tests {
             demand_time_constant: 1_000_000_000,
         };
         let me = Address::V4([10, 0, 0, 1], 7946);
-        let mut node = Node::new(config, SwimConfig::default(), PeerId::new(1), me, 1);
+        let mut node = Node::new(config, SwimConfig::default(), PeerId::new(1), me, 1, 0);
         let actions: Vec<Action> = (2..5)
             .map(|peer| {
                 node.introduce(PeerId::new(peer), Address::V4([10, 0, 0, peer as u8], 7946));
@@ -765,6 +765,7 @@ mod tests {
             crate::key::peer_id(me),
             me,
             1,
+            0,
         )
     }
 
@@ -801,6 +802,7 @@ mod tests {
         let guard = crate::Guard::builder()
             .bind("10.0.0.1:7946")
             .limit(100)
+            .insecure_gossip(true)
             .spawn_on(HungSend)
             .unwrap();
         let (found, mut lookups) = mpsc::channel(1);

@@ -639,6 +639,7 @@ mod tests {
             .bind(format!("127.0.0.1:{port}"))
             .limit(1000)
             .class("pro", Limit::per_second(100))
+            .insecure_gossip(true)
             .spawn()
             .unwrap();
         let _ = guard.check_in("pro", "k");

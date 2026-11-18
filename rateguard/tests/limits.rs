@@ -13,6 +13,7 @@ fn guard() -> Guard {
         .limit(40)
         .burst(50)
         .class("pro", Limit::per_second(40).burst(50))
+        .insecure_gossip(true)
         .spawn()
         .unwrap()
 }

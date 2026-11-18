@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind("127.0.0.1:7946")
         .limit(5)
         .burst(5)
+        .insecure_gossip(true)
         .spawn()?;
 
     // README: begin

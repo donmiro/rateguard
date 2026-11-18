@@ -45,6 +45,7 @@ async fn the_background_task_publishes_counts_and_state() {
         .bind(&me)
         .limit(100)
         .burst(5)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let admitted = (0..8).filter(|_| guard.check("k").is_allowed()).count();

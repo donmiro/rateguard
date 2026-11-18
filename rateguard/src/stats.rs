@@ -93,10 +93,10 @@ pub struct Stats {
     pub rejected_datagrams: RejectedDatagrams,
     /// Times this node has had to outbid an `Alive` record of itself that
     /// it did not make: a newer incarnation of its own ID, spread by
-    /// another. A restart quicker than the peers notice adds one, as they
-    /// tell the new instance where the old one stood. Steady growth means
-    /// two instances advertise one address, and each keeps outbidding the
-    /// other.
+    /// another. A restart that starts above the incarnation the cluster
+    /// still holds is taken as this node and adds nothing. Steady growth
+    /// means two instances advertise one address, and each keeps outbidding
+    /// the other.
     pub identity_conflicts: u64,
     /// Times news of a member not seen before was refused because the
     /// member table was full; see

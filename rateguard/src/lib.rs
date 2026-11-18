@@ -15,7 +15,7 @@
 //!     .advertise("10.0.0.3:7946")
 //!     .seeds(["10.0.0.1:7946", "10.0.0.2:7946"])
 //!     .limit(1_000) // per key, across the whole fleet, per second
-//!     .spawn()?;
+//!     .insecure_gossip(true).spawn()?;
 //!
 //! match guard.check("api:tenant-42") {
 //!     Decision::Allow => { /* serve */ }

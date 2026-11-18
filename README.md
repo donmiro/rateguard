@@ -15,6 +15,7 @@ let guard = Guard::builder()
     .advertise("10.0.0.3:7946")         // where the other instances reach this one
     .seeds(["10.0.0.1:7946", "10.0.0.2:7946"])
     .limit(1_000)                       // 1000 rps per key, across every instance
+    .insecure_gossip(true)              // or sign it: see Security
     .spawn()?;
 
 // ~25 ns. No I/O, no lock shared with the network, no .await.
@@ -85,7 +86,7 @@ fleet holds 1000 throughout, the shares following the replicas
 
 ```toml
 [dependencies]
-rateguard = "0.7"
+rateguard = "0.8"
 ```
 
 Requires Rust 1.88 or newer (2024 edition). Optional features:
@@ -110,6 +111,7 @@ let guard = Guard::builder()
     .limit(1_000)
     .burst(50)
     .partition_policy(PartitionPolicy::HoldDown(Duration::from_secs(30)))
+    .insecure_gossip(true)
     .spawn()?;
 
 match guard.check("api:tenant-42") {
@@ -141,13 +143,13 @@ and answers it over HTTP on loopback; the sidecars share the limit as Rust
 processes do.
 
 ```sh
-rateguard-sidecar --limit 1000 --advertise 10.0.0.3:7946 --seeds 10.0.0.1:7946
+rateguard-sidecar --limit 1000 --advertise 10.0.0.3:7946 --seeds 10.0.0.1:7946 --insecure-gossip
 curl -s -X POST -d '{"key": "tenant:42"}' http://127.0.0.1:7947/v1/check
 # {"allowed":true}
 ```
 
 It is on crates.io (`cargo install rateguard-sidecar`) and an image,
-`ghcr.io/donmiro/rateguard-sidecar:0.7`, for amd64 and arm64.
+`ghcr.io/donmiro/rateguard-sidecar:0.8`, for amd64 and arm64.
 
 ```python
 from rateguard_client import Client  # pip install rateguard-client

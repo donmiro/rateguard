@@ -27,6 +27,7 @@ fn node(port: u16, seeds: &[u16], mode: GossipAuth, secrets: Vec<Secret>) -> Gua
         .seeds(seeds.iter().map(|seed| format!("127.0.0.1:{seed}")))
         .limit(100)
         .gossip_auth(mode, secrets)
+        .insecure_gossip(true)
         .spawn()
         .unwrap()
 }
@@ -273,6 +274,7 @@ fn a_mode_without_secrets_is_refused_at_spawn() {
             .bind("127.0.0.1:0")
             .limit(10)
             .gossip_auth(GossipAuth::Required, Vec::new())
+            .insecure_gossip(true)
             .spawn()
             .map(drop)
     });

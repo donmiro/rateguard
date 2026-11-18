@@ -227,10 +227,24 @@ impl Node {
     /// was sent, replayed, can match this run's probes and keep a dead peer
     /// alive.
     ///
+    /// `incarnation` is where this run starts, and it only rises from
+    /// there. The runtime passes seconds since the Unix epoch, so a
+    /// restart is newer than any leave the previous run sent: a recording
+    /// of that leave cannot remove the new run once its tombstone is
+    /// forgotten. `u32::MAX` is held back by one, so a suspicion can still
+    /// be refuted. A test that replays one seed passes 0.
+    ///
     /// # Panics
     ///
     /// If the timeouts do not fit together, see the messages for each.
-    pub fn new(config: Config, swim: SwimConfig, local: PeerId, addr: Address, seed: u64) -> Self {
+    pub fn new(
+        config: Config,
+        swim: SwimConfig,
+        local: PeerId,
+        addr: Address,
+        seed: u64,
+        incarnation: u32,
+    ) -> Self {
         assert!(swim.protocol_period > 0, "protocol_period must be > 0");
         assert!(
             swim.ack_timeout > 0 && swim.ack_timeout < swim.protocol_period,
@@ -258,6 +272,7 @@ impl Node {
         let seq = apart.next_u64() as u32;
 
         let mut members = MemberTable::new(local, addr);
+        members.start_at(incarnation);
         members.set_max(DEFAULT_MAX_MEMBERS);
 
         Self {
@@ -753,9 +768,9 @@ impl Node {
 
     /// How many times this node has had to outbid an `Alive` record of
     /// itself that it did not make: a newer incarnation of its own ID,
-    /// spread by someone else. A quick restart adds one, as the cluster
-    /// tells the new instance where its predecessor stood; steady growth
-    /// means two instances advertise one address.
+    /// spread by someone else. A restart that starts above the incarnation
+    /// the cluster still holds is taken as this node and adds nothing.
+    /// Steady growth means two instances advertise one address.
     pub fn identity_conflicts(&self) -> u64 {
         self.identity_conflicts
     }
@@ -952,10 +967,10 @@ impl Node {
             return;
         }
         // A peer that opens with an `Alive` older than the one we hold for
-        // it restarted unnoticed, at incarnation 0, and does not know where
-        // its predecessor stood. Unless told, its next leave is older than
-        // our record and dropped as stale. Any other opening clears the
-        // mark: the peer caught up, or says something else of itself.
+        // it came back below that record: a clock that went backwards, or
+        // a run that started at 0. Unless told, its next leave is older
+        // than our record and dropped as stale. Any other opening clears
+        // the mark: the peer caught up, or says something else of itself.
         let held = self.members.update_about(from);
         let behind = matches!(
             (message.updates().first(), held),
@@ -1629,7 +1644,7 @@ mod tests {
     }
 
     fn node() -> Node {
-        Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), 1)
+        Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), 1, 0)
     }
 
     fn node_with(peers: impl IntoIterator<Item = u64>) -> Node {
@@ -1769,7 +1784,7 @@ mod tests {
             suspicion_timeout: PERIOD - 1,
             ..SWIM
         };
-        Node::new(config(), swim, LOCAL, addr(LOCAL.get()), 1);
+        Node::new(config(), swim, LOCAL, addr(LOCAL.get()), 1, 0);
     }
 
     #[test]
@@ -2211,7 +2226,7 @@ mod tests {
             tombstone_ttl: 1000 * PERIOD,
             ..SWIM
         };
-        let mut n = Node::new(config(), quiet, LOCAL, addr(LOCAL.get()), 1);
+        let mut n = Node::new(config(), quiet, LOCAL, addr(LOCAL.get()), 1, 0);
         n.introduce(PeerId::new(1), addr(1));
         let death = news(7, 0, Dead);
         let carrying = |updates: Vec<Update>| Message::Ack {
@@ -2245,7 +2260,7 @@ mod tests {
             tombstone_ttl: 1000 * PERIOD,
             ..SWIM
         };
-        let mut n = Node::new(config(), quiet, LOCAL, addr(LOCAL.get()), 1);
+        let mut n = Node::new(config(), quiet, LOCAL, addr(LOCAL.get()), 1, 0);
         for peer in peers {
             n.introduce(PeerId::new(peer), addr(peer));
         }
@@ -2632,7 +2647,7 @@ mod tests {
             ack_timeout: PERIOD,
             ..SWIM
         };
-        Node::new(config(), swim, LOCAL, addr(LOCAL.get()), 1);
+        Node::new(config(), swim, LOCAL, addr(LOCAL.get()), 1, 0);
     }
 
     #[test]
@@ -2655,7 +2670,7 @@ mod tests {
     #[test]
     fn the_same_seed_probes_in_the_same_order() {
         let order = |seed| {
-            let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed);
+            let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed, 0);
             for peer in 1..=6 {
                 n.introduce(PeerId::new(peer), addr(peer));
             }
@@ -2743,7 +2758,7 @@ mod tests {
     #[test]
     fn each_start_reports_under_an_epoch_of_its_own() {
         let epoch = |seed: u64| {
-            let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed);
+            let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed, 0);
             n.introduce(PeerId::new(1), addr(1));
             let out = sent(n.handle(Event::Tick, 0));
             own_report(&out[0].1).epoch
@@ -2871,7 +2886,7 @@ mod tests {
             tombstone_ttl: 1000 * PERIOD,
             ..SWIM
         };
-        let mut n = Node::new(config(), patient, LOCAL, addr(LOCAL.get()), 1);
+        let mut n = Node::new(config(), patient, LOCAL, addr(LOCAL.get()), 1, 0);
         n.set_partition_policy(PartitionPolicy::Optimistic);
         n.introduce(PeerId::new(1), addr(1));
         deliver(&mut n, 1, reporting(1, 3), 0);
@@ -2893,7 +2908,7 @@ mod tests {
             tombstone_ttl: 1000 * PERIOD,
             ..SWIM
         };
-        let mut n = Node::new(config(), patient, LOCAL, addr(LOCAL.get()), 1);
+        let mut n = Node::new(config(), patient, LOCAL, addr(LOCAL.get()), 1, 0);
         n.introduce(PeerId::new(1), addr(1));
         heat(&mut n);
         n
@@ -3576,6 +3591,40 @@ mod tests {
     }
 
     #[test]
+    fn a_run_starts_at_the_incarnation_it_is_given_and_leaves_there() {
+        let started = 1_700_000_000;
+        let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), 1, started);
+        n.introduce(PeerId::new(1), addr(1));
+        assert_eq!(n.members().incarnation(), started);
+        let told = sent(n.leave(ONE_MS));
+        assert!(
+            told.iter().all(|(_, message)| *message
+                == Message::Leave {
+                    updates: vec![news(0, started, Dead)]
+                }),
+            "a leave is this run's death, not a zero any earlier run could have signed"
+        );
+    }
+
+    #[test]
+    fn a_leave_from_an_earlier_run_does_not_remove_the_restarted_node() {
+        let mut peer = node();
+        let previous = 1_700_000_000;
+        let restarted = previous + 1;
+        deliver(&mut peer, 1, hello(1, restarted), ONE_MS);
+        deliver(
+            &mut peer,
+            1,
+            Message::Leave {
+                updates: vec![news(1, previous, Dead)],
+            },
+            2 * ONE_MS,
+        );
+        assert_eq!(peer.members().status(PeerId::new(1)), Some(Alive));
+        assert!(!peer.members().has_departed(PeerId::new(1)));
+    }
+
+    #[test]
     fn a_node_that_leaves_tells_every_live_peer_and_stops() {
         let mut n = node_with([1, 2, 3]);
         n.handle(Event::Tick, 0);
@@ -3867,7 +3916,7 @@ mod tests {
         let mut nodes: Vec<Node> = ids
             .iter()
             .enumerate()
-            .map(|(i, &id)| Node::new(config(), SWIM, PeerId::new(id), addr(id), i as u64 + 1))
+            .map(|(i, &id)| Node::new(config(), SWIM, PeerId::new(id), addr(id), i as u64 + 1, 0))
             .collect();
         for (i, node) in nodes.iter_mut().enumerate() {
             for peer in [0u64, 1, 2].into_iter().filter(|&peer| peer != ids[i]) {
@@ -3936,7 +3985,7 @@ mod tests {
     ) {
         let mut seen = std::collections::HashMap::new();
         let seed = if record.is_some() { 0xDEAD_BEEF } else { 1 };
-        let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed);
+        let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed, 0);
         n.introduce(PeerId::new(1), addr(1));
         n.introduce(PeerId::new(2), addr(2));
         const X: u64 = 1;
@@ -3996,7 +4045,7 @@ mod tests {
     }
 
     fn first_seq(seed: u64) -> u32 {
-        let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed);
+        let mut n = Node::new(config(), SWIM, LOCAL, addr(LOCAL.get()), seed, 0);
         n.introduce(PeerId::new(1), addr(1));
         round(&mut n, 0).1
     }

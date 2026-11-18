@@ -21,6 +21,7 @@ fn alone(limit: u32, burst: u32) -> Guard {
         .bind(format!("127.0.0.1:{}", free_port()))
         .limit(limit)
         .burst(burst)
+        .insecure_gossip(true)
         .spawn()
         .unwrap()
 }
@@ -90,6 +91,7 @@ fn spawning_outside_a_runtime_is_an_error_not_a_panic() {
     let result = Guard::builder()
         .bind("127.0.0.1:0")
         .limit(10)
+        .insecure_gossip(true)
         .spawn()
         .map(drop);
     assert!(matches!(result, Err(Error::NoRuntime)), "{result:?}");
@@ -101,6 +103,7 @@ async fn dropping_the_last_guard_stops_the_node_and_frees_the_port() {
     let guard = Guard::builder()
         .bind(format!("127.0.0.1:{port}"))
         .limit(10)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let clone = guard.clone();
@@ -136,6 +139,7 @@ async fn a_hung_network_does_not_touch_the_request_path() {
         .seeds(["10.0.0.2:7946"])
         .limit(100)
         .burst(4)
+        .insecure_gossip(true)
         .spawn_on(Hung)
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -166,6 +170,7 @@ async fn a_node_whose_background_task_died_falls_back_to_the_floor() {
         .bind("10.0.0.1:7946")
         .limit(1000)
         .burst(1)
+        .insecure_gossip(true)
         .spawn_on(Panicking(
             tokio::time::Instant::now() + Duration::from_millis(300),
         ))
@@ -196,12 +201,14 @@ async fn two_nodes_on_loopback_find_each_other() {
     let a = Guard::builder()
         .bind(format!("127.0.0.1:{pa}"))
         .limit(100)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let b = Guard::builder()
         .bind(format!("127.0.0.1:{pb}"))
         .seeds([format!("127.0.0.1:{pa}")])
         .limit(100)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     until_each_sees(&[&a, &b], 2).await;
@@ -213,12 +220,14 @@ async fn a_node_finds_its_seed_by_name() {
     let a = Guard::builder()
         .bind(format!("127.0.0.1:{pa}"))
         .limit(100)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let b = Guard::builder()
         .bind(format!("127.0.0.1:{pb}"))
         .seeds([format!("localhost:{pa}")])
         .limit(100)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     until_each_sees(&[&a, &b], 2).await;
@@ -233,6 +242,7 @@ async fn a_node_with_a_seed_by_name_still_frees_the_port() {
         .bind(format!("127.0.0.1:{port}"))
         .seeds([format!("localhost:{nobody}")])
         .limit(10)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -249,12 +259,14 @@ async fn a_node_bound_to_port_zero_advertises_the_port_it_got() {
     let seed = Guard::builder()
         .bind(format!("127.0.0.1:{seed_port}"))
         .limit(100)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let joiner = Guard::builder()
         .bind("127.0.0.1:0")
         .seeds([format!("127.0.0.1:{seed_port}")])
         .limit(100)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     until_each_sees(&[&seed, &joiner], 2).await;
@@ -270,6 +282,7 @@ fn a_runtime_without_timers_is_an_error_not_a_silently_dead_node() {
         Guard::builder()
             .bind("127.0.0.1:0")
             .limit(10)
+            .insecure_gossip(true)
             .spawn()
             .map(drop)
     });
@@ -282,6 +295,7 @@ fn a_period_too_short_to_tick_is_an_error() {
         .bind("127.0.0.1:0")
         .limit(10)
         .protocol_period(Duration::from_nanos(3))
+        .insecure_gossip(true)
         .spawn()
         .map(drop);
     assert!(matches!(result, Err(Error::ZeroPeriod)), "{result:?}");
@@ -297,6 +311,7 @@ fn a_runtime_without_io_is_an_error_not_a_panic() {
         Guard::builder()
             .bind("127.0.0.1:0")
             .limit(10)
+            .insecure_gossip(true)
             .spawn()
             .map(drop)
     });
@@ -329,6 +344,7 @@ async fn a_node_stuck_sending_still_stops_with_its_last_guard() {
         .bind("10.0.0.1:7946")
         .seeds(["10.0.0.2:7946"])
         .limit(100)
+        .insecure_gossip(true)
         .spawn_on(Stuck(dropped.clone()))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -353,6 +369,7 @@ fn no_key_gets_more_than_its_rate_and_a_burst_under_contention() {
             .bind("127.0.0.1:0")
             .limit(limit)
             .burst(burst)
+            .insecure_gossip(true)
             .spawn()
             .unwrap()
     });

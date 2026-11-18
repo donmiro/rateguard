@@ -17,6 +17,7 @@ fn guard() -> Guard {
         .limit(40)
         .burst(50)
         .class("pro", Limit::per_second(10).burst(5))
+        .insecure_gossip(true)
         .spawn()
         .unwrap()
 }
@@ -182,6 +183,7 @@ async fn classes_that_cannot_be_are_refused() {
         .bind("127.0.0.1:0")
         .limit(100)
         .max_classes(2)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     assert!(matches!(
@@ -223,7 +225,10 @@ async fn classes_that_cannot_be_are_refused() {
 async fn a_builder_refuses_classes_that_cannot_be() {
     let builder = || Guard::builder().bind("127.0.0.1:0").limit(100);
     assert!(matches!(
-        builder().class("", Limit::per_second(5)).spawn(),
+        builder()
+            .class("", Limit::per_second(5))
+            .insecure_gossip(true)
+            .spawn(),
         Err(Error::EmptyClassName)
     ));
     assert!(matches!(
@@ -231,11 +236,12 @@ async fn a_builder_refuses_classes_that_cannot_be() {
             .max_classes(1)
             .class("a", Limit::per_second(5))
             .class("b", Limit::per_second(5))
+            .insecure_gossip(true)
             .spawn(),
         Err(Error::TooManyClasses(1))
     ));
     assert!(matches!(
-        builder().max_classes(5000).spawn(),
+        builder().max_classes(5000).insecure_gossip(true).spawn(),
         Err(Error::TooManyClasses(5000))
     ));
 }
@@ -303,7 +309,7 @@ async fn the_builders_burst_applies_on_top_of_a_default_limit_in_any_order() {
             .burst(7)
             .default_limit(Limit::per_minute(600)),
     ] {
-        let guard = guard.spawn().unwrap();
+        let guard = guard.insecure_gossip(true).spawn().unwrap();
         assert_eq!(admitted_in(&guard, "", "k", 100), 7);
     }
 }
@@ -315,6 +321,7 @@ async fn per_minute_holds_its_rate_on_one_node() {
     let guard = Guard::builder()
         .bind("127.0.0.1:0")
         .default_limit(Limit::per_minute(600))
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     let mut admitted = admitted_in(&guard, "", "k", 100);
@@ -337,6 +344,7 @@ fn small_guard() -> Guard {
         .limit(10)
         .burst(5)
         .class("pro", Limit::per_second(10).burst(5))
+        .insecure_gossip(true)
         .spawn()
         .unwrap()
 }
@@ -364,6 +372,7 @@ async fn a_key_limit_keeps_the_key_s_debt() {
     let guard = Guard::builder()
         .bind("127.0.0.1:0")
         .default_limit(Limit::per_minute(60).burst(5))
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     assert_eq!(admitted_in(&guard, "", "k", 20), 5);
@@ -416,6 +425,7 @@ async fn set_key_limits_is_all_or_nothing() {
         .bind("127.0.0.1:0")
         .limit(100)
         .max_key_limits(2)
+        .insecure_gossip(true)
         .spawn()
         .unwrap();
     guard.set_key_limit("", "a", Limit::per_second(5)).unwrap();
@@ -457,7 +467,7 @@ async fn set_key_limits_is_all_or_nothing() {
             .bind("127.0.0.1:0")
             .limit(100)
             .max_key_limits((1 << 20) + 1)
-            .spawn(),
+            .insecure_gossip(true).spawn(),
         Err(Error::TooLargeMaxKeyLimits(n)) if n == (1 << 20) + 1
     ));
 }
@@ -497,6 +507,7 @@ async fn a_shadow_never_changes_the_decision() {
             .burst(10)
             .class("free", Limit::per_second(20).burst(5))
             .class("pro", Limit::per_second(10).burst(5))
+            .insecure_gossip(true)
             .spawn()
             .unwrap()
     };
@@ -541,6 +552,7 @@ async fn shadowed_and_enforced(every: Duration) -> (f64, f64) {
             .bind("127.0.0.1:0")
             .limit(1000)
             .class("c", limit)
+            .insecure_gossip(true)
             .spawn()
             .unwrap()
     };

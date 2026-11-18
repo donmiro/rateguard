@@ -47,9 +47,11 @@ What this does not protect against:
 - **Eavesdropping.** Nothing is encrypted: whoever sees the traffic reads
   the nodes' addresses, the hashes of keys and their rates.
 - **Replay.** A datagram recorded on the way can be sent again, and is
-  taken. News of a member loses to newer news, by incarnation, but a
-  recorded leave can remove a node again after it restarts, until it
-  refutes: that is open (spec §9.1, item 37). A replayed demand report
+  taken. News of a member loses to newer news, by incarnation. A run
+  starts at seconds since the Unix epoch, so a recorded leave of an
+  earlier run does not remove a node that restarted in a later second.
+  A restart in the same second can still be removed until it refutes.
+  A replayed demand report
   makes a node only stricter, never looser, with one exception: a recording
   0.75 to 1 of a round circle old (the round is a `u16`, so about 2.7 to
   3.6 hours at the default 200 ms period) can lower a peer's demand for one

@@ -31,6 +31,7 @@ let mut node = Node::new(
     PeerId::new(1), // this node
     my_address,     // a rateguard_proto::Address, gossiped so others can reach it
     rng_seed,       // drives its random choices: same seed, same run
+    incarnation,    // this run's, seconds since the Unix epoch
 );
 node.add_seed(PeerId::new(0), seed_address); // N comes from membership
 

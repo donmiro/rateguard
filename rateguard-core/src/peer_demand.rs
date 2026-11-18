@@ -370,6 +370,7 @@ mod tests {
                     primary: true,
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 

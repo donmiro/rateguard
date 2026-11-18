@@ -333,6 +333,7 @@ async fn stats(State(app): State<App>) -> Response {
             "bad_tag": s.rejected_datagrams.bad_tag,
             "malformed": s.rejected_datagrams.malformed,
             "mismatched_records": s.rejected_datagrams.mismatched_records,
+            "mismatched_salt": s.rejected_datagrams.mismatched_salt,
         },
         "identity_conflicts": s.identity_conflicts,
         "members_refused": s.members_refused,

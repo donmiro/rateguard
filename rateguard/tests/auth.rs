@@ -251,6 +251,43 @@ async fn a_member_that_does_not_match_its_address_is_refused() {
     assert_eq!(stats.cluster_size, 2, "the made-up member is not learned");
 }
 
+#[tokio::test]
+async fn demand_is_ignored_when_salts_differ() {
+    let (pa, pb) = (free_port(), free_port());
+    let secrets = secret(&A);
+    let a = Guard::builder()
+        .bind(format!("127.0.0.1:{pa}"))
+        .advertise(format!("127.0.0.1:{pa}"))
+        .seeds([format!("127.0.0.1:{pb}")])
+        .limit(100)
+        .gossip_auth(GossipAuth::Required, secrets.clone())
+        .insecure_gossip(true)
+        .key_salt([1; 16])
+        .spawn()
+        .unwrap();
+    let b = Guard::builder()
+        .bind(format!("127.0.0.1:{pb}"))
+        .advertise(format!("127.0.0.1:{pb}"))
+        .seeds([format!("127.0.0.1:{pa}")])
+        .limit(100)
+        .gossip_auth(GossipAuth::Required, secrets)
+        .insecure_gossip(true)
+        .key_salt([2; 16])
+        .spawn()
+        .unwrap();
+    until_each_sees(&[&a, &b], 2).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let aa = a.stats().rejected_datagrams.mismatched_salt;
+        let bb = b.stats().rejected_datagrams.mismatched_salt;
+        if aa > 0 && bb > 0 {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "a={aa} b={bb}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[test]
 fn builder_debug_shows_no_secret() {
     // Bytes that read as text, so that a leak shows in every form.

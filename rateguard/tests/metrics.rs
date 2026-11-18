@@ -88,6 +88,11 @@ async fn the_background_task_publishes_counts_and_state() {
             vec![("reason", "mismatched_records")],
             0.0,
         ),
+        (
+            "rateguard_rejected_datagrams_total",
+            vec![("reason", "mismatched_salt")],
+            0.0,
+        ),
         ("rateguard_identity_conflicts_total", vec![], 0.0),
         ("rateguard_members_refused_total", vec![], 0.0),
         ("rateguard_gossip_auth", vec![("mode", "off")], 1.0),

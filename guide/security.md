@@ -64,7 +64,10 @@ What this does not protect against:
   gain yet.
 - **A node gone rogue.** There is one secret per cluster, and whoever holds
   it can speak for any node.
-- **Salts that differ between nodes.** Nothing detects them; see below.
+- **Salts that differ between nodes.** Each demand report carries a
+  fingerprint of the salt, not the salt. A report whose fingerprint does
+  not match this node's is ignored for shares and counted in
+  `rejected_datagrams.mismatched_salt`. Membership gossip is still taken.
 
 **Without signing**, two checks still bound what a stranger can do. Every
 member in a datagram must go by the ID its address gives, as every node
@@ -137,8 +140,9 @@ file.
 the secret. Nodes exchange demand by the hash of each key: while some hash
 with one salt and others with another, or none, they do not know each
 other's keys, and each takes its share as if the others' demand were for
-other keys, up to N times the limit for N nodes. Nothing tells: the gossip
-carries no trace of the salt. So set or change a salt by restarting every
+other keys, up to N times the limit for N nodes — unless a peer's demand
+is ignored for a mismatched fingerprint, in which case `mismatched_salt`
+grows. Set or change a salt by restarting every
 node at once, never by a rolling update, which would admit up to that much
 for as long as it lasts. With a salt, match the hashes of `most_denied` with
 `guard.key_hash_in(class, key)`, which knows it, not the free function

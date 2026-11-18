@@ -526,6 +526,7 @@ fn report(node: &Node, shared: &Shared, counts: Counts) {
     rejected.bad_tag += counts.rejected.bad_tag;
     rejected.malformed += counts.rejected.malformed;
     rejected.mismatched_records += counts.rejected.mismatched_records;
+    rejected.mismatched_salt += counts.rejected.mismatched_salt;
     let listed = |keys: Vec<(u64, KeyRates)>| -> Vec<crate::stats::DeniedKey> {
         keys.into_iter()
             .map(|(key_hash, rates)| crate::stats::DeniedKey {
@@ -591,14 +592,18 @@ fn receive(
     match screen(message) {
         Some(screened) => {
             rejected.mismatched_records += screened.dropped;
-            node.handle(
-                Event::MessageReceived {
-                    from: screened.from,
-                    bytes: &screened.bytes,
-                },
-                now,
-            )
-            .to_vec()
+            let before = node.mismatched_salt();
+            let actions = node
+                .handle(
+                    Event::MessageReceived {
+                        from: screened.from,
+                        bytes: &screened.bytes,
+                    },
+                    now,
+                )
+                .to_vec();
+            rejected.mismatched_salt += node.mismatched_salt().saturating_sub(before);
+            actions
         }
         None => {
             rejected.malformed += 1;
@@ -1075,6 +1080,7 @@ mod tests {
                     demand: 300.0,
                     primary: true,
                 }],
+                ..Default::default()
             }],
         })
         .unwrap();

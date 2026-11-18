@@ -103,6 +103,7 @@ type RejectedDatagrams struct {
 	BadTag            uint64 `json:"bad_tag"`
 	Malformed         uint64 `json:"malformed"`
 	MismatchedRecords uint64 `json:"mismatched_records"`
+	MismatchedSalt    uint64 `json:"mismatched_salt"`
 }
 
 // KeyStats is one key on this sidecar: its rates, the share it is admitted

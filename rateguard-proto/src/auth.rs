@@ -408,10 +408,11 @@ mod tests {
                     };
                     MAX_DEMAND_KEYS
                 ],
+                salt_fp: u32::MAX,
             }],
         };
         let bytes = encode(&message).unwrap();
-        assert_eq!(bytes.len(), 1301);
+        assert_eq!(bytes.len(), 1305);
         assert!(bytes.len() + FRAME_OVERHEAD <= MAX_DATAGRAM);
         let auth = auth(GossipAuth::Required, &[&A]);
         let frame = auth.seal(&bytes);

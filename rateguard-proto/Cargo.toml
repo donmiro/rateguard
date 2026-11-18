@@ -1,7 +1,7 @@
 [package]
 name = "rateguard-proto"
 description = "The wire format of rateguard: SWIM membership and demand reports over UDP"
-version = "0.6.1" # 0.6.1 adds Message::Full; older messages are unchanged
+version = "0.6.2" # 0.6.2 adds DemandReport::salt_fp; upgrade every node together
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

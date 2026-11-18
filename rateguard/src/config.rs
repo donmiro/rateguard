@@ -530,6 +530,7 @@ fn start<T: crate::Transport>(
     node.set_partition_policy(settings.policy);
     node.set_quorum_memory(settings.quorum_memory);
     node.set_max_members(settings.max_members);
+    node.set_key_salt_fp(crate::key::salt_fingerprint(settings.salt.as_ref()));
     let mut names = crate::driver::Names::new(local);
     for seed in settings.seeds {
         let address = Address::from(seed);

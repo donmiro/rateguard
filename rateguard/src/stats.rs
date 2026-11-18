@@ -131,6 +131,10 @@ pub struct RejectedDatagrams {
     /// name, that a peer passed on as it heard it; a 0.7.0 peer does that
     /// with a forger's news. Counted in every mode, `Off` included.
     pub mismatched_records: u64,
+    /// Not datagrams but demand reports ignored because the sender's
+    /// [`salt_fp`](rateguard_proto::DemandReport::salt_fp) did not match
+    /// this node's key salt. Counted in every mode.
+    pub mismatched_salt: u64,
 }
 
 /// A key denied lately; see [`Stats::most_denied`].

@@ -239,6 +239,7 @@ fn a_flood_of_strangers_is_bounded() {
                     primary: true,
                 })
                 .collect(),
+            ..Default::default()
         }];
         let bytes = encode(&Message::Ack {
             seq: tick as u32,

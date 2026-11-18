@@ -119,7 +119,7 @@ pub struct KeyDemand {
 
 /// What one node, `origin`, observed in one of its rounds. Absolute values,
 /// never deltas: a newer round of the same origin replaces the older one.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DemandReport {
     /// The node whose demand this is.
     pub origin: u64,
@@ -130,8 +130,13 @@ pub struct DemandReport {
     pub round: u16,
     /// Its hot keys, the whole set: a key left out has cooled.
     pub keys: Vec<KeyDemand>,
+    /// Fingerprint of the key-hash salt, not the salt itself: 0 if unsalted.
+    /// A report whose fingerprint differs from the receiver's is not taken
+    /// for shares. Every node on 0.8.0 must upgrade before a release that
+    /// sends this field.
+    #[serde(with = "postcard::fixint::le")]
+    pub salt_fp: u32,
 }
-
 /// A SWIM message. Every one carries membership news and demand. The
 /// variant order is the wire format: do not reorder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -340,6 +345,7 @@ mod tests {
             epoch: 5,
             round: 17,
             keys,
+            ..Default::default()
         }
     }
 
@@ -352,6 +358,7 @@ mod tests {
                 epoch: u32::MAX,
                 round: u16::MAX,
                 keys: vec![key(u64::MAX, f32::MAX); per_report],
+                salt_fp: u32::MAX,
             })
             .collect()
     }
@@ -440,6 +447,19 @@ mod tests {
         let len = encode(&message).unwrap().len();
         // Twelve IPv6 records leave room for a full report.
         assert!(len <= 460, "{len} bytes");
+    }
+
+    #[test]
+    fn a_demand_report_carries_a_salt_fingerprint_on_the_wire() {
+        let mut with_fp = report(Vec::new());
+        with_fp.salt_fp = 9;
+        assert_eq!(
+            decode(&encode(&ping_with_demand(vec![with_fp])).unwrap())
+                .unwrap()
+                .demand()[0]
+                .salt_fp,
+            9
+        );
     }
 
     #[test]
@@ -674,6 +694,7 @@ mod tests {
                     epoch,
                     round,
                     keys,
+                    ..Default::default()
                 },
             )
         }

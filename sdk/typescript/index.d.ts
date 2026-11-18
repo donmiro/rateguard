@@ -84,6 +84,7 @@ export interface Stats {
     bad_tag: number;
     malformed: number;
     mismatched_records: number;
+    mismatched_salt: number;
   };
   identity_conflicts: number;
   members_refused: number;

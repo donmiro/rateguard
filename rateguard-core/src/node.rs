@@ -156,6 +156,10 @@ pub struct Node {
     left: bool,
     held: Held,
     identity_conflicts: u64,
+    /// Demand reports ignored: the sender's salt fingerprint did not match.
+    mismatched_salt: u64,
+    /// Fingerprint this node puts on its demand reports.
+    key_salt_fp: u32,
     // When the full table last refused news of a live newcomer.
     last_refused_at: Option<Nanos>,
     // When a peer last answered our ping with "my table is full".
@@ -313,6 +317,8 @@ impl Node {
             left: false,
             held: Held::default(),
             identity_conflicts: 0,
+            mismatched_salt: 0,
+            key_salt_fp: 0,
             last_refused_at: None,
             excluded_at: None,
             denied: BTreeMap::new(),
@@ -775,6 +781,16 @@ impl Node {
         self.identity_conflicts
     }
 
+    /// Demand reports refused for a mismatched salt fingerprint.
+    pub fn mismatched_salt(&self) -> u64 {
+        self.mismatched_salt
+    }
+
+    /// The fingerprint placed on this node's demand reports. Zero if unsalted.
+    pub fn set_key_salt_fp(&mut self, fp: u32) {
+        self.key_salt_fp = fp;
+    }
+
     /// Whether the node has [left](Node::leave).
     pub fn has_left(&self) -> bool {
         self.left
@@ -1040,7 +1056,7 @@ impl Node {
                 .iter()
                 .find(|report| report.origin == from.get())
         {
-            self.peer_demand.apply(from, report, now);
+            self.apply_peer_demand(from, report, now);
         }
         match message {
             Message::Ping { seq, .. } if refused_sender => self.tell_full(from, seq),
@@ -1116,7 +1132,7 @@ impl Node {
                     && !self.members.has_departed(target)
                     && let Some(report) = demand.iter().find(|r| r.origin == target.get())
                 {
-                    self.peer_demand.apply(target, report, now);
+                    self.apply_peer_demand(target, report, now);
                 }
                 self.probe = None;
                 return;
@@ -1565,7 +1581,16 @@ impl Node {
             epoch: self.epoch,
             round: self.round_number,
             keys: self.own_demand.clone(),
+            salt_fp: self.key_salt_fp,
         }]
+    }
+
+    fn apply_peer_demand(&mut self, from: PeerId, report: &DemandReport, now: Nanos) {
+        if report.salt_fp != self.key_salt_fp {
+            self.mismatched_salt += 1;
+            return;
+        }
+        self.peer_demand.apply(from, report, now);
     }
 
     fn send(&mut self, peer: PeerId, message: &Message) {
@@ -1712,6 +1737,7 @@ mod tests {
             epoch: n.epoch,
             round: 0,
             keys: Vec::new(),
+            ..Default::default()
         }]
     }
 
@@ -2194,6 +2220,7 @@ mod tests {
                     demand: 10_000.0,
                     primary: true,
                 }],
+                ..Default::default()
             }],
         };
         deliver(&mut n, 7, claiming, ONE_MS);
@@ -2779,8 +2806,22 @@ mod tests {
                     demand: 75.0,
                     primary: true,
                 }],
+                ..Default::default()
             }],
         }
+    }
+
+    #[test]
+    fn a_demand_report_with_a_different_salt_fingerprint_is_ignored() {
+        let mut n = node_with([1]);
+        n.set_key_salt_fp(1);
+        let mut msg = reporting(1, 3);
+        if let Message::Ping { demand, .. } = &mut msg {
+            demand[0].salt_fp = 2;
+        }
+        deliver(&mut n, 1, msg, 0);
+        assert_eq!(n.mismatched_salt(), 1);
+        assert!(n.peer_demand().is_empty());
     }
 
     #[test]
@@ -3558,6 +3599,7 @@ mod tests {
                 demand: 75.0,
                 primary: true,
             }],
+            ..Default::default()
         };
         let ping = |origin| Message::Ping {
             seq: 7,
@@ -4161,6 +4203,7 @@ mod tests {
                 demand: 500.0,
                 primary: true,
             }],
+            ..Default::default()
         };
         let ping = |origin: u64| Message::Ping {
             seq: 7,
@@ -4193,6 +4236,7 @@ mod tests {
                 demand: 300.0,
                 primary: true,
             }],
+            ..Default::default()
         };
         let announcing = Message::Ping {
             seq: 7,

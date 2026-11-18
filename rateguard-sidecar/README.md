@@ -132,7 +132,7 @@ under the pod's `terminationGracePeriodSeconds`.
 [`rateguard` guide](https://github.com/donmiro/rateguard/blob/main/guide/observability.md),
 `gossip_auth` as `"off"`, `"transitional"` or `"required"`,
 `rejected_datagrams` as
-`{"unsigned": 0, "bad_tag": 0, "malformed": 0, "mismatched_records": 0}`
+`{"unsigned": 0, "bad_tag": 0, "malformed": 0, "mismatched_records": 0, "mismatched_salt": 0}`
 (the last counts records dropped from datagrams otherwise taken), and
 `identity_conflicts`: times an `Alive` of this instance had to be outbid.
 A second instance on its address makes it grow; a restart that starts

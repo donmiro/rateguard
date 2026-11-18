@@ -44,6 +44,11 @@ pub(crate) fn hash_in(class: u64, key: &str) -> u64 {
 /// a PRF, so its seed would not keep a client who picks the keys from
 /// finding two that collide; SipHash is made for that. Unsalted, it is
 /// [`hash_in`], the hashes of 0.5.
+/// The gossip fingerprint for `salt`: 0 if there is none.
+pub(crate) fn salt_fingerprint(salt: Option<&KeySalt>) -> u32 {
+    salt.map(KeySalt::fingerprint).unwrap_or(0)
+}
+
 pub(crate) fn salted_hash_in(salt: Option<&KeySalt>, class: u64, key: &str) -> u64 {
     let Some(salt) = salt else {
         return hash_in(class, key);
@@ -70,6 +75,13 @@ pub(crate) struct KeySalt([u8; 16]);
 impl KeySalt {
     /// The shortest salt taken: 128 bits, SipHash's whole key.
     pub const MIN_LEN: usize = 16;
+
+    /// A short fingerprint for gossip: the first four bytes of SHA-256 of
+    /// the 128-bit salt key. Not the salt itself.
+    pub fn fingerprint(&self) -> u32 {
+        let digest = Sha256::digest(self.0);
+        u32::from_le_bytes(digest[..4].try_into().expect("four bytes"))
+    }
 
     /// The salt from `bytes`: 16 of them as they are, more cut down to the
     /// first 16 bytes of their SHA-256, so that no byte of a long salt is
@@ -127,6 +139,8 @@ mod tests {
         assert_ne!(peer_id(a), peer_id(Address::V4([10, 0, 0, 1], 7947)));
     }
 
+    use super::salt_fingerprint;
+
     fn salt(bytes: &[u8]) -> KeySalt {
         KeySalt::new(bytes).unwrap()
     }
@@ -177,6 +191,15 @@ mod tests {
         assert_eq!(salt(&long).0, salt(&digest[..16]).0);
         assert_eq!(salt(&long).0, digest[..16]);
         assert_eq!(salt(&[3; 16]).0, [3; 16], "16 bytes are taken as they are");
+    }
+
+    #[test]
+    fn a_fingerprint_is_stable_and_differs_between_salts() {
+        let one = salt_fingerprint(Some(&salt(&[1; 16])));
+        let again = salt_fingerprint(Some(&salt(&[1; 16])));
+        assert_eq!(one, again);
+        assert_ne!(one, salt_fingerprint(Some(&salt(&[2; 16]))));
+        assert_eq!(salt_fingerprint(None), 0);
     }
 
     #[test]

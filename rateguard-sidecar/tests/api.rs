@@ -247,7 +247,7 @@ async fn stats_tell_the_gossip_auth_and_the_rejected_datagrams() {
     assert_eq!(stats["members_full"], false, "{stats}");
     assert_eq!(
         stats["rejected_datagrams"],
-        json!({"unsigned": 0, "bad_tag": 0, "malformed": 0, "mismatched_records": 0})
+        json!({"unsigned": 0, "bad_tag": 0, "malformed": 0, "mismatched_records": 0, "mismatched_salt": 0})
     );
     // A datagram that is no message, counted in every mode.
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

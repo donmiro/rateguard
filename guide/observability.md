@@ -25,7 +25,7 @@ println!("{} admitted, {} denied", stats.admitted, stats.denied);
 | `unknown_class` | Checks in a class this instance does not know, held to the default limit |
 | `identity_conflicts` | Times this instance had to outbid an `Alive` record of itself it did not make. A restart that starts above the incarnation the cluster still holds adds nothing; steady growth means two instances advertise one address |
 | `members_refused` | News of members not seen before, refused because the member table was full (`max_members(n)`). Steady growth means a fleet bigger than the cap, or a stranger flooding unsigned gossip with made-up members |
-| `gossip_auth`, `rejected_datagrams` | How this instance signs its gossip, and the datagrams it refused, by reason: `unsigned`, `bad_tag`, `malformed` (no message, or a sender under an ID its address does not give), and `mismatched_records`: not datagrams but records after the sender's, under an ID their address does not give, dropped from a datagram otherwise taken. A growing `bad_tag`, secrets that do not match the peers'; a growing `unsigned`, a peer not signing yet, or a stranger |
+| `gossip_auth`, `rejected_datagrams` | How this instance signs its gossip, and the datagrams it refused, by reason: `unsigned`, `bad_tag`, `malformed` (no message, or a sender under an ID its address does not give), `mismatched_records` (records after the sender's under a wrong ID, dropped from a datagram otherwise taken), and `mismatched_salt` (demand reports ignored because the sender's salt fingerprint did not match). A growing `bad_tag`, secrets that do not match the peers'; a growing `unsigned`, a peer not signing yet, or a stranger; a growing `mismatched_salt`, a rolling key-salt update or a misconfigured salt file |
 
 `guard.share(key)` is the rate one key is admitted at on this instance now:
 its share of the limit, before the burst; `share_in(class, key)` the same in a
@@ -55,7 +55,7 @@ With the `metrics` feature the background task publishes the same, labelled
 `rateguard_held{reason="joining"|"learning"|"without_quorum"|"members_full"}`,
 `rateguard_dry_run`, the counters `rateguard_shadow_denied_total`,
 `rateguard_identity_conflicts_total`, `rateguard_members_refused_total` and
-`rateguard_rejected_datagrams_total{reason="unsigned"|"bad_tag"|"malformed"|"mismatched_records"}`
+`rateguard_rejected_datagrams_total{reason="unsigned"|"bad_tag"|"malformed"|"mismatched_records"|"mismatched_salt"}`
 and `rateguard_gossip_auth{mode="off"|"transitional"|"required"}`, 1 for the
 instance's mode: everything but `most_denied` and `most_shadow_denied`, whose
 key hashes as labels would make a series per key. Install any `metrics`
